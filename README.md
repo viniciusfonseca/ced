@@ -13,24 +13,43 @@ A desktop text editor written in C99 with [CUI](https://github.com/yappologistic
 
 ## Build and run
 
-Requirements: CMake 3.20+, a C compiler, Git, and Perl 5 on your PATH. Perl generates libvterm's encoding headers during the build. The current implementation uses POSIX APIs and supports **macOS and Linux**. On Linux, install the X11 development headers (`libx11-dev` on Debian/Ubuntu); file dialogs require `zenity` or `kdialog`.
+Requirements: GNU Make, CMake 3.20+, a C compiler, Git, and Perl 5 on your PATH. Perl generates libvterm's encoding headers during the build. The current implementation uses POSIX APIs and supports **macOS and Linux**. On Linux, install the X11 development headers (`libx11-dev` on Debian/Ubuntu); file dialogs require `zenity` or `kdialog`.
 
 Clone this repository with `git clone --recurse-submodules`, or initialize the submodules in an existing checkout before configuring:
 
 ```sh
-git submodule update --init --recursive
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-./build/ced .
+make deps
+make
+make run
 ```
 
-CUI, cJSON, and libvterm are Git submodules under `third_party/`. Their exact revisions are recorded as Git submodule references; URLs are recorded in `.gitmodules`. CMake builds those local checkouts and does not download dependencies. Run `git submodule update --init --recursive` again after checking out a revision that changes the dependency references. Generated libvterm headers stay in the build directory, leaving the submodule checkout clean. See [THIRD_PARTY.md](THIRD_PARTY.md) for revisions and licenses.
+CUI, cJSON, and libvterm are Git submodules under `third_party/`. Their exact revisions are recorded as Git submodule references; URLs are recorded in `.gitmodules`. CMake builds those local checkouts and does not download dependencies. Run `make deps` again after checking out a revision that changes the dependency references. Generated libvterm headers stay in the build directory, leaving the submodule checkout clean. See [THIRD_PARTY.md](THIRD_PARTY.md) for revisions and licenses.
+
+`make` (or `make build`) configures and builds the editor and tests in `build/`. Available targets:
+
+| Target | Action |
+| --- | --- |
+| `make deps` | Initialize and update dependency submodules |
+| `make configure` | Configure CMake with tests enabled |
+| `make build` | Configure and compile the project |
+| `make run` | Build and launch CED |
+| `make test` | Build and run all tests |
+| `make clean` | Remove compiled outputs, keeping the CMake configuration |
+
+Override `BUILD_DIR`, `BUILD_TYPE`, and `JOBS` to choose the output directory, CMake build type, and parallel build jobs. Defaults are `build`, `Release`, and `4`:
+
+```sh
+make BUILD_DIR=build-debug BUILD_TYPE=Debug JOBS=8
+make test BUILD_DIR=build-debug BUILD_TYPE=Debug
+```
 
 Open a project and specific files:
 
 ```sh
-./build/ced /path/to/project src/main.c README.md
+make run ARGS='/path/to/project src/main.c README.md'
 ```
+
+Pass paths containing spaces with inner quotes, for example `make run ARGS='"/path/to/my project" "notes file.md"'`. You can also launch the built executable directly with `./build/ced /path/to/project`.
 
 The first argument is the project folder. Remaining arguments are file paths relative to that folder or absolute paths. With no arguments, the editor opens the current directory. On macOS, the build also creates `build/CED.app`, which you can open from Finder. Use **Open Folder** in the command palette or Mod Shift O to switch projects.
 
@@ -129,7 +148,7 @@ When the operating system closes the window, unsaved drafts are preserved in `~/
 ## Tests
 
 ```sh
-ctest --test-dir build --output-on-failure
+make test
 ```
 
 Tests create temporary projects and repositories to verify reading, saving, CRLF handling, external conflicts, permissions, limits, the tree, asynchronous search, status, staging, unstaging, commits, renames, and diffs. They also cover file creation and deletion, name collisions, workspace-root protection, symbolic-link containment, and persistent zoom. They do not modify the open project's Git repository.
