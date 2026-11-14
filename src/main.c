@@ -1,0 +1,1018 @@
+#include "workspace.h"
+#include "preferences.h"
+#include "lsp.h"
+#include "terminal_view.h"
+#include "editor_assist.h"
+#include "file_operations.h"
+#include <cui/cui.h>
+#include <cui/cui_app.h>
+
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#define MAX_DOCS 32
+
+#ifdef __APPLE__
+void *ced_macos_shortcuts(cui_app *app);
+void ced_macos_remove_shortcuts(void *handle);
+#endif
+
+typedef struct {
+    CedDocument file;
+    int id;
+    char title[CED_PATH + 40];
+    bool focus;
+    bool lsp_synced;
+    int cursor;
+    bool markdown_preview;
+} EditorTab;
+
+typedef enum { FILE_CREATE, FILE_RENAME, FILE_DELETE, DIRECTORY_CREATE } FileOperation;
+typedef struct {
+    FileOperation operation;
+    bool open, execute, directory;
+    int serial;
+    char path[CED_PATH], name[256], error[CED_ERROR];
+} FileAction;
+
+typedef struct {
+    CedWorkspace workspace;
+    CedGit git;
+    CedSearch search;
+    EditorTab docs[MAX_DOCS];
+    int count, selected, next_id, panel, close_index;
+    float split;
+    int font_size;
+    bool sidebar, close_dialog, commit_dialog, palette;
+    bool diff, diff_staged;
+    char diff_path[CED_PATH], *before, *after;
+    char query[256], commit[1024], message[CED_ERROR];
+    char recovery[CED_PATH];
+    int goto_line, goto_column;
+    cui_code_editor_result caret;
+    cui_app *app;
+    CedLsp *lsp;
+    bool lsp_attempted, problems_open;
+    CedEditorAssist assist;
+    int goto_offset;
+    CedTerminal *terminal;
+    CedTerminalView terminal_view;
+    bool terminal_visible, terminal_right;
+    float terminal_bottom_split, terminal_right_split;
+    FileAction file_action;
+} Editor;
+
+static void notify(Editor *e, const char *message) {
+    snprintf(e->message, sizeof e->message, "%s", message);
+}
+
+static void refresh_git(Editor *e) {
+    char error[CED_ERROR];
+    if (!ced_git_refresh(&e->git, e->workspace.root, error)) {
+        if (e->git.available) notify(e, error);
+    }
+}
+
+static void refresh(Editor *e) {
+    char root[CED_PATH], error[CED_ERROR];
+    snprintf(root, sizeof root, "%s", e->workspace.root);
+    if (!ced_workspace_open(&e->workspace, root, error)) notify(e, error);
+    refresh_git(e);
+}
+
+static void tab_title(EditorTab *tab) {
+    snprintf(tab->title, sizeof tab->title, "%s##document-%d",
+             tab->file.path[0] ? ced_basename(tab->file.path) : "Untitled", tab->id);
+}
+
+static EditorTab *new_tab(Editor *e) {
+    if (e->count >= MAX_DOCS) { notify(e, "Maximum of 32 open tabs reached."); return NULL; }
+    EditorTab *tab = &e->docs[e->count];
+    memset(tab, 0, sizeof *tab);
+    tab->id = ++e->next_id;
+    tab->focus = true;
+    e->selected = e->count++;
+    e->diff = false;
+    return tab;
+}
+
+static void new_document(Editor *e) {
+    EditorTab *tab = new_tab(e);
+    if (!tab) return;
+    tab->file.text = calloc(CED_TEXT_CAP, 1);
+    if (!tab->file.text) { e->count--; e->selected = e->count - 1; notify(e, "Out of memory."); return; }
+    tab_title(tab);
+}
+
+static bool open_document(Editor *e, const char *path, int line, int column) {
+    char canonical[CED_PATH], error[CED_ERROR];
+    if (!realpath(path, canonical)) { notify(e, "File no longer available."); return false; }
+    for (int i = 0; i < e->count; i++) {
+        if (!strcmp(e->docs[i].file.path, canonical)) {
+            e->selected = i;
+            e->diff = false;
+            e->docs[i].focus = true;
+            e->goto_line = line; e->goto_column = column;
+            return true;
+        }
+    }
+    CedDocument file = {0};
+    if (!ced_document_open(&file, canonical, error)) { notify(e, error); return false; }
+    EditorTab *tab = new_tab(e);
+    if (!tab) { ced_document_free(&file); return false; }
+    tab->file = file;
+    tab_title(tab);
+    e->goto_line = line; e->goto_column = column;
+    return true;
+}
+
+static void choose_file(Editor *e) {
+    char path[CED_PATH];
+    if (cui_app_file_dialog(e->app, &(cui_file_dialog_opts){.kind = CUI_FILE_OPEN, .title = "Open File"}, path, sizeof path))
+        open_document(e, path, 0, 0);
+}
+
+static bool save_document(Editor *e, int index, bool save_as) {
+    if (index < 0 || index >= e->count) return false;
+    EditorTab *tab = &e->docs[index];
+    char path[CED_PATH], error[CED_ERROR];
+    snprintf(path, sizeof path, "%s", tab->file.path);
+    bool chosen = save_as || !path[0];
+    if (chosen && !cui_app_file_dialog(e->app, &(cui_file_dialog_opts){
+            .kind = CUI_FILE_SAVE, .title = "Save File", .default_name = path[0] ? ced_basename(path) : "untitled.txt"}, path, sizeof path)) return false;
+    char canonical[CED_PATH];
+    if (realpath(path, canonical)) snprintf(path, sizeof path, "%s", canonical);
+    for (int i = 0; i < e->count; i++) {
+        if (i != index && !strcmp(e->docs[i].file.path, path)) { notify(e, "File already open in another tab."); return false; }
+    }
+    /* A native Save dialog confirms replacing an existing destination. */
+    char previous_path[CED_PATH];
+    snprintf(previous_path, sizeof previous_path, "%s", tab->file.path);
+    if (!ced_document_save(&tab->file, path, chosen, error)) { notify(e, error); return false; }
+    if (strcmp(previous_path, tab->file.path)) ced_lsp_close(e->lsp, previous_path);
+    tab->lsp_synced = ced_lsp_sync(e->lsp, tab->file.path, tab->file.text);
+    ced_lsp_saved(e->lsp, tab->file.path);
+    tab_title(tab);
+    notify(e, "Saved.");
+    refresh(e);
+    return true;
+}
+
+static void remove_tab(Editor *e, int index) {
+    ced_lsp_close(e->lsp, e->docs[index].file.path);
+    ced_document_free(&e->docs[index].file);
+    memmove(e->docs + index, e->docs + index + 1, sizeof *e->docs * (size_t)(e->count - index - 1));
+    e->count--;
+    memset(&e->docs[e->count], 0, sizeof *e->docs);
+    if (e->selected > index) e->selected--;
+    if (e->selected >= e->count) e->selected = e->count - 1;
+    if (e->selected >= 0) e->docs[e->selected].focus = true;
+}
+
+static void request_close(Editor *e, int index) {
+    if (index < 0 || index >= e->count) return;
+    if (ced_document_dirty(&e->docs[index].file)) {
+        e->close_index = index;
+        e->close_dialog = true;
+    } else remove_tab(e, index);
+}
+
+/* CUI has no public close-veto callback. Keep unsaved buffers in a private
+ * recovery file when the OS closes the window; restore on the next launch. */
+static void recovery_path(Editor *e) {
+    const char *home = getenv("HOME");
+    if (!home) return;
+    char dir[CED_PATH];
+    if (!ced_join(dir, sizeof dir, home, ".ced")) return;
+    if (mkdir(dir, 0700) && errno != EEXIST) return;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (const unsigned char *p = (const unsigned char *)e->workspace.root; *p; p++) hash = (hash ^ *p) * UINT64_C(1099511628211);
+    snprintf(e->recovery, sizeof e->recovery, "%s/recovery-%016llx", dir, (unsigned long long)hash);
+}
+
+static bool write_recovery(Editor *e) {
+    if (!e->recovery[0]) return false;
+    bool dirty = false;
+    for (int i = 0; i < e->count; i++) dirty |= ced_document_dirty(&e->docs[i].file);
+    if (!dirty) { unlink(e->recovery); return true; }
+    char temp[CED_PATH];
+    int n = snprintf(temp, sizeof temp, "%s.XXXXXX", e->recovery);
+    if (n < 0 || (size_t)n >= sizeof temp) return false;
+    int fd = mkstemp(temp);
+    if (fd < 0) return false;
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { close(fd); unlink(temp); return false; }
+    bool ok = fwrite("CED1", 1, 4, f) == 4;
+    for (int i = 0; i < e->count && ok; i++) {
+        CedDocument *d = &e->docs[i].file;
+        if (!ced_document_dirty(d)) continue;
+        uint32_t header[] = {(uint32_t)strlen(d->path), (uint32_t)strlen(d->text), d->crlf};
+        ok = fwrite(header, sizeof header, 1, f) == 1 &&
+             fwrite(d->path, 1, header[0], f) == header[0] && fwrite(d->text, 1, header[1], f) == header[1];
+    }
+    if (fflush(f) || fsync(fd)) ok = false;
+    if (fclose(f)) ok = false;
+    if (ok && rename(temp, e->recovery)) ok = false;
+    if (!ok) unlink(temp);
+    return ok;
+}
+
+static void restore_recovery(Editor *e) {
+    FILE *f = fopen(e->recovery, "rb");
+    if (!f) return;
+    char magic[4];
+    int restored = 0;
+    if (fread(magic, 1, 4, f) == 4 && !memcmp(magic, "CED1", 4)) {
+        uint32_t header[3];
+        while (e->count < MAX_DOCS && fread(header, sizeof header, 1, f) == 1) {
+            if (header[0] >= CED_PATH || header[1] >= CED_TEXT_CAP) break;
+            char path[CED_PATH] = {0};
+            char *text = calloc(CED_TEXT_CAP, 1);
+            if (!text) break;
+            if (fread(path, 1, header[0], f) != header[0] || fread(text, 1, header[1], f) != header[1]) { free(text); break; }
+            EditorTab *tab = new_tab(e);
+            if (!tab) { free(text); break; }
+            char error[CED_ERROR];
+            if (path[0]) ced_document_open(&tab->file, path, error);
+            free(tab->file.text);
+            tab->file.text = text;
+            snprintf(tab->file.path, sizeof tab->file.path, "%s", path);
+            tab->file.crlf = header[2] != 0;
+            tab_title(tab);
+            restored++;
+        }
+    }
+    fclose(f);
+    if (restored) notify(e, "Recovered unsaved files.");
+}
+
+static void choose_folder(Editor *e) {
+    char path[CED_PATH], error[CED_ERROR];
+    if (!cui_app_file_dialog(e->app, &(cui_file_dialog_opts){.kind = CUI_FILE_FOLDER, .title = "Open Folder"}, path, sizeof path)) return;
+    if (!write_recovery(e)) { notify(e, "Recovery failed. Save your files before switching folders."); return; }
+    CedWorkspace next = {0};
+    if (!ced_workspace_open(&next, path, error)) { notify(e, error); return; }
+    ced_lsp_stop(e->lsp); e->lsp = NULL; e->lsp_attempted = false;
+    ced_assist_reset(&e->assist);
+    ced_terminal_stop(e->terminal); e->terminal = NULL;
+    e->terminal_view = (CedTerminalView){.autofocus = true};
+    ced_search_cancel(&e->search);
+    while (e->count) remove_tab(e, e->count - 1);
+    ced_workspace_free(&e->workspace);
+    e->workspace = next;
+    e->diff = false;
+    e->query[0] = 0;
+    e->search.count = 0;
+    refresh_git(e);
+    recovery_path(e);
+    restore_recovery(e);
+    if (!e->count) notify(e, "Folder opened.");
+}
+
+static void lsp_tick(Editor *e) {
+    if (!e->lsp_attempted) {
+        for (int i = 0; i < e->count; i++) {
+            if (!e->docs[i].file.path[0] || !ced_lsp_language(e->docs[i].file.path)) continue;
+            char error[CED_ERROR];
+            e->lsp_attempted = true;
+            e->lsp = ced_lsp_start(e->workspace.root, getenv("CED_CLANGD"), error, sizeof error);
+            if (!e->lsp) notify(e, error);
+            break;
+        }
+    }
+    ced_lsp_poll(e->lsp);
+    if (ced_lsp_ready(e->lsp)) {
+        for (int i = 0; i < e->count; i++) {
+            EditorTab *tab = &e->docs[i];
+            if (!tab->lsp_synced && tab->file.path[0] && ced_lsp_language(tab->file.path))
+                tab->lsp_synced = ced_lsp_sync(e->lsp, tab->file.path, tab->file.text);
+        }
+    }
+    CedLspResult *r = ced_lsp_result(e->lsp);
+    if (!r || !r->ready) return;
+    r->ready = false;
+    if (e->selected < 0 || e->diff) return;
+    EditorTab *tab = &e->docs[e->selected];
+    if (strcmp(tab->file.path, r->path)) return;
+    if (r->kind == CED_LSP_HOVER) {
+        if (e->assist.hover_tab == tab->id && e->assist.hover_offset == r->offset && e->assist.hover_requested &&
+            !e->palette && !e->close_dialog && !e->commit_dialog && !r->error[0])
+            ced_assist_show_hover(&e->assist, r->hover);
+        return;
+    }
+    if (tab->cursor != r->offset) return;
+    if (r->error[0]) { notify(e, r->error); return; }
+    if (r->kind == CED_LSP_COMPLETION) {
+        if (e->assist.completion_tab != tab->id || e->assist.completion_cursor != tab->cursor ||
+            (!e->assist.geometry.focused && !tab->focus)) return;
+        ced_assist_show_completions(&e->assist, r);
+        if (!r->count) notify(e, "No completions.");
+    } else {
+        if (!r->target[0]) { notify(e, "No definition found."); return; }
+        if (open_document(e, r->target, 0, 0)) e->goto_offset = ced_lsp_offset(e->docs[e->selected].file.text, r->position);
+    }
+}
+
+static void lsp_request(cui_ctx *ui, Editor *e, CedLspRequest kind) {
+    if (e->selected < 0 || e->diff) return;
+    EditorTab *tab = &e->docs[e->selected];
+    if (!tab->file.path[0] || !ced_lsp_language(tab->file.path)) { notify(e, "LSP requires a saved C or C++ file."); return; }
+    ced_assist_reset(&e->assist);
+    if (kind == CED_LSP_COMPLETION) {
+        e->assist.completion_tab = tab->id; e->assist.completion_cursor = tab->cursor;
+    } else if (kind == CED_LSP_HOVER) ced_assist_hover_at_caret(ui, &e->assist, tab->id, tab->cursor);
+    tab->focus = true;
+    if (!ced_lsp_request(e->lsp, kind, tab->file.path, tab->file.text, tab->cursor))
+        notify(e, ced_lsp_status(e->lsp));
+}
+
+static void apply_completion(cui_ctx *ui, Editor *e, int index) {
+    if (e->selected < 0 || index < 0 || index >= e->assist.count) return;
+    EditorTab *tab = &e->docs[e->selected];
+    if (tab->id != e->assist.completion_tab || tab->cursor != e->assist.completion_cursor) return;
+    CedCompletion *c = &e->assist.completions[index];
+    cui_push_id_int(ui, tab->id);
+    bool applied = ced_editor_replace(ui, "source", tab->file.text, CED_TEXT_CAP, c);
+    cui_pop_id(ui);
+    if (applied) {
+        tab->cursor = e->goto_offset = c->start + (int)strlen(c->text);
+        tab->focus = true; tab->lsp_synced = false;
+    }
+    ced_assist_reset(&e->assist);
+}
+
+static void toggle_terminal(Editor *e) {
+    e->terminal_visible = !e->terminal_visible;
+    if (e->terminal_visible) e->terminal_view.autofocus = true;
+    else if (e->selected >= 0) e->docs[e->selected].focus = true;
+}
+
+static void request_file_action(Editor *e, FileOperation operation, const char *path, bool directory) {
+    FileAction *a = &e->file_action;
+    a->operation = operation; a->directory = directory;
+    if ((operation == FILE_CREATE || operation == DIRECTORY_CREATE) && !directory) {
+        if (!ced_parent_path(path, a->path, sizeof a->path)) { notify(e, "Invalid parent folder."); return; }
+    } else snprintf(a->path, sizeof a->path, "%s", path);
+    snprintf(a->name, sizeof a->name, "%s", operation == FILE_RENAME ? ced_basename(path) : "");
+    a->error[0] = 0; a->open = true; a->execute = false; a->serial++;
+    ced_assist_reset(&e->assist);
+}
+
+static void file_context_menu(cui_ctx *ui, Editor *e, const char *path, bool directory, bool root) {
+    cui_context_menu(ui, "file-context") {
+        if (cui_menu_item(ui, "New File...", .icon = CUI_ICON_PLUS)) request_file_action(e, FILE_CREATE, path, directory);
+        if (cui_menu_item(ui, "New Folder...", .icon = CUI_ICON_FOLDER)) request_file_action(e, DIRECTORY_CREATE, path, directory);
+        if (!root) {
+            if (cui_menu_item(ui, "Rename...", .icon = CUI_ICON_SQUARE_PEN)) request_file_action(e, FILE_RENAME, path, directory);
+            cui_menu_separator(ui);
+            if (cui_menu_item(ui, "Delete", .icon = CUI_ICON_TRASH_2, .danger = true)) request_file_action(e, FILE_DELETE, path, directory);
+        }
+    }
+}
+
+static void perform_file_action(Editor *e) {
+    FileAction *a = &e->file_action;
+    if (!a->execute) return;
+    a->execute = false;
+    char result[CED_PATH] = {0};
+    bool ok = false;
+    if (a->operation == FILE_CREATE) {
+        ok = ced_file_create(e->workspace.root, a->path, a->name, result, a->error);
+    } else if (a->operation == DIRECTORY_CREATE) {
+        ok = ced_directory_create(e->workspace.root, a->path, a->name, result, a->error);
+    } else if (a->operation == FILE_RENAME) {
+        char parent[CED_PATH];
+        bool fits = ced_parent_path(a->path, parent, sizeof parent) && ced_join(result, sizeof result, parent, a->name);
+        for (int i = 0; fits && i < e->count; i++)
+            if (ced_path_within(e->docs[i].file.path, a->path))
+                fits = strlen(result) + strlen(e->docs[i].file.path + strlen(a->path)) < CED_PATH;
+        if (!fits) snprintf(a->error, sizeof a->error, "Path too long for an open file.");
+        else ok = ced_file_rename(e->workspace.root, a->path, a->name, result, a->error);
+        if (ok) {
+            for (int i = 0; i < e->count; i++) {
+                EditorTab *tab = &e->docs[i];
+                if (!ced_path_within(tab->file.path, a->path)) continue;
+                char renamed[CED_PATH];
+                snprintf(renamed, sizeof renamed, "%s%s", result, tab->file.path + strlen(a->path));
+                ced_lsp_close(e->lsp, tab->file.path);
+                snprintf(tab->file.path, sizeof tab->file.path, "%s", renamed);
+                tab->lsp_synced = false; tab_title(tab);
+            }
+            /* Let the regular refresh preserve expansion under the new names. */
+            for (int i = 0; i < e->workspace.count; i++) {
+                CedEntry *entry = &e->workspace.entries[i];
+                char absolute[CED_PATH];
+                if (!ced_join(absolute, sizeof absolute, e->workspace.root, entry->path) || !ced_path_within(absolute, a->path)) continue;
+                char renamed[CED_PATH];
+                int n = snprintf(renamed, sizeof renamed, "%s%s", result, absolute + strlen(a->path));
+                size_t root_length = strlen(e->workspace.root);
+                if (strcmp(e->workspace.root, "/")) root_length++;
+                if (n >= 0 && (size_t)n < sizeof renamed) {
+                    char *copy = strdup(renamed + root_length);
+                    if (copy) { free(entry->path); entry->path = copy; }
+                }
+            }
+        }
+    } else {
+        ok = ced_file_delete(e->workspace.root, a->path, a->error);
+        if (ok) for (int i = e->count - 1; i >= 0; i--)
+            if (ced_path_within(e->docs[i].file.path, a->path)) remove_tab(e, i);
+    }
+    /* A recursive delete may partially succeed before a permission error. */
+    ced_search_cancel(&e->search);
+    e->search.count = 0;
+    ced_assist_reset(&e->assist);
+    e->diff = false;
+    refresh(e);
+    if (e->query[0]) ced_search_start(&e->search, &e->workspace, e->query);
+    if (!ok) { a->open = true; notify(e, a->error); return; }
+    if (a->operation == FILE_CREATE || a->operation == DIRECTORY_CREATE) {
+        for (int i = 0; i < e->workspace.count; i++) {
+            char path[CED_PATH];
+            CedEntry *entry = &e->workspace.entries[i];
+            if (entry->directory && ced_join(path, sizeof path, e->workspace.root, entry->path) && ced_path_within(result, path)) entry->expanded = true;
+        }
+        if (a->operation == FILE_CREATE) open_document(e, result, 0, 0);
+    }
+    notify(e, a->operation == FILE_CREATE ? "File created." : a->operation == DIRECTORY_CREATE ? "Folder created." : a->operation == FILE_RENAME ? "Renamed." : "Deleted.");
+}
+
+static int tree_node(cui_ctx *ui, Editor *e, int index) {
+    CedEntry *entry = &e->workspace.entries[index];
+    bool selected = false;
+    char path[CED_PATH];
+    if (!ced_join(path, sizeof path, e->workspace.root, entry->path)) return index + 1;
+    if (e->selected >= 0) selected = !strcmp(path, e->docs[e->selected].file.path);
+    cui_push_id(ui, entry->path);
+    bool expanded = cui_tree_begin(ui, ced_basename(entry->path), &entry->expanded,
+        &(cui_tree_opts){.leaf = !entry->directory, .selected = selected,
+                        .icon = entry->directory ? CUI_ICON_FOLDER : CUI_ICON_FILE_TEXT});
+    if (!entry->directory && cui_tree_clicked(ui)) open_document(e, path, 0, 0);
+    file_context_menu(ui, e, path, entry->directory, false);
+    int next = index + 1;
+    if (expanded) {
+        while (next < e->workspace.count && e->workspace.entries[next].parent == index)
+            next = tree_node(ui, e, next);
+        cui_tree_end(ui);
+    } else if (entry->directory) {
+        /* Skip its depth-first subtree. */
+        while (next < e->workspace.count) {
+            int parent = e->workspace.entries[next].parent;
+            if (parent < index) break;
+            next++;
+        }
+    }
+    cui_pop_id(ui);
+    return next;
+}
+
+static void search_panel(cui_ctx *ui, Editor *e) {
+    bool changed = cui_search(ui, "project-search", e->query, sizeof e->query, .placeholder = "Search files...");
+    if (changed && !ced_search_start(&e->search, &e->workspace, e->query)) notify(e, "Could not start search.");
+    if (e->search.running) {
+        cui_secondary(ui, "Searching...");
+    } else if (e->query[0]) {
+        cui_textf(ui, "%d results%s", e->search.count, e->search.truncated ? " (limit reached)" : "");
+        cui_scroll(ui, .id = "search-results", .height = CUI_FILL, .gap = 2) {
+            for (int i = 0; i < e->search.count; i++) {
+                CedHit *hit = &e->search.hits[i];
+                char label[CED_PATH + 30];
+                snprintf(label, sizeof label, "%s:%d", hit->path, hit->line);
+                cui_push_id_int(ui, i);
+                if (cui_list_item(ui, label, .subtitle = hit->preview, .icon = CUI_ICON_SEARCH)) {
+                    char path[CED_PATH];
+                    if (ced_join(path, sizeof path, e->workspace.root, hit->path)) open_document(e, path, hit->line, hit->column);
+                }
+                cui_pop_id(ui);
+            }
+            if (!e->search.count) cui_secondary(ui, "No results.");
+        }
+    }
+}
+
+static void open_diff(Editor *e, CedChange *change, bool staged) {
+    char error[CED_ERROR], *before, *after;
+    if (!ced_git_versions(&e->git, change, staged, &before, &after, error)) { notify(e, error); return; }
+    free(e->before); free(e->after);
+    e->before = before; e->after = after;
+    e->diff = true; e->diff_staged = staged;
+    snprintf(e->diff_path, sizeof e->diff_path, "%s", change->path);
+}
+
+static void git_panel(cui_ctx *ui, Editor *e) {
+    if (!e->git.available) {
+        cui_empty_state(ui, "No Git repository", .icon = CUI_ICON_GIT_BRANCH);
+        return;
+    }
+    cui_text(ui, e->git.branch, .font = CUI_FONT_MEDIUM);
+    cui_input(ui, "commit-message", e->commit, sizeof e->commit, .placeholder = "Commit message");
+    bool staged_any = false;
+    for (int i = 0; i < e->git.count; i++) staged_any |= e->git.changes[i].index != ' ' && e->git.changes[i].index != '?';
+    if (cui_button(ui, "Commit...", .icon = CUI_ICON_CHECK, .variant = CUI_BUTTON_PRIMARY,
+                   .full_width = true, .disabled = !staged_any || !e->commit[0])) e->commit_dialog = true;
+    cui_scroll(ui, .id = "git-changes", .height = CUI_FILL, .gap = 2) {
+        if (!e->git.count) cui_secondary(ui, "No changes.");
+        bool mutated = false;
+        for (int group = 0; group < 2 && !mutated; group++) {
+            cui_text(ui, group == 0 ? "STAGED CHANGES" : "CHANGES", .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+            for (int i = 0; i < e->git.count; i++) {
+                CedChange *change = &e->git.changes[i];
+                bool staged = group == 0;
+                char status = staged ? change->index : change->worktree;
+                if (status == ' ' || (staged && status == '?')) continue;
+                char label[CED_PATH + 8];
+                snprintf(label, sizeof label, "%c  %s", status, change->path);
+                cui_push_id_int(ui, group * CED_MAX_CHANGES + i);
+                cui_row(ui, .gap = 2) {
+                    cui_column(ui, .width = CUI_FILL) {
+                        if (cui_nav_item(ui, label, .selected = e->diff && e->diff_staged == staged && !strcmp(e->diff_path, change->path))) open_diff(e, change, staged);
+                    }
+                    if (cui_icon_button(ui, staged ? CUI_ICON_MINUS : CUI_ICON_PLUS, .size = CUI_SIZE_SM,
+                                        .tooltip = staged ? "Unstage Changes" : "Stage Changes")) {
+                        char error[CED_ERROR];
+                        if (!ced_git_stage(&e->git, change->path, staged, error)) notify(e, error);
+                        else notify(e, staged ? "Changes unstaged." : "Changes staged.");
+                        mutated = true;
+                    }
+                }
+                cui_pop_id(ui);
+                if (mutated) break;
+            }
+        }
+        if (mutated) refresh_git(e);
+        if (e->git.truncated) cui_secondary(ui, "Showing first 4096 changes.");
+    }
+}
+
+static void sidebar(cui_ctx *ui, Editor *e) {
+    static const char *labels[] = {"Files", "Search", "Git"};
+    static const char *icons[] = {CUI_ICON_FOLDER, CUI_ICON_SEARCH, CUI_ICON_GIT_BRANCH};
+    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .bg = CUI_COLOR_SURFACE_MUTED, .clip = true) {
+        int old = e->panel;
+        cui_row(ui, .width = CUI_FILL, .gap = 0, .pad = 0) {
+            for (int i = 0; i < 3; i++)
+                if (cui_icon_button(ui, icons[i], .tooltip = labels[i], .size = CUI_SIZE_SM, .selected = e->panel == i)) e->panel = i;
+        }
+        if (old != e->panel && e->panel == 2) refresh_git(e);
+        cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 10, .gap = 10) {
+            cui_row(ui, .gap = 4) {
+                cui_column(ui, .width = CUI_FILL) {
+                    cui_nav_item(ui, ced_basename(e->workspace.root), .icon = CUI_ICON_FOLDER);
+                    file_context_menu(ui, e, e->workspace.root, true, true);
+                }
+                if (cui_icon_button(ui, CUI_ICON_REFRESH_CW, .size = CUI_SIZE_SM, .tooltip = "Refresh Files and Git")) {
+                    refresh(e);
+                    if (e->panel == 1 && e->query[0]) ced_search_start(&e->search, &e->workspace, e->query);
+                }
+            }
+            if (e->panel == 0) {
+                cui_scroll(ui, .id = "files", .height = CUI_FILL) {
+                    for (int i = 0; i < e->workspace.count;) i = tree_node(ui, e, i);
+                    if (!e->workspace.count) cui_secondary(ui, "Empty folder.");
+                }
+                if (e->workspace.truncated) cui_secondary(ui, "Partial listing: limit reached or access denied.");
+            } else if (e->panel == 1) search_panel(ui, e);
+            else git_panel(ui, e);
+        }
+    }
+}
+
+static int compare_marks(const void *a, const void *b) {
+    const cui_text_mark *left = a, *right = b;
+    return left->start < right->start ? -1 : left->start > right->start;
+}
+
+static void problems_panel(cui_ctx *ui, Editor *e, EditorTab *tab, const CedDiagnostic *diagnostics, int count) {
+    if (!e->problems_open || !count) return;
+    cui_column(ui, .height = CUI_PX(150), .gap = 2, .pad = 8, .bg = CUI_COLOR_SURFACE_MUTED) {
+        cui_row(ui, .gap = 4) {
+            cui_text(ui, "Problems", .font = CUI_FONT_MEDIUM, .size = 12, .width = CUI_FILL);
+            if (cui_icon_button(ui, CUI_ICON_X, .size = CUI_SIZE_SM, .tooltip = "Hide Problems")) e->problems_open = false;
+        }
+        cui_scroll(ui, .id = "diagnostics", .height = CUI_FILL) {
+            for (int i = 0; i < count; i++) {
+                CedLspPosition pos = ced_lsp_position(tab->file.text, diagnostics[i].start);
+                char label[560];
+                snprintf(label, sizeof label, "%d:%d  %.*s", pos.line + 1, pos.character + 1,
+                         (int)strcspn(diagnostics[i].message, "\r\n"), diagnostics[i].message);
+                cui_push_id_int(ui, i);
+                if (cui_nav_item(ui, label, .icon = diagnostics[i].severity == 1 ? CUI_ICON_TRIANGLE_ALERT : CUI_ICON_INFO)) {
+                    e->goto_offset = diagnostics[i].start; tab->focus = true;
+                }
+                cui_tooltip(ui, diagnostics[i].message);
+                cui_pop_id(ui);
+            }
+        }
+    }
+}
+
+static void toggle_markdown_preview(Editor *e) {
+    if (e->selected < 0 || e->diff || !ced_markdown_file(e->docs[e->selected].file.path)) return;
+    EditorTab *tab = &e->docs[e->selected];
+    tab->markdown_preview = !tab->markdown_preview;
+    tab->focus = !tab->markdown_preview;
+    ced_assist_reset(&e->assist);
+}
+
+static void markdown_preview(cui_ctx *ui, Editor *e, EditorTab *tab) {
+    cui_push_id_int(ui, tab->id);
+    cui_scroll(ui, .id = "markdown-preview", .height = CUI_FILL, .pad = 24, .gap = 12) {
+        cui_markdown_result result = cui_markdown(ui, "document-markdown", tab->file.text, .size = (float)e->font_size);
+        if (result.link) {
+            if (!strncmp(result.link, "https://", 8) || !strncmp(result.link, "http://", 7)) cui_app_open_url(result.link);
+            else if (result.link[0] != '#' && !strstr(result.link, ":")) {
+                char parent[CED_PATH], path[CED_PATH];
+                if (ced_parent_path(tab->file.path, parent, sizeof parent) && ced_join(path, sizeof path, parent, result.link) && open_document(e, path, 0, 0))
+                    e->docs[e->selected].markdown_preview = ced_markdown_file(path);
+            }
+        }
+    }
+    cui_pop_id(ui);
+}
+
+static void editor_pane(cui_ctx *ui, Editor *e) {
+    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .bg = CUI_COLOR_SURFACE, .clip = true) {
+        if (e->count) {
+            cui_doc_tab tabs[MAX_DOCS];
+            for (int i = 0; i < e->count; i++) tabs[i] = (cui_doc_tab){
+                .title = e->docs[i].title, .icon = CUI_ICON_FILE_TEXT,
+                .tooltip = e->docs[i].file.path, .dirty = ced_document_dirty(&e->docs[i].file)};
+            cui_doc_tabs_result result = cui_doc_tabs(ui, "documents", tabs, e->count, &e->selected, .shortcuts = true);
+            if (result.changed) { e->diff = false; e->docs[e->selected].focus = true; ced_assist_reset(&e->assist); }
+            if (result.move_from >= 0) {
+                EditorTab moved = e->docs[result.move_from];
+                if (result.move_from < result.move_to)
+                    memmove(e->docs + result.move_from, e->docs + result.move_from + 1, sizeof moved * (size_t)(result.move_to - result.move_from));
+                else memmove(e->docs + result.move_to + 1, e->docs + result.move_to, sizeof moved * (size_t)(result.move_from - result.move_to));
+                e->docs[result.move_to] = moved;
+            }
+            if (result.close >= 0) request_close(e, result.close);
+        }
+        if (e->diff) {
+            cui_row(ui, .pad = 8, .gap = 8) {
+                cui_text(ui, e->diff_path, .width = CUI_FILL, .nowrap = true);
+                if (cui_button(ui, "Edit File", .size = CUI_SIZE_SM)) {
+                    char path[CED_PATH];
+                    if (ced_join(path, sizeof path, e->git.root, e->diff_path)) open_document(e, path, 0, 0);
+                }
+                if (cui_icon_button(ui, CUI_ICON_X, .tooltip = "Close Diff")) e->diff = false;
+            }
+            cui_diff_view(ui, "git-diff", e->before, e->after, .height = -1, .language = ced_language(e->diff_path),
+                          .old_title = e->diff_staged ? "HEAD" : "Index", .new_title = e->diff_staged ? "Index" : "Working Tree",
+                          .size = e->font_size);
+        } else if (e->selected >= 0 && e->selected < e->count) {
+            EditorTab *tab = &e->docs[e->selected];
+            bool assist_enabled = !e->close_dialog && !e->commit_dialog && !e->file_action.open && !e->palette && ced_lsp_language(tab->file.path);
+            if (!assist_enabled) ced_assist_reset(&e->assist);
+            int accepted = assist_enabled ? ced_assist_keys(ui, &e->assist) : -1;
+            if (accepted >= 0) apply_completion(ui, e, accepted);
+            cui_row(ui, .gap = 8) {
+                cui_text(ui, tab->file.path[0] ? tab->file.path : "Untitled",
+                         .size = 11, .color = CUI_COLOR_TEXT_MUTED, .nowrap = true, .width = CUI_FILL);
+                if (ced_markdown_file(tab->file.path) && cui_button(ui, tab->markdown_preview ? "Edit" : "Preview",
+                        .icon = tab->markdown_preview ? CUI_ICON_CODE : CUI_ICON_EYE, .size = CUI_SIZE_SM)) toggle_markdown_preview(e);
+            }
+            if (tab->markdown_preview && ced_markdown_file(tab->file.path)) {
+                ced_assist_reset(&e->assist);
+                markdown_preview(ui, e, tab);
+            } else {
+                cui_push_id_int(ui, tab->id);
+                bool complete = assist_enabled && ced_editor_completion_key(ui, "source");
+                if (tab->focus && e->goto_line <= 0 && e->goto_offset < 0)
+                    cui_code_editor_select(ui, "source", tab->cursor, tab->cursor);
+                if (e->goto_line > 0) {
+                    cui_code_editor_goto(ui, "source", e->goto_line, e->goto_column);
+                    e->goto_line = 0;
+                }
+                if (e->goto_offset >= 0) {
+                    cui_code_editor_select(ui, "source", e->goto_offset, e->goto_offset);
+                    e->goto_offset = -1;
+                }
+                int diagnostic_count = 0;
+                const CedDiagnostic *diagnostics = ced_lsp_diagnostics(e->lsp, tab->file.path, &diagnostic_count);
+                cui_text_mark marks[CED_LSP_DIAGNOSTICS];
+                for (int i = 0; i < diagnostic_count; i++) marks[i] = (cui_text_mark){diagnostics[i].start, diagnostics[i].end, diagnostics[i].severity == 1 ? 4 : 3};
+                qsort(marks, (size_t)diagnostic_count, sizeof *marks, compare_marks);
+                e->caret = cui_code_editor(ui, "source", tab->file.text, CED_TEXT_CAP,
+                    .lang = ced_language(tab->file.path), .height = -1, .size = e->font_size, .tab_size = 4, .autofocus = tab->focus,
+                    .marks = marks, .mark_count = diagnostic_count);
+                tab->cursor = e->caret.cursor;
+                if (e->caret.changed) tab->lsp_synced = false;
+                tab->focus = false;
+                if (e->caret.refused) notify(e, "Edit exceeds the 2 MiB file limit.");
+                CedEditorGeometry geometry = ced_editor_geometry(ui, "source", tab->file.text, (float)e->font_size);
+                cui_pop_id(ui);
+                CedLspResult *pending = ced_lsp_result(e->lsp);
+                bool completing = e->assist.completion_open || (ced_lsp_pending(e->lsp) && pending &&
+                    pending->kind == CED_LSP_COMPLETION && e->assist.completion_tab == tab->id);
+                if (e->caret.changed && completing && tab->cursor > 0) {
+                    unsigned char ch = (unsigned char)tab->file.text[tab->cursor - 1];
+                    complete |= (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch >= 128;
+                }
+                int hover = ced_assist_hover(ui, &e->assist, tab->id, geometry, e->caret.changed,
+                    assist_enabled && ced_lsp_ready(e->lsp) && !ced_lsp_pending(e->lsp) && !complete);
+                if (!assist_enabled) ced_assist_reset(&e->assist);
+                if (complete) lsp_request(ui, e, CED_LSP_COMPLETION);
+                else if (hover >= 0) ced_lsp_request(e->lsp, CED_LSP_HOVER, tab->file.path, tab->file.text, hover);
+                if (!e->caret.changed) problems_panel(ui, e, tab, diagnostics, diagnostic_count);
+            }
+        } else {
+            cui_spacer(ui);
+            cui_column(ui, .align = CUI_ALIGN_CENTER, .gap = 16, .pad = 32) {
+                cui_heading(ui, "CED", 1);
+                cui_row(ui, .gap = 12, .justify = CUI_JUSTIFY_CENTER) {
+                    if (cui_button(ui, "New File", .icon = CUI_ICON_PLUS, .variant = CUI_BUTTON_PRIMARY)) new_document(e);
+                    if (cui_button(ui, "Open File", .icon = CUI_ICON_FILE_TEXT)) choose_file(e);
+                }
+            }
+            cui_spacer(ui);
+        }
+    }
+}
+
+static void terminal_panel(cui_ctx *ui, Editor *e) {
+    if (!e->terminal) {
+        char error[CED_ERROR];
+        e->terminal = ced_terminal_start(e->workspace.root, getenv("SHELL"), error, sizeof error);
+        if (!e->terminal) { notify(e, error); e->terminal_visible = false; return; }
+        e->terminal_view.autofocus = true;
+    }
+    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .bg = CUI_COLOR_SURFACE_MUTED, .clip = true) {
+        cui_row(ui, .pad_x = 8, .pad_y = 4, .gap = 6) {
+            cui_text(ui, "Terminal", .font = CUI_FONT_MEDIUM, .size = 12, .width = CUI_FILL);
+            static const char *positions[] = {"Bottom", "Right"};
+            int position = e->terminal_right ? 1 : 0;
+            if (cui_segmented(ui, "terminal-position", positions, 2, &position, .size = CUI_SIZE_SM)) e->terminal_right = position == 1;
+            if (cui_icon_button(ui, CUI_ICON_REFRESH_CW, .size = CUI_SIZE_SM, .tooltip = "Restart Terminal")) {
+                ced_terminal_stop(e->terminal); e->terminal = NULL;
+            }
+            if (cui_icon_button(ui, CUI_ICON_X, .size = CUI_SIZE_SM, .tooltip = "Hide Terminal")) toggle_terminal(e);
+        }
+        if (e->terminal) {
+            if (!e->terminal->alive) cui_secondary(ui, "Shell exited.");
+            ced_terminal_view(ui, e->terminal, &e->terminal_view, (float)e->font_size);
+        }
+    }
+}
+
+static void document_area(cui_ctx *ui, Editor *e) {
+    if (!e->terminal_visible) { e->terminal_view.focused = false; editor_pane(ui, e); return; }
+    bool right = e->terminal_right;
+    float *ratio = right ? &e->terminal_right_split : &e->terminal_bottom_split;
+    cui_split(ui, right ? "terminal-right-split" : "terminal-bottom-split", ratio,
+              .vertical = !right, .min_first = right ? 220 : 140, .min_second = right ? 260 : 140, .height = CUI_FILL) {
+        editor_pane(ui, e);
+        cui_split_next(ui);
+        terminal_panel(ui, e);
+    }
+}
+
+static void dialogs(cui_ctx *ui, Editor *e) {
+    cui_dialog(ui, "Save Changes?", &e->close_dialog, .description = "Unsaved changes will be lost.", .width = 480) {
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "Cancel", .variant = CUI_BUTTON_DEFAULT)) e->close_dialog = false;
+            if (cui_button(ui, "Discard", .variant = CUI_BUTTON_DANGER)) {
+                remove_tab(e, e->close_index); e->close_dialog = false;
+            }
+            if (cui_button(ui, "Save", .variant = CUI_BUTTON_PRIMARY)) {
+                if (save_document(e, e->close_index, false)) { remove_tab(e, e->close_index); e->close_dialog = false; }
+            }
+        }
+    }
+    cui_dialog(ui, "Create Commit?", &e->commit_dialog, .width = 480) {
+        cui_text(ui, e->commit, .size = 14);
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "Cancel", .variant = CUI_BUTTON_DEFAULT)) e->commit_dialog = false;
+            if (cui_button(ui, "Create Commit", .variant = CUI_BUTTON_PRIMARY)) {
+                char error[CED_ERROR];
+                if (ced_git_commit(&e->git, e->commit, error)) { notify(e, "Commit created."); e->commit[0] = 0; }
+                else notify(e, error);
+                refresh_git(e);
+                e->commit_dialog = false;
+            }
+        }
+    }
+    FileAction *a = &e->file_action;
+    const char *title = a->operation == FILE_CREATE ? "New File" : a->operation == DIRECTORY_CREATE ? "New Folder" : a->operation == FILE_RENAME ? "Rename" : "Delete?";
+    cui_dialog(ui, title, &a->open, .width = 500) {
+        cui_text(ui, a->path, .size = 12, .color = CUI_COLOR_TEXT_MUTED, .width = CUI_FILL);
+        bool submitted = false;
+        if (a->operation != FILE_DELETE) {
+            cui_push_id_int(ui, a->serial);
+            submitted = (cui_input(ui, "file-name", a->name, sizeof a->name, .placeholder = a->operation == DIRECTORY_CREATE ? "Folder name" : "File name", .autofocus = true,
+                .error = a->error[0] ? a->error : NULL) & CUI_SUBMITTED) != 0;
+            cui_pop_id(ui);
+        } else {
+            cui_text(ui, a->directory ? "Delete this folder and all its contents? This cannot be undone." : "Delete this file? This cannot be undone.", .size = 13);
+            int unsaved = 0;
+            for (int i = 0; i < e->count; i++)
+                if (ced_path_within(e->docs[i].file.path, a->path) && ced_document_dirty(&e->docs[i].file)) unsaved++;
+            if (unsaved) cui_textf(ui, "Unsaved changes in %d open file%s will be discarded.", unsaved, unsaved == 1 ? "" : "s");
+            if (a->error[0]) cui_text(ui, a->error, .color = CUI_COLOR_TEXT_MUTED, .size = 12);
+        }
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "Cancel", .variant = CUI_BUTTON_DEFAULT)) a->open = false;
+            bool clicked = cui_button(ui, a->operation == FILE_RENAME ? "Rename" : a->operation == FILE_DELETE ? "Delete" : "Create",
+                .variant = a->operation == FILE_DELETE ? CUI_BUTTON_DANGER : CUI_BUTTON_PRIMARY,
+                .disabled = a->operation != FILE_DELETE && !a->name[0]);
+            if (clicked || (submitted && a->name[0])) { a->execute = true; a->open = false; }
+        }
+    }
+}
+
+static void frame(cui_ctx *ui, Editor *e) {
+    /* Tree paths and document buffers from the previous frame are no longer
+     * needed by the renderer here, so filesystem actions can refresh them. */
+    perform_file_action(e);
+    /* Release diff sources only after the previous frame has finished painting. */
+    if (!e->diff) {
+        free(e->before); free(e->after);
+        e->before = e->after = NULL;
+    }
+    if (e->selected < 0 || e->diff || e->close_dialog || e->commit_dialog || e->file_action.open || e->palette) ced_assist_reset(&e->assist);
+    lsp_tick(e);
+    if (ced_lsp_running(e->lsp)) cui_request_wakeup(ui, 0.05f);
+    if (e->terminal) {
+        ced_terminal_poll(e->terminal);
+        if (e->terminal->alive) cui_request_wakeup(ui, e->terminal_visible ? 0.03f : 0.1f);
+    }
+    if (e->search.running && ced_search_done(&e->search)) ced_search_finish(&e->search);
+    if (e->search.running) cui_request_wakeup(ui, 0.05f);
+    if (!e->close_dialog && !e->commit_dialog && !e->file_action.open && !e->palette) {
+        int previous_font_size = e->font_size;
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_MINUS) && e->font_size > CED_FONT_SIZE_MIN) e->font_size--;
+        if ((cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_EQUAL) ||
+             cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_EQUAL)) && e->font_size < CED_FONT_SIZE_MAX) e->font_size++;
+        if (e->font_size != previous_font_size && !ced_font_size_save(e->font_size))
+            notify(e, "Could not save editor settings.");
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_N)) new_document(e);
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_O)) choose_file(e);
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_O)) choose_folder(e);
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_S)) save_document(e, e->selected, false);
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_S)) save_document(e, e->selected, true);
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_B)) e->sidebar = !e->sidebar;
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_E)) { e->panel = 0; e->sidebar = true; }
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_F)) { e->panel = 1; e->sidebar = true; }
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_G)) { e->panel = 2; e->sidebar = true; refresh_git(e); }
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_P)) e->palette = true;
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_J)) toggle_terminal(e);
+        if (!e->terminal_view.focused) {
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_V)) toggle_markdown_preview(e);
+            if (cui_shortcut(ui, 0, CUI_KEY_F12)) lsp_request(ui, e, CED_LSP_DEFINITION);
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_K)) lsp_request(ui, e, CED_LSP_HOVER);
+        }
+    }
+    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .bg = CUI_COLOR_BACKGROUND) {
+        cui_toolbar(ui, "main-toolbar", .no_border = false) {
+            cui_toolbar_button(ui, CUI_ICON_PANEL_LEFT, .tooltip = "Toggle Sidebar", .toggle = &e->sidebar);
+            if (cui_toolbar_button(ui, CUI_ICON_PLUS, .label = "New")) new_document(e);
+            if (cui_toolbar_button(ui, CUI_ICON_FOLDER_OPEN, .label = "Open")) choose_file(e);
+            if (cui_toolbar_button(ui, CUI_ICON_SAVE, .label = "Save", .disabled = e->selected < 0)) save_document(e, e->selected, false);
+            if (cui_toolbar_button(ui, CUI_ICON_TERMINAL, .label = "Terminal")) toggle_terminal(e);
+            cui_toolbar_spacer(ui);
+            cui_text(ui, "CED", .font = CUI_FONT_MEDIUM, .size = 12);
+            cui_theme_toggle(ui);
+        }
+        cui_box(ui, .width = CUI_FILL, .height = CUI_FILL) {
+            if (e->sidebar) {
+                cui_split(ui, "workspace-split", &e->split, .min_first = 290, .min_second = 380, .height = CUI_FILL) {
+                    sidebar(ui, e);
+                    cui_split_next(ui);
+                    document_area(ui, e);
+                }
+            } else document_area(ui, e);
+        }
+        cui_status_bar(ui, "status", .no_border = false) {
+            cui_status_bar_text(ui, e->git.available ? e->git.branch : "No Git", .icon = CUI_ICON_GIT_BRANCH);
+            cui_status_bar_text(ui, e->message, .tone = CUI_TONE_NEUTRAL);
+            cui_status_bar_spacer(ui);
+            if (e->lsp_attempted) cui_status_bar_text(ui, ced_lsp_status(e->lsp), .tone = CUI_TONE_NEUTRAL);
+            if (!e->diff && e->selected >= 0) {
+                int count;
+                ced_lsp_diagnostics(e->lsp, e->docs[e->selected].file.path, &count);
+                char problems[40]; snprintf(problems, sizeof problems, "Problems: %d", count);
+                if (ced_lsp_language(e->docs[e->selected].file.path) && cui_status_bar_item(ui, problems, .icon = CUI_ICON_TRIANGLE_ALERT)) e->problems_open = !e->problems_open;
+                if (!e->docs[e->selected].markdown_preview) {
+                    char position[64];
+                    snprintf(position, sizeof position, "Ln %d, Col %d", e->caret.line, e->caret.column);
+                    cui_status_bar_text(ui, position, .tone = CUI_TONE_NEUTRAL);
+                    cui_status_bar_text(ui, e->docs[e->selected].file.crlf ? "CRLF" : "LF", .tone = CUI_TONE_NEUTRAL);
+                }
+                cui_status_bar_text(ui, ced_language(e->docs[e->selected].file.path), .tone = CUI_TONE_NEUTRAL);
+            }
+        }
+    }
+    dialogs(ui, e);
+    int completion = ced_assist_draw(ui, &e->assist);
+    if (completion >= 0) apply_completion(ui, e, completion);
+    static const cui_command commands[] = {
+        {"New File", CUI_ICON_PLUS, "File", "Cmd/Ctrl N"},
+        {"Open File", CUI_ICON_FILE_TEXT, "File", "Cmd/Ctrl O"},
+        {"Open Folder", CUI_ICON_FOLDER_OPEN, "File", "Cmd/Ctrl Shift O"},
+        {"Save", CUI_ICON_SAVE, "File", "Cmd/Ctrl S"},
+        {"Save As", CUI_ICON_SAVE, "File", "Cmd/Ctrl Shift S"},
+        {"Refresh Files and Git", CUI_ICON_REFRESH_CW, "Project", NULL},
+        {"Toggle Theme", CUI_ICON_MOON, "Appearance", NULL},
+        {"Complete", CUI_ICON_CODE, "Language", "Ctrl Space"},
+        {"Go to Definition", CUI_ICON_CODE, "Language", "F12"},
+        {"Symbol Information", CUI_ICON_INFO, "Language", "Cmd/Ctrl Shift K"},
+        {"Restart Language Server", CUI_ICON_REFRESH_CW, "Language", NULL},
+        {"Toggle Terminal", CUI_ICON_TERMINAL, "Terminal", "Cmd/Ctrl J"},
+        {"Move Terminal Right", CUI_ICON_TERMINAL, "Terminal", NULL},
+        {"Move Terminal to Bottom", CUI_ICON_TERMINAL, "Terminal", NULL},
+        {"Toggle Markdown Preview", CUI_ICON_EYE, "View", "Cmd/Ctrl Shift V"}
+    };
+    switch (cui_command_palette(ui, &e->palette, commands, (int)(sizeof commands / sizeof commands[0]))) {
+        case 0: new_document(e); break;
+        case 1: choose_file(e); break;
+        case 2: choose_folder(e); break;
+        case 3: save_document(e, e->selected, false); break;
+        case 4: save_document(e, e->selected, true); break;
+        case 5: refresh(e); break;
+        case 6: cui_set_theme(ui, cui_get_theme_mode(ui) == CUI_THEME_DARK ? CUI_THEME_LIGHT : CUI_THEME_DARK); break;
+        case 7: lsp_request(ui, e, CED_LSP_COMPLETION); break;
+        case 8: lsp_request(ui, e, CED_LSP_DEFINITION); break;
+        case 9: lsp_request(ui, e, CED_LSP_HOVER); break;
+        case 10:
+            ced_lsp_stop(e->lsp); e->lsp = NULL; e->lsp_attempted = false;
+            ced_assist_reset(&e->assist);
+            for (int i = 0; i < e->count; i++) e->docs[i].lsp_synced = false;
+            break;
+        case 11: toggle_terminal(e); break;
+        case 12: e->terminal_right = true; if (!e->terminal_visible) toggle_terminal(e); break;
+        case 13: e->terminal_right = false; if (!e->terminal_visible) toggle_terminal(e); break;
+        case 14: toggle_markdown_preview(e); break;
+        default: break;
+    }
+}
+
+static void editor_free(Editor *e) {
+    ced_search_cancel(&e->search);
+    ced_lsp_stop(e->lsp);
+    ced_terminal_stop(e->terminal);
+    pthread_mutex_destroy(&e->search.mutex);
+    for (int i = 0; i < e->count; i++) ced_document_free(&e->docs[i].file);
+    ced_workspace_free(&e->workspace);
+    ced_git_free(&e->git);
+    free(e->before); free(e->after);
+    if (e->app) cui_app_destroy(e->app);
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
+        puts("Usage: ced [folder] [file ...]");
+        return 0;
+    }
+    static Editor e;
+    e.selected = -1;
+    e.sidebar = true;
+    e.split = 0.27f;
+    e.font_size = ced_font_size_load();
+    e.goto_offset = -1; e.problems_open = true;
+    e.terminal_bottom_split = 0.65f; e.terminal_right_split = 0.6f;
+    pthread_mutex_init(&e.search.mutex, NULL);
+    char error[CED_ERROR];
+    const char *root = argc > 1 ? argv[1] : ".";
+    if (!ced_workspace_open(&e.workspace, root, error)) { fprintf(stderr, "%s\n", error); editor_free(&e); return 1; }
+    refresh_git(&e);
+    recovery_path(&e);
+    restore_recovery(&e);
+    for (int i = 2; i < argc; i++) {
+        char path[CED_PATH];
+        if (argv[i][0] == '/') open_document(&e, argv[i], 0, 0);
+        else if (ced_join(path, sizeof path, e.workspace.root, argv[i])) open_document(&e, path, 0, 0);
+    }
+    e.app = cui_app_create(&(cui_app_desc){.title = "CED · Editor", .width = 1280, .height = 820,
+        .min_width = 760, .min_height = 480, .theme = CUI_THEME_DARK, .accent = CUI_ACCENT_BLUE,
+        .app_id = "dev.ced.Editor"});
+    if (!e.app) { fprintf(stderr, "Could not create window.\n"); editor_free(&e); return 1; }
+#ifdef __APPLE__
+    void *shortcut_monitor = ced_macos_shortcuts(e.app);
+#endif
+    while (cui_app_frame(e.app)) frame(cui_app_ui(e.app), &e);
+#ifdef __APPLE__
+    ced_macos_remove_shortcuts(shortcut_monitor);
+#endif
+    if (!write_recovery(&e)) {
+        fprintf(stderr, "Could not write recovery file: %s\n", e.recovery);
+        /* Last-resort copies in the workspace, without replacing user files. */
+        for (int i = 0; i < e.count; i++) {
+            if (!ced_document_dirty(&e.docs[i].file)) continue;
+            char path[CED_PATH];
+            if (!ced_join(path, sizeof path, e.workspace.root, ".ced-recovery-XXXXXX")) continue;
+            int fd = mkstemp(path);
+            if (fd >= 0) {
+                FILE *f = fdopen(fd, "wb");
+                if (f) { fputs(e.docs[i].file.text, f); fclose(f); fprintf(stderr, "Recovery: %s\n", path); }
+                else close(fd);
+            }
+        }
+    }
+    editor_free(&e);
+    return 0;
+}

@@ -1,0 +1,107 @@
+cmake_minimum_required(VERSION 3.20)
+project(ced VERSION 0.1.0 LANGUAGES C)
+
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+foreach(dependency_file IN ITEMS
+        third_party/CUI/CMakeLists.txt
+        third_party/cjson/cJSON.c
+        third_party/libvterm/src/vterm.c)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${dependency_file}")
+        message(FATAL_ERROR "Missing dependency submodules. Run:\n  git submodule update --init --recursive")
+    endif()
+endforeach()
+set(CUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(CUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(CED_CUI_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/CUI")
+add_subdirectory(third_party/CUI EXCLUDE_FROM_ALL)
+find_package(Threads REQUIRED)
+find_package(Perl REQUIRED)
+
+add_library(ced_json STATIC third_party/cjson/cJSON.c)
+target_include_directories(ced_json PUBLIC third_party/cjson)
+add_library(ced_vterm STATIC
+    third_party/libvterm/src/encoding.c third_party/libvterm/src/keyboard.c
+    third_party/libvterm/src/mouse.c third_party/libvterm/src/parser.c
+    third_party/libvterm/src/pen.c third_party/libvterm/src/screen.c
+    third_party/libvterm/src/state.c third_party/libvterm/src/unicode.c
+    third_party/libvterm/src/vterm.c)
+target_include_directories(ced_vterm PUBLIC third_party/libvterm/include)
+# The upstream Git checkout contains encoding tables, not their generated C
+# headers. Generate those in the build tree so the submodule stays clean.
+set(CED_VTERM_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/generated/libvterm")
+set(CED_VTERM_ENCODINGS)
+foreach(encoding IN ITEMS DECdrawing uk)
+    set(output "${CED_VTERM_GENERATED}/encoding/${encoding}.inc")
+    add_custom_command(OUTPUT "${output}"
+        COMMAND "${CMAKE_COMMAND}"
+            "-DPERL=${PERL_EXECUTABLE}"
+            "-DGENERATOR=${CMAKE_CURRENT_SOURCE_DIR}/third_party/libvterm/tbl2inc_c.pl"
+            "-DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/third_party/libvterm/src/encoding/${encoding}.tbl"
+            "-DOUTPUT=${output}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GenerateVTermEncoding.cmake"
+        DEPENDS
+            "third_party/libvterm/src/encoding/${encoding}.tbl"
+            "third_party/libvterm/tbl2inc_c.pl"
+            "cmake/GenerateVTermEncoding.cmake"
+        VERBATIM)
+    list(APPEND CED_VTERM_ENCODINGS "${output}")
+endforeach()
+add_custom_target(ced_vterm_encodings DEPENDS ${CED_VTERM_ENCODINGS})
+add_dependencies(ced_vterm ced_vterm_encodings)
+target_include_directories(ced_vterm PRIVATE "${CED_VTERM_GENERATED}")
+
+add_library(ced_core src/workspace.c src/preferences.c src/lsp.c src/terminal.c src/file_operations.c)
+target_include_directories(ced_core PUBLIC src)
+target_compile_definitions(ced_core PUBLIC _DARWIN_C_SOURCE _POSIX_C_SOURCE=200809L _XOPEN_SOURCE=700)
+target_compile_options(ced_core PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(ced_core PUBLIC Threads::Threads ced_json ced_vterm)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(ced_core PUBLIC util m)
+endif()
+
+add_executable(ced src/main.c src/terminal_view.c src/editor_assist.c)
+target_include_directories(ced PRIVATE "${CED_CUI_SOURCE_DIR}/src")
+target_link_libraries(ced PRIVATE ced_core cui::cui)
+target_compile_options(ced PRIVATE -Wall -Wextra -Wpedantic)
+cui_app_target(ced)
+if(APPLE)
+    enable_language(OBJC)
+    target_sources(ced PRIVATE src/macos.m)
+    target_compile_options(ced PRIVATE $<$<COMPILE_LANGUAGE:OBJC>:-fobjc-arc>)
+    # Keep the CLI executable and also provide a Finder-launchable application.
+    configure_file(packaging/Info.plist.in ${CMAKE_BINARY_DIR}/Info.plist @ONLY)
+    add_custom_command(TARGET ced POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/CED.app/Contents/MacOS"
+        COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:ced>" "${CMAKE_BINARY_DIR}/CED.app/Contents/MacOS/ced"
+        COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_BINARY_DIR}/Info.plist" "${CMAKE_BINARY_DIR}/CED.app/Contents/Info.plist")
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(ced_tests tests/workspace_test.c)
+    target_link_libraries(ced_tests PRIVATE ced_core)
+    target_compile_options(ced_tests PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
+    add_test(NAME workspace COMMAND ced_tests)
+    add_executable(ced_lsp_tests tests/lsp_test.c)
+    target_link_libraries(ced_lsp_tests PRIVATE ced_core)
+    target_compile_options(ced_lsp_tests PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
+    find_program(CED_CLANGD_EXECUTABLE clangd)
+    if(CED_CLANGD_EXECUTABLE)
+        add_test(NAME lsp COMMAND ced_lsp_tests ${CED_CLANGD_EXECUTABLE})
+    else()
+        add_test(NAME lsp COMMAND ced_lsp_tests)
+    endif()
+    set_tests_properties(lsp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 45)
+    add_executable(ced_terminal_tests tests/terminal_test.c)
+    target_link_libraries(ced_terminal_tests PRIVATE ced_core)
+    target_compile_options(ced_terminal_tests PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
+    add_test(NAME terminal COMMAND ced_terminal_tests)
+    set_tests_properties(terminal PROPERTIES TIMEOUT 20)
+    add_executable(ced_editor_assist_tests tests/editor_assist_test.c src/editor_assist.c)
+    target_include_directories(ced_editor_assist_tests PRIVATE "${CED_CUI_SOURCE_DIR}/src")
+    target_link_libraries(ced_editor_assist_tests PRIVATE ced_core cui::cui)
+    target_compile_options(ced_editor_assist_tests PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
+    add_test(NAME editor_assist COMMAND ced_editor_assist_tests)
+endif()

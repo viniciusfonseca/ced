@@ -1,0 +1,137 @@
+# CED
+
+A desktop text editor written in C99 with [CUI](https://github.com/yappologistic/CUI), organized around a VS Code-inspired workspace.
+
+- **Files:** expandable file tree, file opening, project refresh, and context menus for creating, renaming, and deleting files and folders.
+- **Search:** literal search in the background; click a result to open its line and column.
+- **Git:** current branch, staged and local changes, side-by-side diffs, staging, unstaging, and commits with confirmation.
+- **Editor:** multiple reorderable tabs, unsaved-change indicators, syntax highlighting, line numbers, indentation, undo/redo, copy/paste, in-file search, and go-to-line navigation.
+- **Markdown:** rendered previews of the current buffer, including unsaved changes.
+- **LSP:** clangd integration for C/C++, with diagnostics, completion, symbol information, and go-to-definition.
+- **Terminal:** an interactive PTY shell in a resizable panel to the right of or below the editor.
+- Resizable sidebar, light/dark themes, and a command palette.
+
+## Build and run
+
+Requirements: CMake 3.20+, a C compiler, Git, and Perl 5 on your PATH. Perl generates libvterm's encoding headers during the build. The current implementation uses POSIX APIs and supports **macOS and Linux**. On Linux, install the X11 development headers (`libx11-dev` on Debian/Ubuntu); file dialogs require `zenity` or `kdialog`.
+
+Clone this repository with `git clone --recurse-submodules`, or initialize the submodules in an existing checkout before configuring:
+
+```sh
+git submodule update --init --recursive
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/ced .
+```
+
+CUI, cJSON, and libvterm are Git submodules under `third_party/`. Their exact revisions are recorded as Git submodule references; URLs are recorded in `.gitmodules`. CMake builds those local checkouts and does not download dependencies. Run `git submodule update --init --recursive` again after checking out a revision that changes the dependency references. Generated libvterm headers stay in the build directory, leaving the submodule checkout clean. See [THIRD_PARTY.md](THIRD_PARTY.md) for revisions and licenses.
+
+Open a project and specific files:
+
+```sh
+./build/ced /path/to/project src/main.c README.md
+```
+
+The first argument is the project folder. Remaining arguments are file paths relative to that folder or absolute paths. With no arguments, the editor opens the current directory. On macOS, the build also creates `build/CED.app`, which you can open from Finder. Use **Open Folder** in the command palette or Mod Shift O to switch projects.
+
+## Keyboard shortcuts
+
+`Mod` means Command on macOS and Ctrl on Linux.
+
+| Shortcut | Action |
+| --- | --- |
+| Mod N | New file |
+| Mod O | Open file |
+| Mod Shift O | Open folder |
+| Mod S | Save |
+| Mod Shift S | Save as |
+| Mod W | Close tab; prompts for unsaved changes |
+| Ctrl Tab / Ctrl Shift Tab | Next / previous tab |
+| Mod B | Toggle sidebar |
+| Mod Shift E | File explorer |
+| Mod Shift F | Project search |
+| Mod Shift G | Git view |
+| Mod Shift P | Command palette |
+| Mod F | Find in the editor |
+| Mod G | Go to line |
+| Mod Z / Mod Shift Z | Undo / redo |
+| Mod − / Mod + | Decrease / increase editor text size (8–32 px) |
+| Mod Shift V | Toggle Markdown preview |
+| Mod J | Toggle terminal |
+| Ctrl Space or Mod Shift Space | Request completion |
+| F12 | Go to definition |
+| Mod Shift K | Symbol information |
+| Tab / Shift Tab | Indent / unindent |
+
+Text size is saved automatically to `~/.ced/settings.conf` whenever you change the zoom and restored when CED starts, across all projects. Without a valid setting, the default is 14 px.
+
+## File tree actions
+
+Right-click a file or folder to open its context menu:
+
+- **New File...** creates an empty file inside the selected folder, or in the parent folder of a selected file, and opens it in a tab.
+- **New Folder...** creates a directory in the selected folder, or beside the selected file, and expands the resulting folder in the tree.
+- **Rename...** renames the selected item. Renaming a folder also updates the paths of its open documents, preserving their unsaved contents.
+- **Delete** permanently removes the selected file or folder after confirmation. The dialog identifies affected unsaved files before their tabs are closed. Folder deletion includes all its contents.
+
+Existing destination names are never overwritten. The tree, search results, and Git status are refreshed after an operation. Right-click the project heading to create a file or folder at the project root; the root itself cannot be renamed or deleted through the menu.
+
+## Markdown preview
+
+Open a `.md` or `.markdown` file and click **Preview**, or press Mod Shift V. Click **Edit** or use the same shortcut to return to the source. Each tab keeps its own preview mode.
+
+The preview renders the current buffer, including unsaved changes. It supports headings, emphasis, lists, task lists, tables, block quotes, links, and highlighted code blocks. Web links open in the default browser; simple relative file links open in the editor. Images are displayed as links, and section-anchor navigation is not implemented.
+
+## LSP for C and C++
+
+The client uses the [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) through JSON-RPC over [clangd](https://clangd.llvm.org/installation)'s standard input/output. It starts when you open a saved C/C++ file and synchronizes the editor buffer, including unsaved edits. Server status appears in the bottom bar; diagnostics appear in **Problems** and support click-to-navigate.
+
+Make sure `clangd` is on your PATH. To choose another executable, set `CED_CLANGD=/path/to/clangd` before starting CED. If clangd is unavailable, other editor features continue to work. **Restart Language Server** is available in the command palette.
+
+Provide `compile_commands.json` so clangd knows your include paths, macros, and compiler options. CED already exports it into `build/`. For other CMake projects, use `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
+
+A small example is available in `examples/c/`:
+
+```sh
+cmake -S examples/c -B examples/c/build
+cmake --build examples/c/build
+./build/ced examples/c main.c calculator.c
+```
+
+In `main.c`, use F12 on `add` to navigate to its definition. Ctrl Space opens completion suggestions beside the caret: use the arrow keys to choose, Enter/Tab or a click to apply, and Esc to close. Continuing to type updates the suggestions. Hover over a symbol to see its documentation in a popover without moving the text caret. To try diagnostics, use an undefined identifier; the error appears without saving.
+
+The current integration provides completion through a shortcut or palette command, symbol-information popovers, definition navigation, and up to 128 diagnostics per file. Hover waits about 350 ms over a symbol and does not block editing. Completion supports simple replacements with undo/redo; snippets, automatic header insertion, symbol rename, formatting, references, and code actions are not implemented yet.
+
+## Integrated terminal
+
+Click **Terminal** in the top bar or press Mod J. The panel offers **Bottom** and **Right** positions; moving it preserves the process and working directory. Drag the divider to resize it. The command palette also provides **Move Terminal Right** and **Move Terminal to Bottom**.
+
+The terminal starts the shell specified by `SHELL` (or `/bin/sh`) in the project folder. The session preserves `cd`, variables, and processes between commands. It supports ANSI colors, the alternate screen, function keys, and Ctrl+C to interrupt the foreground process. Drag to select and use Mod C to copy; Mod V pastes. On Linux, Ctrl Shift C/V also copies/pastes. The mouse wheel and Shift PageUp/PageDown navigate up to 2,000 lines of scrollback.
+
+Hiding the panel keeps the session running. **Restart Terminal** ends the session and starts another; switching projects or closing CED ends the shell and foreground process. Terminal position is not persisted. Multiple sessions, mouse-event forwarding to terminal programs, and scrollback reflow on resize are not implemented yet; font attributes such as bold/italic do not change glyph rendering.
+
+## Files and recovery
+
+Saving replaces a file atomically while preserving its permissions and LF/CRLF convention. If its contents on disk change after opening, a normal save is refused; **Save As** lets you keep a separate copy. Closing a modified tab offers Save, Discard, or Cancel.
+
+When the operating system closes the window, unsaved drafts are preserved in `~/.ced/recovery-*` and restored the next time you open **the same folder**. Switching projects also preserves those drafts. Recovery runs during normal shutdown; there is no autosave for abrupt crashes or coordination between multiple instances in the same project yet.
+
+## Current limits
+
+- Up to 32 tabs, 2 MiB per text file, 20,000 tree entries, and 500 search results. Files containing NUL bytes are treated as binary.
+- Search is case-sensitive and uses files **saved on disk**, not unsaved editor buffers.
+- The tree and search skip symbolic links and the `.git`, `node_modules`, `build`, `dist`, `target`, `.venv`, `venv`, and `__pycache__` directories. Other `.gitignore` rules are not interpreted by the explorer/search; the Git panel uses Git's own rules.
+- Use the refresh button to update files/Git. Automatic filesystem monitoring is not implemented yet.
+- A diff is a snapshot of the versions at the time of the click; click the item again after refreshing to reload it.
+- Git write operations run locally and may wait for hooks, signing, or user configuration. The editor does not push, pull, or discard Git changes.
+- Windows and extensions are not implemented yet.
+
+## Tests
+
+```sh
+ctest --test-dir build --output-on-failure
+```
+
+Tests create temporary projects and repositories to verify reading, saving, CRLF handling, external conflicts, permissions, limits, the tree, asynchronous search, status, staging, unstaging, commits, renames, and diffs. They also cover file creation and deletion, name collisions, workspace-root protection, symbolic-link containment, and persistent zoom. They do not modify the open project's Git repository.
+
+Additional tests exercise LSP with a real `clangd` (when installed), editor-assistance geometry and input, and the terminal with a real PTY, including colors, persistent working directories, resize, Ctrl+C, alternate-screen mode, and scrollback. Bundled dependencies and their licenses are listed in [THIRD_PARTY.md](THIRD_PARTY.md).

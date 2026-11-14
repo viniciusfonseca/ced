@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+project(ced_c_example LANGUAGES C)
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+add_executable(c-example main.c calculator.c)
