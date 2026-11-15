@@ -14,13 +14,14 @@ concurrency:
 
 jobs:
   test:
-    name: Tests (${{ matrix.os }})
+    name: Tests (${{ matrix.os }}, extensions ${{ matrix.extensions }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15]
+        extensions: ["ON", "OFF"]
 
     steps:
       - name: Checkout repository and submodules
@@ -47,6 +48,7 @@ jobs:
           clangd_path="$(command -v clangd)"
           "$clangd_path" --version
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON \
+            "-DCED_ENABLE_EXTENSIONS=${{ matrix.extensions }}" \
             "-DCED_CLANGD_EXECUTABLE=$clangd_path"
 
       - name: Build

@@ -72,24 +72,6 @@ CedEditorGeometry ced_editor_geometry(cui_ctx *ui, const char *id, const char *t
     return g;
 }
 
-bool ced_editor_replace(cui_ctx *ui, const char *id, char *text, size_t cap, const CedCompletion *c) {
-    size_t length = strlen(text), inserted = strlen(c->text);
-    if (c->start < 0 || c->end < c->start || (size_t)c->end > length ||
-        length - (size_t)(c->end - c->start) + inserted >= cap) return false;
-    cui_state_entry *entry = cui__state_entry(ui, cui_make_id(ui, id) ^ EDITOR_SALT);
-    if (!entry->data || entry->size < sizeof(EditorStatePrefix)) return false;
-    EditorStatePrefix *state = entry->data;
-    if ((size_t)(c->end - c->start) != inserted || memcmp(text + c->start, c->text, inserted)) {
-        cui__edit_undo_push(ui, &state->edit, text, 3);
-        memmove(text + c->start + inserted, text + c->end, length - (size_t)c->end + 1);
-        memcpy(text + c->start, c->text, inserted);
-    }
-    state->edit.cursor = state->edit.anchor = c->start + (int)inserted;
-    state->edit.last_edit = 0;
-    cui_code_editor_select(ui, id, state->edit.cursor, state->edit.cursor);
-    return true;
-}
-
 bool ced_editor_completion_key(cui_ctx *ui, const char *id) {
     if (ui->focus != (cui_make_id(ui, id) ^ EDITOR_BODY)) return false;
     if (!cui_shortcut(ui, CUI_MOD_CTRL, CUI_KEY_SPACE) &&

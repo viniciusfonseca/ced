@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <pthread.h>
+#include <stdint.h>
 
 #define CED_PATH 4096
 #define CED_TEXT_CAP (2 * 1024 * 1024 + 1)
@@ -31,6 +32,7 @@ typedef struct {
     char *saved;
     size_t length;
     bool crlf;
+    uint64_t id, version;
 } CedDocument;
 
 typedef struct {

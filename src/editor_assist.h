@@ -30,7 +30,6 @@ typedef struct {
 /* Called in the same ID scope as the code editor. The adapter follows the
  * geometry and state prefix of the CUI revision pinned in CMake. */
 CedEditorGeometry ced_editor_geometry(cui_ctx *ui, const char *id, const char *text, float size);
-bool ced_editor_replace(cui_ctx *ui, const char *id, char *text, size_t cap, const CedCompletion *completion);
 bool ced_editor_completion_key(cui_ctx *ui, const char *id);
 void ced_assist_reset(CedEditorAssist *assist);
 int ced_assist_keys(cui_ctx *ui, CedEditorAssist *assist);

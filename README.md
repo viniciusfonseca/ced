@@ -15,6 +15,7 @@ A desktop text editor written in C99 with [CUI](https://github.com/yappologistic
 - **Markdown:** rendered previews of the current buffer, including unsaved changes.
 - **LSP:** clangd integration for C/C++, with diagnostics, completion, symbol information, and go-to-definition.
 - **Terminal:** an interactive PTY shell in a resizable panel to the right of or below the editor.
+- **Extensions (experimental):** reviewed local packages, workspace trust, lazy command activation in separate processes, and version-checked buffer edits with undo/redo.
 - Resizable sidebar, light/dark themes, and a command palette.
 - Status bar memory usage: the CED process's physical footprint on macOS (the metric used by Activity Monitor's Memory column), or resident memory (RSS) on Linux, in MB (1 MB = 1,000,000 bytes). Refreshed every second; small differences can occur between tools due to sampling times. Shell and language-server child processes are excluded.
 
@@ -193,7 +194,21 @@ When the operating system closes the window, unsaved drafts are preserved in `~/
 - Use the refresh button to update files/Git. Automatic filesystem monitoring is not implemented yet.
 - A diff is a snapshot of the versions at the time of the click; click the item again after refreshing to reload it.
 - Git operations may wait for hooks, signing, credential helpers, or user configuration. The editor does not discard working-tree changes.
-- Windows and extensions are not implemented yet.
+- Windows is not implemented yet.
+
+## Extensions (experimental)
+
+Build normally with `make`. Open the command palette with **Mod Shift P**, choose **Install Extension from Folder**, select a package containing `ced-extension.json`, and review its identity, version, source, SHA-256 and requested API permissions before choosing **Allow and Install**. Installation copies the package without running it. In **Manage Extensions**, choose **Trust Workspace** to authorize execution for the current canonical workspace path. Commands activate their extension on demand.
+
+The native C example is built into `build/examples/extensions/uppercase-selection`. Install that generated folder, open a text file inside the trusted workspace, select text, and run **Uppercase ASCII Selection**. ASCII letters become uppercase, other Unicode characters are preserved, and one undo restores the selection's original text. The command reads unsaved buffers and never saves them. Untitled documents and files outside the workspace require **Allow Active Document for This Session** for that extension in the manager.
+
+The manager supports enable/disable, explicit restart after failure, uninstall, workspace-trust revocation, document-access revocation and opening a process log. Packages and permissions are stored under `~/.ced/extensions/` and `~/.ced/extensions.json`; logs are under `~/.ced/logs/extensions/`. Updating to another version retains the previous package for manual rollback by reinstalling it; uninstall removes all versions if no window is using them. Changed contents with the same registered version are rejected.
+
+Executables are **not sandboxed**: they run with your operating-system user permissions. API capabilities restrict broker operations, not direct filesystem or network access. CED never discovers and executes extensions automatically from the open repository.
+
+Use `ced --disable-extensions /path/to/project` to skip extension loading and execution. To omit the subsystem entirely, build with `make EXTENSIONS=OFF BUILD_DIR=build-no-extensions` or configure CMake with `-DCED_ENABLE_EXTENSIONS=OFF`.
+
+This implements the initial vertical slice of the [extension architecture](docs/arquitetura-extensoes.md). See the [implemented host profile](docs/extensions.md) and [native example](examples/extensions/uppercase-selection/README.md). The [authoring specification](docs/extension-authoring-spec.md) remains a draft: configuration overrides, persistent extension state, events, contributed shortcuts/menus/views/themes and extension LSP servers belong to later phases and are unavailable in this host. API `1.0` is experimental, not a stable compatibility promise.
 
 ## Tests
 
@@ -206,3 +221,5 @@ make test
 Tests create temporary projects and repositories to verify reading, saving, CRLF handling, external conflicts, permissions, limits, the tree, asynchronous search, status, staging, unstaging, commits, renames, and diffs. They also cover file creation and deletion, name collisions, workspace-root protection, symbolic-link containment, and persistent zoom. They do not modify the open project's Git repository.
 
 Additional tests exercise LSP with a real `clangd` (when installed), editor-assistance geometry and input, and the terminal with a real PTY, including colors, persistent working directories, resize, Ctrl+C, alternate-screen mode, and scrollback. Bundled dependencies and their licenses are listed in [THIRD_PARTY.md](THIRD_PARTY.md).
+
+Extension tests use native C peers and a temporary profile. They cover manifest/package validation, framing and quotas, reviewed installation, persisted trust, lifecycle failures/timeouts, stderr flooding, stale edits/selections, inactive editor ownership, allocation failure before commit, undo/redo, and rendered management dialogs. No scripting runtime is required. Dialog screenshots are written to the build directory.

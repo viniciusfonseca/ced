@@ -4,7 +4,7 @@ Dependencies are checked out as Git submodules. Initialize them with `git submod
 
 | Dependency | Submodule | Pinned revision | License |
 | --- | --- | --- | --- |
-| [CUI](https://github.com/yappologistic/CUI) | `third_party/CUI` | `a8f71c05be29eb441bf3ff72dba67b279e68384f` | MIT, `LICENSE` |
+| [CUI](https://github.com/yappologistic/CUI) | `third_party/CUI` | `6e6b35326f655405822fcf863fac0d3bb35bb787` | MIT, `LICENSE` |
 | [cJSON](https://github.com/DaveGamble/cJSON) | `third_party/cjson` | v1.7.19, `c859b25da02955fef659d658b8f324b5cde87be3` | MIT, `LICENSE` |
 | [libvterm](https://github.com/neovim/libvterm) | `third_party/libvterm` | v0.3.3, `9d6d2112335080312ef8c36667fa717ded4f7daf` | MIT, `LICENSE` |
 

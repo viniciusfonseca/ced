@@ -1,0 +1,21 @@
+{
+  "manifestVersion": 1,
+  "id": "example.text-tools",
+  "name": "Text Tools",
+  "version": "0.1.0",
+  "description": "Uppercase ASCII letters in the captured selection; preserve other Unicode characters.",
+  "ced": {"minVersion": "0.2.0", "apiMajor": 1},
+  "kind": "executable",
+  "entrypoints": {"@CED_EXTENSION_PLATFORM@": "bin/uppercase-selection"},
+  "activationEvents": ["onCommand:example.text-tools.uppercase"],
+  "capabilities": ["documents.read", "documents.edit"],
+  "untrustedWorkspaces": false,
+  "contributes": {
+    "commands": [{
+      "id": "example.text-tools.uppercase",
+      "title": "Uppercase ASCII Selection",
+      "category": "Text Tools",
+      "enableWhen": {"hasDocument": true, "hasSelection": true, "workspaceTrusted": true}
+    }]
+  }
+}

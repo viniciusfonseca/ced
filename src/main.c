@@ -6,6 +6,11 @@
 #include "file_operations.h"
 #include "process_memory.h"
 #include "editor_logo.h"
+#include "commands.h"
+#include "editor_bridge.h"
+#ifdef CED_ENABLE_EXTENSIONS
+#include "extensions/extension_ui.h"
+#endif
 #include <cui/cui.h>
 #include <cui/cui_app.h>
 
@@ -31,7 +36,7 @@ typedef struct {
     char title[CED_PATH + 40];
     bool focus;
     bool lsp_synced;
-    int cursor;
+    int cursor, anchor;
     bool markdown_preview;
 } EditorTab;
 
@@ -79,7 +84,24 @@ typedef struct {
     bool terminal_visible, terminal_right;
     float terminal_bottom_split, terminal_right_split;
     FileAction file_action;
+    CedCommands commands;
+    cui_command palette_items[1024];
+    char palette_ids[1024][257];
+    uint64_t selection_version, selection_document;
+    size_t selection_anchor, selection_cursor;
+#ifdef CED_ENABLE_EXTENSIONS
+    CedExtensions *extensions;
+#endif
 } Editor;
+static void dispatch(Editor *e, const char *id);
+
+static bool extension_modal(const Editor *e) {
+#ifdef CED_ENABLE_EXTENSIONS
+    return e->extensions && (e->extensions->manage_open || e->extensions->trust_open || e->extensions->review_open);
+#else
+    (void)e; return false;
+#endif
+}
 
 static void notify(Editor *e, const char *message) {
     snprintf(e->message, sizeof e->message, "%s", message);
@@ -159,6 +181,7 @@ static void new_document(Editor *e) {
     if (!tab) return;
     tab->file.text = calloc(CED_TEXT_CAP, 1);
     if (!tab->file.text) { e->count--; e->selected = e->count - 1; notify(e, "Out of memory."); return; }
+    ced_document_identify(&tab->file, (uint64_t)tab->id);
     tab_title(tab);
 }
 
@@ -179,6 +202,7 @@ static bool open_document(Editor *e, const char *path, int line, int column) {
     EditorTab *tab = new_tab(e);
     if (!tab) { ced_document_free(&file); return false; }
     tab->file = file;
+    ced_document_identify(&tab->file, (uint64_t)tab->id);
     tab_title(tab);
     e->goto_line = line; e->goto_column = column;
     return true;
@@ -206,7 +230,13 @@ static bool save_document(Editor *e, int index, bool save_as) {
     /* A native Save dialog confirms replacing an existing destination. */
     char previous_path[CED_PATH];
     snprintf(previous_path, sizeof previous_path, "%s", tab->file.path);
+#ifdef CED_ENABLE_EXTENSIONS
+    unsigned previous_access = ced_extensions_document_access(e->extensions, &tab->file);
+#endif
     if (!ced_document_save(&tab->file, path, chosen, error)) { notify(e, error); return false; }
+#ifdef CED_ENABLE_EXTENSIONS
+    ced_extensions_document_changed(e->extensions, &tab->file, previous_access);
+#endif
     if (strcmp(previous_path, tab->file.path)) ced_lsp_close(e->lsp, previous_path);
     tab->lsp_synced = ced_lsp_sync(e->lsp, tab->file.path, tab->file.text);
     ced_lsp_saved(e->lsp, tab->file.path);
@@ -217,6 +247,9 @@ static bool save_document(Editor *e, int index, bool save_as) {
 }
 
 static void remove_tab(Editor *e, int index) {
+#ifdef CED_ENABLE_EXTENSIONS
+    ced_extensions_document_closed(e->extensions, e->docs[index].file.id);
+#endif
     ced_lsp_close(e->lsp, e->docs[index].file.path);
     ced_document_free(&e->docs[index].file);
     memmove(e->docs + index, e->docs + index + 1, sizeof *e->docs * (size_t)(e->count - index - 1));
@@ -296,6 +329,7 @@ static void restore_recovery(Editor *e) {
             tab->file.text = text;
             snprintf(tab->file.path, sizeof tab->file.path, "%s", path);
             tab->file.crlf = header[2] != 0;
+            ced_document_identify(&tab->file, (uint64_t)tab->id);
             tab_title(tab);
             restored++;
         }
@@ -311,6 +345,9 @@ static void choose_folder(Editor *e) {
     if (!write_recovery(e)) { notify(e, "Recovery failed. Save your files before switching folders."); return; }
     CedWorkspace next = {0};
     if (!ced_workspace_open(&next, path, error)) { notify(e, error); return; }
+#ifdef CED_ENABLE_EXTENSIONS
+    ced_extensions_workspace(e->extensions, next.root);
+#endif
     ced_lsp_stop(e->lsp); e->lsp = NULL; e->lsp_attempted = false;
     ced_assist_reset(&e->assist);
     ced_terminal_stop(e->terminal); e->terminal = NULL;
@@ -391,10 +428,19 @@ static void apply_completion(cui_ctx *ui, Editor *e, int index) {
     if (tab->id != e->assist.completion_tab || tab->cursor != e->assist.completion_cursor) return;
     CedCompletion *c = &e->assist.completions[index];
     cui_push_id_int(ui, tab->id);
-    bool applied = ced_editor_replace(ui, "source", tab->file.text, CED_TEXT_CAP, c);
+    CedTextEdit edit = {(size_t)c->start, (size_t)c->end, c->text};
+    CedEditTransaction transaction;
+    char error[CED_ERROR];
+    bool applied = ced_document_prepare_edit(&tab->file, tab->file.version, &edit, 1,
+        (size_t)tab->anchor, (size_t)tab->cursor, true,
+        (size_t)c->start + strlen(c->text), (size_t)c->start + strlen(c->text), &transaction, error);
+    if (applied) {
+        applied = ced_editor_commit(ui, "source", &tab->file, tab->file.version, &transaction, error);
+        ced_edit_transaction_free(&transaction);
+    }
     cui_pop_id(ui);
     if (applied) {
-        tab->cursor = e->goto_offset = c->start + (int)strlen(c->text);
+        tab->anchor = tab->cursor = e->goto_offset = c->start + (int)strlen(c->text);
         tab->focus = true; tab->lsp_synced = false;
     }
     ced_assist_reset(&e->assist);
@@ -440,6 +486,10 @@ static void perform_file_action(Editor *e) {
     } else if (a->operation == DIRECTORY_CREATE) {
         ok = ced_directory_create(e->workspace.root, a->path, a->name, result, a->error);
     } else if (a->operation == FILE_RENAME) {
+#ifdef CED_ENABLE_EXTENSIONS
+        unsigned previous_access[MAX_DOCS];
+        for (int n = 0; n < e->count; n++) previous_access[n] = ced_extensions_document_access(e->extensions, &e->docs[n].file);
+#endif
         char parent[CED_PATH];
         bool fits = ced_parent_path(a->path, parent, sizeof parent) && ced_join(result, sizeof result, parent, a->name);
         for (int i = 0; fits && i < e->count; i++)
@@ -455,6 +505,9 @@ static void perform_file_action(Editor *e) {
                 snprintf(renamed, sizeof renamed, "%s%s", result, tab->file.path + strlen(a->path));
                 ced_lsp_close(e->lsp, tab->file.path);
                 snprintf(tab->file.path, sizeof tab->file.path, "%s", renamed);
+#ifdef CED_ENABLE_EXTENSIONS
+                ced_extensions_document_changed(e->extensions, &tab->file, previous_access[i]);
+#endif
                 tab->lsp_synced = false; tab_title(tab);
             }
             /* Let the regular refresh preserve expansion under the new names. */
@@ -749,14 +802,14 @@ static void editor_pane(cui_ctx *ui, Editor *e) {
                           .size = e->font_size);
         } else if (e->selected >= 0 && e->selected < e->count) {
             EditorTab *tab = &e->docs[e->selected];
-            bool assist_enabled = !e->close_dialog && !e->commit_dialog && !e->file_action.open && !e->palette && ced_lsp_language(tab->file.path);
+            bool assist_enabled = !e->close_dialog && !e->commit_dialog && !e->file_action.open && !e->palette && !extension_modal(e) && ced_lsp_language(tab->file.path);
             if (!assist_enabled) ced_assist_reset(&e->assist);
             int accepted = assist_enabled ? ced_assist_keys(ui, &e->assist) : -1;
             if (accepted >= 0) apply_completion(ui, e, accepted);
             if (ced_markdown_file(tab->file.path)) {
                 cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_END) {
                     if (cui_button(ui, tab->markdown_preview ? "Edit" : "Preview",
-                            .icon = tab->markdown_preview ? CUI_ICON_CODE : CUI_ICON_EYE, .size = CUI_SIZE_SM)) toggle_markdown_preview(e);
+                            .icon = tab->markdown_preview ? CUI_ICON_CODE : CUI_ICON_EYE, .size = CUI_SIZE_SM)) dispatch(e,"ced.markdown.toggle");
                 }
             }
             if (tab->markdown_preview && ced_markdown_file(tab->file.path)) {
@@ -780,10 +833,11 @@ static void editor_pane(cui_ctx *ui, Editor *e) {
                 cui_text_mark marks[CED_LSP_DIAGNOSTICS];
                 for (int i = 0; i < diagnostic_count; i++) marks[i] = (cui_text_mark){diagnostics[i].start, diagnostics[i].end, diagnostics[i].severity == 1 ? 4 : 3};
                 qsort(marks, (size_t)diagnostic_count, sizeof *marks, compare_marks);
-                e->caret = cui_code_editor(ui, "source", tab->file.text, CED_TEXT_CAP,
+                e->caret = ced_editor_render(ui, "source", &tab->file, &(cui_code_editor_opts){
                     .lang = ced_language(tab->file.path), .height = -1, .size = e->font_size, .tab_size = 4, .autofocus = tab->focus,
-                    .marks = marks, .mark_count = diagnostic_count);
+                    .marks = marks, .mark_count = diagnostic_count});
                 tab->cursor = e->caret.cursor;
+                tab->anchor = e->caret.anchor;
                 if (e->caret.changed) tab->lsp_synced = false;
                 tab->focus = false;
                 if (e->caret.refused) notify(e, "Edit exceeds the 2 MiB file limit.");
@@ -834,7 +888,7 @@ static void terminal_panel(cui_ctx *ui, Editor *e) {
             if (cui_icon_button(ui, CUI_ICON_REFRESH_CW, .size = CUI_SIZE_SM, .tooltip = "Restart Terminal")) {
                 ced_terminal_stop(e->terminal); e->terminal = NULL;
             }
-            if (cui_icon_button(ui, CUI_ICON_X, .size = CUI_SIZE_SM, .tooltip = "Hide Terminal")) toggle_terminal(e);
+            if (cui_icon_button(ui, CUI_ICON_X, .size = CUI_SIZE_SM, .tooltip = "Hide Terminal")) dispatch(e,"ced.terminal.toggle");
         }
         if (e->terminal) {
             if (!e->terminal->alive) cui_secondary(ui, "Shell exited.");
@@ -908,6 +962,137 @@ static void dialogs(cui_ctx *ui, Editor *e) {
     }
 }
 
+static CedCommandContext editor_context(void *user) {
+    Editor *e = user;
+    EditorTab *tab = e->selected >= 0 && e->selected < e->count ? &e->docs[e->selected] : NULL;
+    bool has_document = tab && !e->diff && !tab->markdown_preview;
+    uint64_t document = has_document ? tab->file.id : 0;
+    size_t anchor = has_document ? (size_t)tab->anchor : 0, cursor = has_document ? (size_t)tab->cursor : 0;
+    if (!e->selection_version || e->selection_document != document || e->selection_anchor != anchor || e->selection_cursor != cursor) {
+        e->selection_version++; e->selection_document = document;
+        e->selection_anchor = anchor; e->selection_cursor = cursor;
+    }
+    bool trusted = false;
+#ifdef CED_ENABLE_EXTENSIONS
+    trusted = e->extensions && e->extensions->trusted;
+#endif
+    const char *language = has_document ? ced_language(tab->file.path) : NULL;
+    return (CedCommandContext){document, has_document ? tab->file.version : 0, e->selection_version,
+        anchor, cursor, has_document, has_document && !e->terminal_view.focused && !extension_modal(e), trusted, language ? language : "text"};
+}
+
+#ifdef CED_ENABLE_EXTENSIONS
+static bool extension_document(void *user, size_t index, CedExtensionDocument *out) {
+    Editor *e = user;
+    if (index >= (size_t)e->count) return false;
+    EditorTab *tab = &e->docs[index];
+    const char *language = ced_language(tab->file.path);
+    *out = (CedExtensionDocument){&tab->file, language ? language : "text", (size_t)tab->anchor, (size_t)tab->cursor};
+    return true;
+}
+
+static bool extension_commit(void *user, CedDocument *document, uint64_t version,
+                             const CedEditTransaction *transaction, char *error) {
+    Editor *e = user;
+    for (int n = 0; n < e->count; n++) if (&e->docs[n].file == document) {
+        EditorTab *tab = &e->docs[n]; cui_ctx *ui = cui_app_ui(e->app);
+        cui_push_id_int(ui, tab->id);
+        bool ok = ced_editor_commit(ui, "source", document, version, transaction, error);
+        cui_pop_id(ui);
+        if (ok && transaction->changed) {
+            tab->anchor = (int)transaction->anchor; tab->cursor = (int)transaction->cursor;
+            tab->lsp_synced = false; ced_assist_reset(&e->assist); editor_context(e);
+        }
+        return ok;
+    }
+    snprintf(error, CED_ERROR, "Unavailable"); return false;
+}
+static void extension_message(void *user, const char *message) { notify(user, message); }
+static void extension_open_log(void *user, const char *path) { open_document(user, path, 0, 0); }
+#endif
+
+static const struct { const char *id, *title, *category, *shortcut; } builtin_commands[] = {
+    {"ced.file.new", "New File", "File", "Cmd/Ctrl N"},
+    {"ced.file.open", "Open File", "File", "Cmd/Ctrl O"},
+    {"ced.workspace.open", "Open Folder", "File", "Cmd/Ctrl Shift O"},
+    {"ced.file.save", "Save", "File", "Cmd/Ctrl S"},
+    {"ced.file.saveAs", "Save As", "File", "Cmd/Ctrl Shift S"},
+    {"ced.workspace.refresh", "Refresh Files and Git", "Project", ""},
+    {"ced.theme.toggle", "Toggle Theme", "Appearance", ""},
+    {"ced.language.complete", "Complete", "Language", "Ctrl Space"},
+    {"ced.language.definition", "Go to Definition", "Language", "F12"},
+    {"ced.language.hover", "Symbol Information", "Language", "Cmd/Ctrl Shift K"},
+    {"ced.language.restart", "Restart Language Server", "Language", ""},
+    {"ced.terminal.toggle", "Toggle Terminal", "Terminal", "Cmd/Ctrl J"},
+    {"ced.terminal.right", "Move Terminal Right", "Terminal", ""},
+    {"ced.terminal.bottom", "Move Terminal to Bottom", "Terminal", ""},
+    {"ced.markdown.toggle", "Toggle Markdown Preview", "View", "Cmd/Ctrl Shift V"},
+#ifdef CED_ENABLE_EXTENSIONS
+    {"ced.extensions.install", "Install Extension from Folder", "Extensions", ""},
+    {"ced.extensions.manage", "Manage Extensions", "Extensions", ""},
+#endif
+};
+
+static bool builtin_execute(void *user, const char *id, const CedCommandContext *context, char *error) {
+    (void)context;
+    Editor *e = user; cui_ctx *ui = cui_app_ui(e->app);
+    size_t action = 0;
+    while (action < sizeof builtin_commands / sizeof *builtin_commands && strcmp(builtin_commands[action].id, id)) action++;
+    switch (action) {
+        case 0: new_document(e); break;
+        case 1: choose_file(e); break;
+        case 2: choose_folder(e); break;
+        case 3: save_document(e, e->selected, false); break;
+        case 4: save_document(e, e->selected, true); break;
+        case 5: refresh(e); break;
+        case 6: cui_set_theme(ui, cui_get_theme_mode(ui) == CUI_THEME_DARK ? CUI_THEME_LIGHT : CUI_THEME_DARK); break;
+        case 7: lsp_request(ui, e, CED_LSP_COMPLETION); break;
+        case 8: lsp_request(ui, e, CED_LSP_DEFINITION); break;
+        case 9: lsp_request(ui, e, CED_LSP_HOVER); break;
+        case 10:
+            ced_lsp_stop(e->lsp); e->lsp = NULL; e->lsp_attempted = false;
+            ced_assist_reset(&e->assist);
+            for (int n = 0; n < e->count; n++) e->docs[n].lsp_synced = false;
+            break;
+        case 11: toggle_terminal(e); break;
+        case 12: set_terminal_position(e, true); if (!e->terminal_visible) toggle_terminal(e); break;
+        case 13: set_terminal_position(e, false); if (!e->terminal_visible) toggle_terminal(e); break;
+        case 14: toggle_markdown_preview(e); break;
+#ifdef CED_ENABLE_EXTENSIONS
+        case 15: {
+            char source[CED_PATH];
+            if (!e->extensions) goto disabled;
+            if (cui_app_file_dialog(e->app, &(cui_file_dialog_opts){.kind=CUI_FILE_FOLDER,.title="Install Extension from Folder"}, source, sizeof source))
+                return ced_extensions_job(e->extensions, EXT_INSPECT, source);
+            break;
+        }
+        case 16:
+            if (!e->extensions) goto disabled;
+            e->extensions->manage_open = true; break;
+#endif
+        default: snprintf(error, CED_ERROR, "Unknown command"); return false;
+    }
+    return true;
+#ifdef CED_ENABLE_EXTENSIONS
+disabled:
+    snprintf(error, CED_ERROR, "Extensions are disabled."); return false;
+#endif
+}
+
+static void register_commands(Editor *e) {
+    for (size_t n = 0; n < sizeof builtin_commands / sizeof *builtin_commands; n++) {
+        char error[CED_ERROR];
+        if (!ced_commands_add(&e->commands, builtin_commands[n].id, builtin_commands[n].title,
+            builtin_commands[n].category, builtin_commands[n].shortcut, (CedCommandCondition){0},
+            e, builtin_execute, e, error)) notify(e, error);
+    }
+}
+
+static void dispatch(Editor *e, const char *id) {
+    char error[CED_ERROR] = {0}; CedCommandContext context = editor_context(e);
+    if (!ced_commands_execute(&e->commands, id, &context, error)) notify(e, error);
+}
+
 static void frame(cui_ctx *ui, Editor *e) {
     poll_git_sync(ui, e);
     double now = cui_time(ui);
@@ -919,6 +1104,14 @@ static void frame(cui_ctx *ui, Editor *e) {
     /* Tree paths and document buffers from the previous frame are no longer
      * needed by the renderer here, so filesystem actions can refresh them. */
     perform_file_action(e);
+    for (int n = 0; n < e->count; n++) {
+        cui_push_id_int(ui, e->docs[n].id); ced_editor_touch(ui, "source"); cui_pop_id(ui);
+    }
+    editor_context(e);
+#ifdef CED_ENABLE_EXTENSIONS
+    ced_extensions_tick(e->extensions);
+    if (e->extensions) cui_request_wakeup(ui, .03f);
+#endif
     /* Release diff sources only after the previous frame has finished painting. */
     if (!e->diff) {
         free(e->before); free(e->after);
@@ -933,37 +1126,37 @@ static void frame(cui_ctx *ui, Editor *e) {
     }
     if (e->search.running && ced_search_done(&e->search)) ced_search_finish(&e->search);
     if (e->search.running) cui_request_wakeup(ui, 0.05f);
-    if (!e->close_dialog && !e->commit_dialog && !e->file_action.open && !e->palette) {
+    if (!e->close_dialog && !e->commit_dialog && !e->file_action.open && !e->palette && !extension_modal(e)) {
         int previous_font_size = e->font_size;
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_MINUS) && e->font_size > CED_FONT_SIZE_MIN) e->font_size--;
         if ((cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_EQUAL) ||
              cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_EQUAL)) && e->font_size < CED_FONT_SIZE_MAX) e->font_size++;
         if (e->font_size != previous_font_size && !ced_font_size_save(e->font_size))
             notify(e, "Could not save editor settings.");
-        if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_N)) new_document(e);
-        if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_O)) choose_file(e);
-        if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_O)) choose_folder(e);
-        if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_S)) save_document(e, e->selected, false);
-        if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_S)) save_document(e, e->selected, true);
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_N)) dispatch(e, "ced.file.new");
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_O)) dispatch(e, "ced.file.open");
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_O)) dispatch(e, "ced.workspace.open");
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_S)) dispatch(e, "ced.file.save");
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_S)) dispatch(e, "ced.file.saveAs");
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_B)) e->sidebar = !e->sidebar;
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_E)) { e->panel = 0; e->sidebar = true; }
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_F)) { e->panel = 1; e->sidebar = true; }
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_G)) { e->panel = 2; e->sidebar = true; refresh_git(e); }
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_P)) e->palette = true;
-        if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_J)) toggle_terminal(e);
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_J)) dispatch(e, "ced.terminal.toggle");
         if (!e->terminal_view.focused) {
-            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_V)) toggle_markdown_preview(e);
-            if (cui_shortcut(ui, 0, CUI_KEY_F12)) lsp_request(ui, e, CED_LSP_DEFINITION);
-            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_K)) lsp_request(ui, e, CED_LSP_HOVER);
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_V)) dispatch(e, "ced.markdown.toggle");
+            if (cui_shortcut(ui, 0, CUI_KEY_F12)) dispatch(e, "ced.language.definition");
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_K)) dispatch(e, "ced.language.hover");
         }
     }
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .bg = CUI_COLOR_BACKGROUND) {
         cui_toolbar(ui, "main-toolbar", .no_border = false) {
             cui_toolbar_button(ui, CUI_ICON_PANEL_LEFT, .tooltip = "Toggle Sidebar", .toggle = &e->sidebar);
-            if (cui_toolbar_button(ui, CUI_ICON_PLUS, .label = "New")) new_document(e);
-            if (cui_toolbar_button(ui, CUI_ICON_FOLDER_OPEN, .label = "Open")) choose_folder(e);
-            if (cui_toolbar_button(ui, CUI_ICON_SAVE, .label = "Save", .disabled = e->selected < 0)) save_document(e, e->selected, false);
-            if (cui_toolbar_button(ui, CUI_ICON_TERMINAL, .label = "Terminal")) toggle_terminal(e);
+            if (cui_toolbar_button(ui, CUI_ICON_PLUS, .label = "New")) dispatch(e, "ced.file.new");
+            if (cui_toolbar_button(ui, CUI_ICON_FOLDER_OPEN, .label = "Open")) dispatch(e, "ced.workspace.open");
+            if (cui_toolbar_button(ui, CUI_ICON_SAVE, .label = "Save", .disabled = e->selected < 0)) dispatch(e, "ced.file.save");
+            if (cui_toolbar_button(ui, CUI_ICON_TERMINAL, .label = "Terminal")) dispatch(e, "ced.terminal.toggle");
             cui_toolbar_spacer(ui);
             cui_text(ui, "CED", .font = CUI_FONT_MEDIUM, .size = 12);
             cui_theme_toggle(ui);
@@ -1005,48 +1198,27 @@ static void frame(cui_ctx *ui, Editor *e) {
     dialogs(ui, e);
     int completion = ced_assist_draw(ui, &e->assist);
     if (completion >= 0) apply_completion(ui, e, completion);
-    static const cui_command commands[] = {
-        {"New File", CUI_ICON_PLUS, "File", "Cmd/Ctrl N"},
-        {"Open File", CUI_ICON_FILE_TEXT, "File", "Cmd/Ctrl O"},
-        {"Open Folder", CUI_ICON_FOLDER_OPEN, "File", "Cmd/Ctrl Shift O"},
-        {"Save", CUI_ICON_SAVE, "File", "Cmd/Ctrl S"},
-        {"Save As", CUI_ICON_SAVE, "File", "Cmd/Ctrl Shift S"},
-        {"Refresh Files and Git", CUI_ICON_REFRESH_CW, "Project", NULL},
-        {"Toggle Theme", CUI_ICON_MOON, "Appearance", NULL},
-        {"Complete", CUI_ICON_CODE, "Language", "Ctrl Space"},
-        {"Go to Definition", CUI_ICON_CODE, "Language", "F12"},
-        {"Symbol Information", CUI_ICON_INFO, "Language", "Cmd/Ctrl Shift K"},
-        {"Restart Language Server", CUI_ICON_REFRESH_CW, "Language", NULL},
-        {"Toggle Terminal", CUI_ICON_TERMINAL, "Terminal", "Cmd/Ctrl J"},
-        {"Move Terminal Right", CUI_ICON_TERMINAL, "Terminal", NULL},
-        {"Move Terminal to Bottom", CUI_ICON_TERMINAL, "Terminal", NULL},
-        {"Toggle Markdown Preview", CUI_ICON_EYE, "View", "Cmd/Ctrl Shift V"}
-    };
-    switch (cui_command_palette(ui, &e->palette, commands, (int)(sizeof commands / sizeof commands[0]))) {
-        case 0: new_document(e); break;
-        case 1: choose_file(e); break;
-        case 2: choose_folder(e); break;
-        case 3: save_document(e, e->selected, false); break;
-        case 4: save_document(e, e->selected, true); break;
-        case 5: refresh(e); break;
-        case 6: cui_set_theme(ui, cui_get_theme_mode(ui) == CUI_THEME_DARK ? CUI_THEME_LIGHT : CUI_THEME_DARK); break;
-        case 7: lsp_request(ui, e, CED_LSP_COMPLETION); break;
-        case 8: lsp_request(ui, e, CED_LSP_DEFINITION); break;
-        case 9: lsp_request(ui, e, CED_LSP_HOVER); break;
-        case 10:
-            ced_lsp_stop(e->lsp); e->lsp = NULL; e->lsp_attempted = false;
-            ced_assist_reset(&e->assist);
-            for (int i = 0; i < e->count; i++) e->docs[i].lsp_synced = false;
-            break;
-        case 11: toggle_terminal(e); break;
-        case 12: set_terminal_position(e, true); if (!e->terminal_visible) toggle_terminal(e); break;
-        case 13: set_terminal_position(e, false); if (!e->terminal_visible) toggle_terminal(e); break;
-        case 14: toggle_markdown_preview(e); break;
-        default: break;
+    CedCommandContext context = editor_context(e);
+    int command_count = 0;
+    for (size_t n = 0; n < e->commands.count && command_count < 1024; n++) {
+        const CedCommandEntry *command = &e->commands.entries[n];
+        if (!ced_command_condition(&command->when, &context)) continue;
+        e->palette_items[command_count] = (cui_command){command->title, CUI_ICON_CODE, command->category, command->shortcut};
+        snprintf(e->palette_ids[command_count], sizeof e->palette_ids[command_count], "%s", command->id);
+        command_count++;
     }
+    int chosen = cui_command_palette(ui, &e->palette, e->palette_items, command_count);
+    if (chosen >= 0 && chosen < command_count) dispatch(e, e->palette_ids[chosen]);
+#ifdef CED_ENABLE_EXTENSIONS
+    ced_extensions_ui(ui, e->extensions);
+#endif
 }
 
 static void editor_free(Editor *e) {
+#ifdef CED_ENABLE_EXTENSIONS
+    ced_extensions_destroy(e->extensions);
+#endif
+    ced_commands_free(&e->commands);
     if (e->git_sync.running) pthread_join(e->git_sync.thread, NULL);
     pthread_mutex_destroy(&e->git_sync.mutex);
     ced_search_cancel(&e->search);
@@ -1065,9 +1237,12 @@ static void editor_free(Editor *e) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
-        puts("Usage: ced [folder] [file ...]");
+        puts("Usage: ced [--disable-extensions] [folder] [file ...]");
         return 0;
     }
+    bool disable_extensions = false;
+    int first = 1;
+    if (argc > first && !strcmp(argv[first], "--disable-extensions")) { disable_extensions = true; first++; }
     static Editor e;
     e.selected = -1;
     e.sidebar = true;
@@ -1079,12 +1254,12 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&e.search.mutex, NULL);
     pthread_mutex_init(&e.git_sync.mutex, NULL);
     char error[CED_ERROR];
-    const char *root = argc > 1 ? argv[1] : ".";
+    const char *root = argc > first ? argv[first] : ".";
     if (!ced_workspace_open(&e.workspace, root, error)) { fprintf(stderr, "%s\n", error); editor_free(&e); return 1; }
     refresh_git(&e);
     recovery_path(&e);
     restore_recovery(&e);
-    for (int i = 2; i < argc; i++) {
+    for (int i = first + 1; i < argc; i++) {
         char path[CED_PATH];
         if (argv[i][0] == '/') open_document(&e, argv[i], 0, 0);
         else if (ced_join(path, sizeof path, e.workspace.root, argv[i])) open_document(&e, path, 0, 0);
@@ -1094,6 +1269,15 @@ int main(int argc, char **argv) {
         .app_id = "dev.ced.Editor"});
     if (!e.app) { fprintf(stderr, "Could not create window.\n"); editor_free(&e); return 1; }
     e.logo = ced_editor_logo_create(cui_app_ui(e.app));
+    register_commands(&e);
+#ifdef CED_ENABLE_EXTENSIONS
+    const char *home = getenv("HOME"); char profile[CED_PATH];
+    if (!disable_extensions && home && ced_join(profile, sizeof profile, home, ".ced"))
+        e.extensions = ced_extensions_create(&e.commands,
+            (CedExtensionHost){&e, editor_context, extension_document, extension_commit, extension_message, extension_open_log}, profile, e.workspace.root);
+#else
+    (void)disable_extensions;
+#endif
 #ifdef __APPLE__
     ced_macos_set_icon();
     void *shortcut_monitor = ced_macos_shortcuts(e.app);

@@ -1,4 +1,5 @@
 #include "editor_assist.h"
+#include "editor_bridge.h"
 #include "cui_internal.h"
 #include <assert.h>
 #include <stdio.h>
@@ -76,7 +77,12 @@ int main(void) {
     assert(chosen == 1 && !assist.completion_open && caret.cursor == before);
     release(CUI_KEY_ENTER);
     cui_begin_frame(ui, 0.02f);
-    assert(ced_editor_replace(ui, "source", text, sizeof text, &result.completions[1]));
+    CedDocument document = {.text = text}; ced_document_identify(&document, 1);
+    CedTextEdit edit = {(size_t)result.completions[1].start, (size_t)result.completions[1].end, result.completions[1].text};
+    CedEditTransaction transaction; char error[CED_ERROR];
+    assert(ced_document_prepare_edit(&document, 1, &edit, 1, (size_t)caret.anchor, (size_t)caret.cursor, false, 0, 0, &transaction, error));
+    assert(ced_editor_commit(ui, "source", &document, 1, &transaction, error));
+    ced_edit_transaction_free(&transaction);
     cui_code_editor(ui, "source", text, sizeof text, .height = 300);
     cui_end_frame(ui);
     assert(strstr(text, "another"));

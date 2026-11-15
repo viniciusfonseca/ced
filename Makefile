@@ -7,6 +7,7 @@ ARGS ?= .
 PREFIX ?= /usr/local
 DESTDIR ?=
 APPDIR ?= /Applications
+EXTENSIONS ?= ON
 UNAME_S := $(shell uname -s)
 
 .PHONY: all deps configure build test run install install-cli install-macos clean
@@ -17,7 +18,7 @@ deps:
 	git submodule update --init --recursive
 
 configure:
-	cmake -S . -B "$(BUILD_DIR)" -DCMAKE_BUILD_TYPE="$(BUILD_TYPE)" -DBUILD_TESTING=ON
+	cmake -S . -B "$(BUILD_DIR)" -DCMAKE_BUILD_TYPE="$(BUILD_TYPE)" -DBUILD_TESTING=ON -DCED_ENABLE_EXTENSIONS="$(EXTENSIONS)"
 
 build: configure
 	cmake --build "$(BUILD_DIR)" --parallel "$(JOBS)"
