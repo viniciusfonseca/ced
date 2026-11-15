@@ -753,11 +753,11 @@ static void editor_pane(cui_ctx *ui, Editor *e) {
             if (!assist_enabled) ced_assist_reset(&e->assist);
             int accepted = assist_enabled ? ced_assist_keys(ui, &e->assist) : -1;
             if (accepted >= 0) apply_completion(ui, e, accepted);
-            cui_row(ui, .gap = 8) {
-                cui_text(ui, tab->file.path[0] ? tab->file.path : "Untitled",
-                         .size = 11, .color = CUI_COLOR_TEXT_MUTED, .nowrap = true, .width = CUI_FILL);
-                if (ced_markdown_file(tab->file.path) && cui_button(ui, tab->markdown_preview ? "Edit" : "Preview",
-                        .icon = tab->markdown_preview ? CUI_ICON_CODE : CUI_ICON_EYE, .size = CUI_SIZE_SM)) toggle_markdown_preview(e);
+            if (ced_markdown_file(tab->file.path)) {
+                cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_END) {
+                    if (cui_button(ui, tab->markdown_preview ? "Edit" : "Preview",
+                            .icon = tab->markdown_preview ? CUI_ICON_CODE : CUI_ICON_EYE, .size = CUI_SIZE_SM)) toggle_markdown_preview(e);
+                }
             }
             if (tab->markdown_preview && ced_markdown_file(tab->file.path)) {
                 ced_assist_reset(&e->assist);

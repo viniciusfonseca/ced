@@ -195,6 +195,8 @@ When the operating system closes the window, unsaved drafts are preserved in `~/
 
 ## Tests
 
+GitHub Actions runs the test suite on Ubuntu and macOS for every push and pull request. The **Unit Tests** workflow can also be started manually. It checks out all submodules and installs clangd so the LSP integration test runs alongside the workspace, terminal, and editor-assistance tests.
+
 ```sh
 make test
 ```
