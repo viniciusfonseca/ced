@@ -1,5 +1,18 @@
 #import <Cocoa/Cocoa.h>
+#include <mach-o/getsect.h>
+#include <mach-o/ldsyms.h>
 #include <cui/cui_app.h>
+
+void ced_macos_set_icon(void) {
+    NSString *path = [[NSBundle mainBundle] pathForResource:@"ced" ofType:@"icns"];
+    NSImage *icon = path ? [[NSImage alloc] initWithContentsOfFile:path] : nil;
+    if (!icon) {
+        unsigned long size = 0;
+        const uint8_t *bytes = getsectiondata(&_mh_execute_header, "__DATA", "__ced_icon", &size);
+        if (bytes && size) icon = [[NSImage alloc] initWithData:[NSData dataWithBytes:bytes length:size]];
+    }
+    if (icon) [NSApp setApplicationIconImage:icon];
+}
 
 /* Forward Cmd-W before the window menu consumes it, and normalize '+',
  * which CUI's Cocoa key mapping does not recognize, to the equal key. */

@@ -515,6 +515,36 @@ bool ced_git_stage(CedGit *git, const char *path, bool unstage, char *error) {
     return ok;
 }
 
+bool ced_git_stage_all(CedGit *git, bool unstage, char *error) {
+    char *out = NULL;
+    if (unstage) {
+        const char *head[] = {"git", "-C", git->root, "rev-parse", "--verify", "HEAD", NULL};
+        int result = ced_command(head, &out, NULL);
+        free(out);
+        if (result) {
+            /* Clear an unborn branch's index without touching working files. */
+            const char *empty[] = {"git", "-C", git->root, "read-tree", "--empty", NULL};
+            bool ok = git_run(empty, &out, error);
+            free(out);
+            return ok;
+        }
+    }
+    const char *args[] = {"git", "-C", git->root, unstage ? "restore" : "add",
+                         unstage ? "--staged" : "--all", "--", ".", NULL};
+    bool ok = git_run(args, &out, error);
+    free(out);
+    return ok;
+}
+
+bool ced_git_sync(CedGit *git, bool pull, char *error) {
+    const char *args[] = {"env", "GIT_TERMINAL_PROMPT=0", "git", "-C", git->root,
+                         pull ? "pull" : "push", pull ? "--ff-only" : NULL, NULL};
+    char *out = NULL;
+    bool ok = git_run(args, &out, error);
+    free(out);
+    return ok;
+}
+
 bool ced_git_commit(CedGit *git, const char *message, char *error) {
     if (!*message) return fail(error, "Enter a commit message.");
     const char *args[] = {"git", "-C", git->root, "-c", "core.editor=true", "commit", "-m", message, NULL};

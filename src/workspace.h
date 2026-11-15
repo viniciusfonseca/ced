@@ -78,6 +78,8 @@ void ced_search_cancel(CedSearch *search);
 bool ced_git_refresh(CedGit *git, const char *root, char *error);
 void ced_git_free(CedGit *git);
 bool ced_git_stage(CedGit *git, const char *path, bool unstage, char *error);
+bool ced_git_stage_all(CedGit *git, bool unstage, char *error);
+bool ced_git_sync(CedGit *git, bool pull, char *error);
 bool ced_git_commit(CedGit *git, const char *message, char *error);
 bool ced_git_versions(CedGit *git, const CedChange *change, bool staged,
                       char **before, char **after, char *error);

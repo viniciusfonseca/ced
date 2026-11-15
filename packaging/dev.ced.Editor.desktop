@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=CED
+Comment=Text and code editor
+Exec=ced
+TryExec=ced
+Icon=dev.ced.Editor
+Terminal=false
+Categories=Development;TextEditor;
+StartupWMClass=dev.ced.Editor

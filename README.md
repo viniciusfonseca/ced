@@ -1,15 +1,20 @@
 # CED
 
+<p align="center">
+  <img src="assets/ced.png" alt="CED logo: a blue angular C and terminal cursor" width="160" height="160">
+</p>
+
 A desktop text editor written in C99 with [CUI](https://github.com/yappologistic/CUI), organized around a VS Code-inspired workspace.
 
 - **Files:** expandable file tree, file opening, project refresh, and context menus for creating, renaming, and deleting files and folders.
 - **Search:** literal search in the background; click a result to open its line and column.
-- **Git:** current branch, staged and local changes, side-by-side diffs, staging, unstaging, and commits with confirmation.
+- **Git:** current branch, staged and local changes, side-by-side diffs, staging/unstaging individual files or all changes, commits with confirmation, push, and pull.
 - **Editor:** multiple reorderable tabs, unsaved-change indicators, syntax highlighting, line numbers, indentation, undo/redo, copy/paste, in-file search, and go-to-line navigation.
 - **Markdown:** rendered previews of the current buffer, including unsaved changes.
 - **LSP:** clangd integration for C/C++, with diagnostics, completion, symbol information, and go-to-definition.
 - **Terminal:** an interactive PTY shell in a resizable panel to the right of or below the editor.
 - Resizable sidebar, light/dark themes, and a command palette.
+- Status bar memory usage: the CED process's physical footprint on macOS (the metric used by Activity Monitor's Memory column), or resident memory (RSS) on Linux, in MB (1 MB = 1,000,000 bytes). Refreshed every second; small differences can occur between tools due to sampling times. Shell and language-server child processes are excluded.
 
 ## Build and run
 
@@ -34,6 +39,8 @@ CUI, cJSON, and libvterm are Git submodules under `third_party/`. Their exact re
 | `make build` | Configure and compile the project |
 | `make run` | Build and launch CED |
 | `make test` | Build and run all tests |
+| `make install` | Install `ced` and the platform application icon/launcher |
+| `make install-macos` | Build and install `CED.app` into `/Applications` and `ced` into `PREFIX/bin` (macOS only) |
 | `make clean` | Remove compiled outputs, keeping the CMake configuration |
 
 Override `BUILD_DIR`, `BUILD_TYPE`, and `JOBS` to choose the output directory, CMake build type, and parallel build jobs. Defaults are `build`, `Release`, and `4`:
@@ -52,6 +59,39 @@ make run ARGS='/path/to/project src/main.c README.md'
 Pass paths containing spaces with inner quotes, for example `make run ARGS='"/path/to/my project" "notes file.md"'`. You can also launch the built executable directly with `./build/ced /path/to/project`.
 
 The first argument is the project folder. Remaining arguments are file paths relative to that folder or absolute paths. With no arguments, the editor opens the current directory. On macOS, the build also creates `build/CED.app`, which you can open from Finder. Use **Open Folder** in the command palette or Mod Shift O to switch projects.
+
+## Install
+
+On macOS, install the app with its Finder and Dock icon:
+
+```sh
+make install-macos
+```
+
+This installs `CED.app` into `/Applications` and the global command into `/usr/local/bin/ced`. For a per-user installation, use `make install-macos APPDIR="$HOME/Applications" PREFIX="$HOME/.local"`. The target also supports `BUILD_DIR` and `DESTDIR`. If the destinations require administrator permissions, build with `make` first, then run `sudo make install-macos`.
+
+Each macOS installation replaces the complete app bundle and removes older CED bundles with the same bundle identifier from the chosen `APPDIR`. It also unregisters other CED copies (including build/test copies) from Launch Services and registers the installed app. Copies outside `APPDIR` are not deleted, and preferences in `~/.ced` are preserved. Close CED before upgrading so an already-running process does not keep the old executable in memory. Staged installations with `DESTDIR` do not modify Launch Services.
+
+Install the `ced` command globally:
+
+```sh
+make install
+ced /path/to/project
+```
+
+The default destination is `/usr/local/bin/ced`. If that directory requires administrator permissions, build with `make` first, then run `sudo make install`.
+
+On macOS, installation also copies `CED.app` to `/Applications` (override with `APPDIR`). The bundle includes the terminal-inspired CED icon for Finder and the Dock; the standalone `ced` command embeds the icon too. On Linux, installation adds the application launcher and icon under `PREFIX/share`.
+
+Choose another prefix with `PREFIX`, for example a per-user installation:
+
+```sh
+make install PREFIX="$HOME/.local"
+```
+
+For a per-user macOS app bundle, add `APPDIR="$HOME/Applications"` to that command.
+
+Ensure the chosen prefix's `bin` directory is on your `PATH`. On Linux, a per-user prefix should be `$HOME/.local` so the desktop can also discover the launcher and icon. For packaging, `DESTDIR` stages the installation without changing the prefix: `make install DESTDIR=/tmp/ced-package PREFIX=/usr/local` writes `/tmp/ced-package/usr/local/bin/ced` and the platform resources under the same staging root. Installation copies the executable and resources, so it continues to work independently of the build folder.
 
 ## Keyboard shortcuts
 
@@ -95,6 +135,12 @@ Right-click a file or folder to open its context menu:
 
 Existing destination names are never overwritten. The tree, search results, and Git status are refreshed after an operation. Right-click the project heading to create a file or folder at the project root; the root itself cannot be renamed or deleted through the menu.
 
+## Git actions
+
+The Git view provides **Stage All**, **Unstage All**, **Push**, and **Pull**. Bulk staging includes additions, modifications, and deletions across the repository and respects `.gitignore`. Unstaging clears the index while preserving working files, including before the first commit.
+
+Push and pull use Git's configured remote, upstream branch, and credential helpers. Pull uses `--ff-only`: divergent history produces an error instead of an automatic merge or rebase. Push uses normal Git behavior without requesting a force push. Remote operations run in the background; Git controls and project switching wait until they finish. Completion refreshes Git status, and a successful pull also refreshes the file tree. Open editor buffers keep their contents. Configure remotes and authentication through Git first; errors appear in the status bar.
+
 ## Markdown preview
 
 Open a `.md` or `.markdown` file and click **Preview**, or press Mod Shift V. Click **Edit** or use the same shortcut to return to the source. Each tab keeps its own preview mode.
@@ -127,7 +173,9 @@ Click **Terminal** in the top bar or press Mod J. The panel offers **Bottom** an
 
 The terminal starts the shell specified by `SHELL` (or `/bin/sh`) in the project folder. The session preserves `cd`, variables, and processes between commands. It supports ANSI colors, the alternate screen, function keys, and Ctrl+C to interrupt the foreground process. Drag to select and use Mod C to copy; Mod V pastes. On Linux, Ctrl Shift C/V also copies/pastes. The mouse wheel and Shift PageUp/PageDown navigate up to 2,000 lines of scrollback.
 
-Hiding the panel keeps the session running. **Restart Terminal** ends the session and starts another; switching projects or closing CED ends the shell and foreground process. Terminal position is not persisted. Multiple sessions, mouse-event forwarding to terminal programs, and scrollback reflow on resize are not implemented yet; font attributes such as bold/italic do not change glyph rendering.
+Terminal position is saved to `~/.ced/settings.conf` whenever you change it through the panel or command palette, and restored on startup across projects. The default is **Bottom** when no valid preference exists. Changing the position preserves your saved editor zoom.
+
+Hiding the panel keeps the session running. **Restart Terminal** ends the session and starts another; switching projects or closing CED ends the shell and foreground process. Multiple sessions, mouse-event forwarding to terminal programs, and scrollback reflow on resize are not implemented yet; font attributes such as bold/italic do not change glyph rendering.
 
 ## Files and recovery
 
@@ -142,7 +190,7 @@ When the operating system closes the window, unsaved drafts are preserved in `~/
 - The tree and search skip symbolic links and the `.git`, `node_modules`, `build`, `dist`, `target`, `.venv`, `venv`, and `__pycache__` directories. Other `.gitignore` rules are not interpreted by the explorer/search; the Git panel uses Git's own rules.
 - Use the refresh button to update files/Git. Automatic filesystem monitoring is not implemented yet.
 - A diff is a snapshot of the versions at the time of the click; click the item again after refreshing to reload it.
-- Git write operations run locally and may wait for hooks, signing, or user configuration. The editor does not push, pull, or discard Git changes.
+- Git operations may wait for hooks, signing, credential helpers, or user configuration. The editor does not discard working-tree changes.
 - Windows and extensions are not implemented yet.
 
 ## Tests

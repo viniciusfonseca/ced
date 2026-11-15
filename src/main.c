@@ -4,6 +4,8 @@
 #include "terminal_view.h"
 #include "editor_assist.h"
 #include "file_operations.h"
+#include "process_memory.h"
+#include "editor_logo.h"
 #include <cui/cui.h>
 #include <cui/cui_app.h>
 
@@ -18,6 +20,7 @@
 #define MAX_DOCS 32
 
 #ifdef __APPLE__
+void ced_macos_set_icon(void);
 void *ced_macos_shortcuts(cui_app *app);
 void ced_macos_remove_shortcuts(void *handle);
 #endif
@@ -41,13 +44,23 @@ typedef struct {
 } FileAction;
 
 typedef struct {
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    bool running, done, ok, pull;
+    char root[CED_PATH], error[CED_ERROR];
+} GitSync;
+
+typedef struct {
     CedWorkspace workspace;
     CedGit git;
+    GitSync git_sync;
     CedSearch search;
     EditorTab docs[MAX_DOCS];
     int count, selected, next_id, panel, close_index;
     float split;
     int font_size;
+    uint64_t memory_usage;
+    double next_memory_sample;
     bool sidebar, close_dialog, commit_dialog, palette;
     bool diff, diff_staged;
     char diff_path[CED_PATH], *before, *after;
@@ -56,6 +69,7 @@ typedef struct {
     int goto_line, goto_column;
     cui_code_editor_result caret;
     cui_app *app;
+    cui_texture logo;
     CedLsp *lsp;
     bool lsp_attempted, problems_open;
     CedEditorAssist assist;
@@ -83,6 +97,45 @@ static void refresh(Editor *e) {
     snprintf(root, sizeof root, "%s", e->workspace.root);
     if (!ced_workspace_open(&e->workspace, root, error)) notify(e, error);
     refresh_git(e);
+}
+
+static void *git_sync_worker(void *user) {
+    GitSync *job = user;
+    CedGit git = {0};
+    snprintf(git.root, sizeof git.root, "%s", job->root);
+    bool ok = ced_git_sync(&git, job->pull, job->error);
+    pthread_mutex_lock(&job->mutex);
+    job->ok = ok;
+    job->done = true;
+    pthread_mutex_unlock(&job->mutex);
+    return NULL;
+}
+
+static void start_git_sync(Editor *e, bool pull) {
+    GitSync *job = &e->git_sync;
+    if (job->running) return;
+    snprintf(job->root, sizeof job->root, "%s", e->git.root);
+    job->pull = pull; job->done = false; job->error[0] = 0;
+    if (pthread_create(&job->thread, NULL, git_sync_worker, job)) {
+        notify(e, "Could not start Git operation.");
+        return;
+    }
+    job->running = true;
+    notify(e, pull ? "Pulling..." : "Pushing...");
+}
+
+static void poll_git_sync(cui_ctx *ui, Editor *e) {
+    GitSync *job = &e->git_sync;
+    if (!job->running) return;
+    pthread_mutex_lock(&job->mutex);
+    bool done = job->done;
+    pthread_mutex_unlock(&job->mutex);
+    if (!done) { cui_request_wakeup(ui, 0.1f); return; }
+    pthread_join(job->thread, NULL);
+    job->running = false;
+    if (job->ok && job->pull) { e->diff = false; refresh(e); }
+    else refresh_git(e);
+    notify(e, job->ok ? (job->pull ? "Pull completed." : "Push completed.") : job->error);
 }
 
 static void tab_title(EditorTab *tab) {
@@ -252,6 +305,7 @@ static void restore_recovery(Editor *e) {
 }
 
 static void choose_folder(Editor *e) {
+    if (e->git_sync.running) { notify(e, "Wait for the Git operation to finish."); return; }
     char path[CED_PATH], error[CED_ERROR];
     if (!cui_app_file_dialog(e->app, &(cui_file_dialog_opts){.kind = CUI_FILE_FOLDER, .title = "Open Folder"}, path, sizeof path)) return;
     if (!write_recovery(e)) { notify(e, "Recovery failed. Save your files before switching folders."); return; }
@@ -509,17 +563,38 @@ static void git_panel(cui_ctx *ui, Editor *e) {
         cui_empty_state(ui, "No Git repository", .icon = CUI_ICON_GIT_BRANCH);
         return;
     }
+    cui_push_disabled(ui, e->git_sync.running);
     cui_text(ui, e->git.branch, .font = CUI_FONT_MEDIUM);
     cui_input(ui, "commit-message", e->commit, sizeof e->commit, .placeholder = "Commit message");
-    bool staged_any = false;
-    for (int i = 0; i < e->git.count; i++) staged_any |= e->git.changes[i].index != ' ' && e->git.changes[i].index != '?';
+    bool staged_any = false, unstaged_any = false;
+    for (int i = 0; i < e->git.count; i++) {
+        staged_any |= e->git.changes[i].index != ' ' && e->git.changes[i].index != '?';
+        unstaged_any |= e->git.changes[i].worktree != ' ';
+    }
     if (cui_button(ui, "Commit...", .icon = CUI_ICON_CHECK, .variant = CUI_BUTTON_PRIMARY,
                    .full_width = true, .disabled = !staged_any || !e->commit[0])) e->commit_dialog = true;
+    int bulk = -1;
+    cui_row(ui, .gap = 4, .width = CUI_FILL) {
+        if (cui_button(ui, "Push", .icon = CUI_ICON_UPLOAD, .size = CUI_SIZE_SM, .full_width = true)) start_git_sync(e, false);
+        if (cui_button(ui, "Pull", .icon = CUI_ICON_DOWNLOAD, .size = CUI_SIZE_SM, .full_width = true)) start_git_sync(e, true);
+    }
     cui_scroll(ui, .id = "git-changes", .height = CUI_FILL, .gap = 2) {
         if (!e->git.count) cui_secondary(ui, "No changes.");
         bool mutated = false;
         for (int group = 0; group < 2 && !mutated; group++) {
-            cui_text(ui, group == 0 ? "STAGED CHANGES" : "CHANGES", .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+            bool staged = group == 0;
+            cui_push_id(ui, staged ? "staged-header" : "changes-header");
+            cui_row(ui, .width = CUI_FILL, .gap = 4, .align = CUI_ALIGN_CENTER) {
+                cui_text(ui, staged ? "STAGED CHANGES" : "CHANGES", .size = 11,
+                         .color = CUI_COLOR_TEXT_MUTED, .width = CUI_FILL);
+                if (cui_icon_button(ui, staged ? CUI_ICON_MINUS : CUI_ICON_PLUS,
+                                    .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST,
+                                    .tooltip = staged ? "Unstage All" : "Stage All",
+                                    .disabled = !(staged ? staged_any : unstaged_any) && !e->git.truncated))
+                    bulk = staged ? 1 : 0;
+            }
+            cui_pop_id(ui);
+            if (bulk >= 0) break;
             for (int i = 0; i < e->git.count; i++) {
                 CedChange *change = &e->git.changes[i];
                 bool staged = group == 0;
@@ -544,9 +619,16 @@ static void git_panel(cui_ctx *ui, Editor *e) {
                 if (mutated) break;
             }
         }
+        if (bulk >= 0) {
+            char error[CED_ERROR];
+            if (!ced_git_stage_all(&e->git, bulk == 1, error)) notify(e, error);
+            else notify(e, bulk == 1 ? "All changes unstaged." : "All changes staged.");
+            mutated = true;
+        }
         if (mutated) refresh_git(e);
         if (e->git.truncated) cui_secondary(ui, "Showing first 4096 changes.");
     }
+    cui_pop_disabled(ui);
 }
 
 static void sidebar(cui_ctx *ui, Editor *e) {
@@ -722,17 +804,18 @@ static void editor_pane(cui_ctx *ui, Editor *e) {
                 if (!e->caret.changed) problems_panel(ui, e, tab, diagnostics, diagnostic_count);
             }
         } else {
-            cui_spacer(ui);
-            cui_column(ui, .align = CUI_ALIGN_CENTER, .gap = 16, .pad = 32) {
-                cui_heading(ui, "CED", 1);
-                cui_row(ui, .gap = 12, .justify = CUI_JUSTIFY_CENTER) {
-                    if (cui_button(ui, "New File", .icon = CUI_ICON_PLUS, .variant = CUI_BUTTON_PRIMARY)) new_document(e);
-                    if (cui_button(ui, "Open File", .icon = CUI_ICON_FILE_TEXT)) choose_file(e);
-                }
+            cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+                       .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER) {
+                cui_image(ui, e->logo, .width = CUI_PX(192), .height = CUI_PX(192));
             }
-            cui_spacer(ui);
         }
     }
+}
+
+static void set_terminal_position(Editor *e, bool right) {
+    if (e->terminal_right == right) return;
+    e->terminal_right = right;
+    if (!ced_terminal_right_save(right)) notify(e, "Could not save editor settings.");
 }
 
 static void terminal_panel(cui_ctx *ui, Editor *e) {
@@ -747,7 +830,7 @@ static void terminal_panel(cui_ctx *ui, Editor *e) {
             cui_text(ui, "Terminal", .font = CUI_FONT_MEDIUM, .size = 12, .width = CUI_FILL);
             static const char *positions[] = {"Bottom", "Right"};
             int position = e->terminal_right ? 1 : 0;
-            if (cui_segmented(ui, "terminal-position", positions, 2, &position, .size = CUI_SIZE_SM)) e->terminal_right = position == 1;
+            if (cui_segmented(ui, "terminal-position", positions, 2, &position, .size = CUI_SIZE_SM)) set_terminal_position(e, position == 1);
             if (cui_icon_button(ui, CUI_ICON_REFRESH_CW, .size = CUI_SIZE_SM, .tooltip = "Restart Terminal")) {
                 ced_terminal_stop(e->terminal); e->terminal = NULL;
             }
@@ -826,6 +909,13 @@ static void dialogs(cui_ctx *ui, Editor *e) {
 }
 
 static void frame(cui_ctx *ui, Editor *e) {
+    poll_git_sync(ui, e);
+    double now = cui_time(ui);
+    if (now >= e->next_memory_sample) {
+        e->memory_usage = ced_memory_usage_bytes();
+        e->next_memory_sample = now + 1;
+    }
+    cui_request_wakeup(ui, (float)(e->next_memory_sample - now));
     /* Tree paths and document buffers from the previous frame are no longer
      * needed by the renderer here, so filesystem actions can refresh them. */
     perform_file_action(e);
@@ -871,7 +961,7 @@ static void frame(cui_ctx *ui, Editor *e) {
         cui_toolbar(ui, "main-toolbar", .no_border = false) {
             cui_toolbar_button(ui, CUI_ICON_PANEL_LEFT, .tooltip = "Toggle Sidebar", .toggle = &e->sidebar);
             if (cui_toolbar_button(ui, CUI_ICON_PLUS, .label = "New")) new_document(e);
-            if (cui_toolbar_button(ui, CUI_ICON_FOLDER_OPEN, .label = "Open")) choose_file(e);
+            if (cui_toolbar_button(ui, CUI_ICON_FOLDER_OPEN, .label = "Open")) choose_folder(e);
             if (cui_toolbar_button(ui, CUI_ICON_SAVE, .label = "Save", .disabled = e->selected < 0)) save_document(e, e->selected, false);
             if (cui_toolbar_button(ui, CUI_ICON_TERMINAL, .label = "Terminal")) toggle_terminal(e);
             cui_toolbar_spacer(ui);
@@ -905,6 +995,11 @@ static void frame(cui_ctx *ui, Editor *e) {
                 }
                 cui_status_bar_text(ui, ced_language(e->docs[e->selected].file.path), .tone = CUI_TONE_NEUTRAL);
             }
+            char memory[48];
+            if (e->memory_usage)
+                snprintf(memory, sizeof memory, "RAM: %.1f MB", (double)e->memory_usage / 1000000.0);
+            else snprintf(memory, sizeof memory, "RAM: —");
+            cui_status_bar_text(ui, memory, .tone = CUI_TONE_NEUTRAL);
         }
     }
     dialogs(ui, e);
@@ -944,14 +1039,16 @@ static void frame(cui_ctx *ui, Editor *e) {
             for (int i = 0; i < e->count; i++) e->docs[i].lsp_synced = false;
             break;
         case 11: toggle_terminal(e); break;
-        case 12: e->terminal_right = true; if (!e->terminal_visible) toggle_terminal(e); break;
-        case 13: e->terminal_right = false; if (!e->terminal_visible) toggle_terminal(e); break;
+        case 12: set_terminal_position(e, true); if (!e->terminal_visible) toggle_terminal(e); break;
+        case 13: set_terminal_position(e, false); if (!e->terminal_visible) toggle_terminal(e); break;
         case 14: toggle_markdown_preview(e); break;
         default: break;
     }
 }
 
 static void editor_free(Editor *e) {
+    if (e->git_sync.running) pthread_join(e->git_sync.thread, NULL);
+    pthread_mutex_destroy(&e->git_sync.mutex);
     ced_search_cancel(&e->search);
     ced_lsp_stop(e->lsp);
     ced_terminal_stop(e->terminal);
@@ -960,7 +1057,10 @@ static void editor_free(Editor *e) {
     ced_workspace_free(&e->workspace);
     ced_git_free(&e->git);
     free(e->before); free(e->after);
-    if (e->app) cui_app_destroy(e->app);
+    if (e->app) {
+        if (e->logo) cui_image_destroy(cui_app_ui(e->app), e->logo);
+        cui_app_destroy(e->app);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -973,9 +1073,11 @@ int main(int argc, char **argv) {
     e.sidebar = true;
     e.split = 0.27f;
     e.font_size = ced_font_size_load();
+    e.terminal_right = ced_terminal_right_load();
     e.goto_offset = -1; e.problems_open = true;
     e.terminal_bottom_split = 0.65f; e.terminal_right_split = 0.6f;
     pthread_mutex_init(&e.search.mutex, NULL);
+    pthread_mutex_init(&e.git_sync.mutex, NULL);
     char error[CED_ERROR];
     const char *root = argc > 1 ? argv[1] : ".";
     if (!ced_workspace_open(&e.workspace, root, error)) { fprintf(stderr, "%s\n", error); editor_free(&e); return 1; }
@@ -991,7 +1093,9 @@ int main(int argc, char **argv) {
         .min_width = 760, .min_height = 480, .theme = CUI_THEME_DARK, .accent = CUI_ACCENT_BLUE,
         .app_id = "dev.ced.Editor"});
     if (!e.app) { fprintf(stderr, "Could not create window.\n"); editor_free(&e); return 1; }
+    e.logo = ced_editor_logo_create(cui_app_ui(e.app));
 #ifdef __APPLE__
+    ced_macos_set_icon();
     void *shortcut_monitor = ced_macos_shortcuts(e.app);
 #endif
     while (cui_app_frame(e.app)) frame(cui_app_ui(e.app), &e);

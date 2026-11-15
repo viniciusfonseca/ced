@@ -202,13 +202,95 @@ static void test_git(void) {
     puts("OK: Git status, literal filenames, unborn unstage, stage, commit, staged/unstaged diff, rename, delete, subdirectory");
 }
 
+static void test_git_bulk_and_sync(void) {
+    char repository[CED_PATH], remote[CED_PATH], peer_path[CED_PATH], path[CED_PATH];
+    path_for(repository, "bulk"); assert(!mkdir(repository, 0700));
+    path_for(remote, "remote.git"); path_for(peer_path, "peer");
+    const char *init[] = {"git", "-C", repository, "init", "-b", "main", NULL}; command(init);
+    const char *name[] = {"git", "-C", repository, "config", "user.name", "CED Test", NULL}; command(name);
+    const char *email[] = {"git", "-C", repository, "config", "user.email", "test@example.invalid", NULL}; command(email);
+    write_text("bulk/.gitignore", "ignored.tmp\n");
+    write_text("bulk/ignored.tmp", "ignored\n");
+    write_text("bulk/a [literal].txt", "initial\n");
+    write_text("bulk/b.txt", "delete later\n");
+    CedGit git = {0}, peer = {0};
+    assert(ced_git_refresh(&git, repository, error));
+    assert(ced_git_stage_all(&git, false, error));
+    assert(ced_git_refresh(&git, repository, error));
+    assert(git.count == 3 && !find_change(&git, "ignored.tmp"));
+    for (int i = 0; i < git.count; i++) assert(git.changes[i].index == 'A');
+    write_text("bulk/a [literal].txt", "edited after staging\n");
+    assert(ced_git_stage_all(&git, true, error)); /* no HEAD, including a modified staged file */
+    assert(ced_git_refresh(&git, repository, error));
+    for (int i = 0; i < git.count; i++) assert(git.changes[i].index == '?');
+    CedDocument document = {0}; path_for(path, "bulk/a [literal].txt");
+    assert(ced_document_open(&document, path, error));
+    assert(!strcmp(document.text, "edited after staging\n")); ced_document_free(&document);
+    assert(ced_git_stage_all(&git, false, error));
+    assert(ced_git_commit(&git, "initial bulk files", error));
+    write_text("bulk/a [literal].txt", "modified\n");
+    path_for(path, "bulk/b.txt"); assert(!unlink(path));
+    write_text("bulk/new.txt", "new\n");
+    assert(ced_git_stage_all(&git, false, error));
+    assert(ced_git_refresh(&git, repository, error));
+    assert(find_change(&git, "a [literal].txt")->index == 'M');
+    assert(find_change(&git, "b.txt")->index == 'D');
+    assert(find_change(&git, "new.txt")->index == 'A');
+    assert(ced_git_stage_all(&git, true, error));
+    assert(ced_git_refresh(&git, repository, error));
+    for (int i = 0; i < git.count; i++) assert(git.changes[i].index == ' ' || git.changes[i].index == '?');
+    assert(ced_git_stage_all(&git, false, error));
+    assert(ced_git_commit(&git, "bulk changes", error));
+    assert(!ced_git_sync(&git, false, error) && error[0]); /* no remote */
+    const char *bare[] = {"git", "init", "--bare", "-b", "main", remote, NULL}; command(bare);
+    const char *add_remote[] = {"git", "-C", repository, "remote", "add", "origin", remote, NULL}; command(add_remote);
+    const char *tracking_remote[] = {"git", "-C", repository, "config", "branch.main.remote", "origin", NULL}; command(tracking_remote);
+    const char *tracking_merge[] = {"git", "-C", repository, "config", "branch.main.merge", "refs/heads/main", NULL}; command(tracking_merge);
+    assert(ced_git_sync(&git, false, error));
+    const char *clone[] = {"git", "clone", "--", remote, peer_path, NULL}; command(clone);
+    const char *peer_name[] = {"git", "-C", peer_path, "config", "user.name", "CED Peer", NULL}; command(peer_name);
+    const char *peer_email[] = {"git", "-C", peer_path, "config", "user.email", "peer@example.invalid", NULL}; command(peer_email);
+    assert(ced_git_refresh(&peer, peer_path, error));
+    write_text("peer/remote.txt", "from remote\n");
+    assert(ced_git_stage_all(&peer, false, error));
+    assert(ced_git_commit(&peer, "remote change", error));
+    assert(ced_git_sync(&peer, false, error));
+    assert(ced_git_sync(&git, true, error));
+    path_for(path, "bulk/remote.txt");
+    assert(ced_document_open(&document, path, error));
+    assert(!strcmp(document.text, "from remote\n")); ced_document_free(&document);
+    write_text("bulk/local.txt", "local history\n");
+    assert(ced_git_stage_all(&git, false, error));
+    assert(ced_git_commit(&git, "local commit", error));
+    write_text("peer/another.txt", "remote history\n");
+    assert(ced_git_stage_all(&peer, false, error));
+    assert(ced_git_commit(&peer, "another remote commit", error));
+    assert(ced_git_sync(&peer, false, error));
+    assert(!ced_git_sync(&git, true, error) && error[0]); /* ff-only rejects divergence */
+    assert(!ced_git_sync(&git, false, error) && error[0]); /* push never forces */
+    path_for(path, "bulk/local.txt"); assert(!access(path, F_OK));
+    path_for(path, "bulk/another.txt"); assert(access(path, F_OK));
+    ced_git_free(&git); ced_git_free(&peer);
+    puts("OK: stage/unstage all, unborn index, ignored/literal paths, local-remote push/pull and divergence rejection");
+}
+
 static void test_preferences(void) {
     const char *home = getenv("HOME");
     char *original_home = home ? strdup(home) : NULL;
     assert(!setenv("HOME", root, 1));
     assert(ced_font_size_load() == CED_FONT_SIZE_DEFAULT);
+    assert(!ced_terminal_right_load());
     assert(ced_font_size_save(21));
     assert(ced_font_size_load() == 21);
+    assert(!ced_terminal_right_load());
+    assert(ced_terminal_right_save(true));
+    assert(ced_terminal_right_load());
+    assert(ced_font_size_load() == 21);
+    assert(ced_font_size_save(22));
+    assert(ced_terminal_right_load());
+    assert(ced_terminal_right_save(false));
+    assert(!ced_terminal_right_load());
+    assert(ced_font_size_load() == 22);
     assert(ced_font_size_save(CED_FONT_SIZE_MIN));
     assert(ced_font_size_load() == CED_FONT_SIZE_MIN);
     assert(ced_font_size_save(CED_FONT_SIZE_MAX));
@@ -222,19 +304,31 @@ static void test_preferences(void) {
         write_text(".ced/settings.conf", invalid[i]);
         assert(ced_font_size_load() == CED_FONT_SIZE_DEFAULT);
     }
+    write_text(".ced/settings.conf", "terminal_position=right\nfont_size=19\n");
+    assert(ced_terminal_right_load());
+    assert(ced_font_size_load() == 19);
+    write_text(".ced/settings.conf", "font_size=invalid\nterminal_position=right\n");
+    assert(ced_terminal_right_load());
+    assert(ced_font_size_load() == CED_FONT_SIZE_DEFAULT);
+    write_text(".ced/settings.conf", "font_size=20\nterminal_position=unknown\n");
+    assert(!ced_terminal_right_load());
+    assert(ced_font_size_load() == 20);
     char path[CED_PATH];
     path_for(path, ".ced/settings.conf");
     assert(!unlink(path));
     assert(!mkdir(path, 0700));
     assert(!ced_font_size_save(18));
+    assert(!ced_terminal_right_save(true));
     assert(!rmdir(path));
     assert(ced_font_size_save(18));
     assert(ced_font_size_load() == 18);
     assert(!unsetenv("HOME"));
     assert(ced_font_size_load() == CED_FONT_SIZE_DEFAULT);
+    assert(!ced_terminal_right_load());
     assert(!ced_font_size_save(18));
+    assert(!ced_terminal_right_save(true));
     if (original_home) { assert(!setenv("HOME", original_home, 1)); free(original_home); }
-    puts("OK: persistent zoom, defaults, bounds, invalid settings and write failures");
+    puts("OK: persistent zoom and terminal position, independent settings, defaults, bounds and write failures");
 }
 
 static void test_file_operations(void) {
@@ -302,6 +396,7 @@ int main(void) {
     test_documents();
     test_workspace_search();
     test_git();
+    test_git_bulk_and_sync();
     const char *remove[] = {"rm", "-rf", "--", root, NULL}; command(remove);
     puts("Todos os testes passaram.");
     return 0;

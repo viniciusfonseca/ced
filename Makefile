@@ -4,8 +4,12 @@ BUILD_DIR ?= build
 BUILD_TYPE ?= Release
 JOBS ?= 4
 ARGS ?= .
+PREFIX ?= /usr/local
+DESTDIR ?=
+APPDIR ?= /Applications
+UNAME_S := $(shell uname -s)
 
-.PHONY: all deps configure build test run clean
+.PHONY: all deps configure build test run install install-cli install-macos clean
 
 all: build
 
@@ -23,6 +27,28 @@ test: build
 
 run: build
 	"$(BUILD_DIR)/ced" $(ARGS)
+
+install: install-cli
+ifeq ($(UNAME_S),Linux)
+	install -d "$(DESTDIR)$(PREFIX)/share/applications" "$(DESTDIR)$(PREFIX)/share/icons/hicolor/256x256/apps"
+	install -m 644 packaging/dev.ced.Editor.desktop "$(DESTDIR)$(PREFIX)/share/applications/dev.ced.Editor.desktop"
+	install -m 644 assets/ced-256.png "$(DESTDIR)$(PREFIX)/share/icons/hicolor/256x256/apps/dev.ced.Editor.png"
+endif
+
+install-cli: build
+	install -d "$(DESTDIR)$(PREFIX)/bin"
+	install -m 755 "$(BUILD_DIR)/ced" "$(DESTDIR)$(PREFIX)/bin/ced"
+
+ifeq ($(UNAME_S),Darwin)
+install: install-macos
+
+install-macos: install-cli
+	sh packaging/install-macos.sh "$(BUILD_DIR)/CED.app" "$(DESTDIR)$(APPDIR)" "$(DESTDIR)"
+else
+install-macos:
+	@echo "install-macos requires macOS."
+	@exit 1
+endif
 
 clean:
 	@if [ -d "$(BUILD_DIR)" ]; then cmake --build "$(BUILD_DIR)" --target clean; fi

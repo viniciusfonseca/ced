@@ -9,5 +9,7 @@
 
 int ced_font_size_load(void);
 bool ced_font_size_save(int size);
+bool ced_terminal_right_load(void);
+bool ced_terminal_right_save(bool right);
 
 #endif

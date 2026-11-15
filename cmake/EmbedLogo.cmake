@@ -1,0 +1,5 @@
+file(READ "${INPUT}" logo_hex HEX)
+string(REGEX REPLACE "(..)" "0x\\1," logo_bytes "${logo_hex}")
+get_filename_component(output_directory "${OUTPUT}" DIRECTORY)
+file(MAKE_DIRECTORY "${output_directory}")
+file(WRITE "${OUTPUT}" "static const unsigned char ced_logo_png[] = {\n${logo_bytes}\n};\n")

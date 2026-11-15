@@ -52,7 +52,7 @@ add_custom_target(ced_vterm_encodings DEPENDS ${CED_VTERM_ENCODINGS})
 add_dependencies(ced_vterm ced_vterm_encodings)
 target_include_directories(ced_vterm PRIVATE "${CED_VTERM_GENERATED}")
 
-add_library(ced_core src/workspace.c src/preferences.c src/lsp.c src/terminal.c src/file_operations.c)
+add_library(ced_core src/workspace.c src/preferences.c src/lsp.c src/terminal.c src/file_operations.c src/process_memory.c)
 target_include_directories(ced_core PUBLIC src)
 target_compile_definitions(ced_core PUBLIC _DARWIN_C_SOURCE _POSIX_C_SOURCE=200809L _XOPEN_SOURCE=700)
 target_compile_options(ced_core PRIVATE -Wall -Wextra -Wpedantic)
@@ -61,21 +61,41 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(ced_core PUBLIC util m)
 endif()
 
-add_executable(ced src/main.c src/terminal_view.c src/editor_assist.c)
-target_include_directories(ced PRIVATE "${CED_CUI_SOURCE_DIR}/src")
+set(CED_LOGO_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/ced_logo_data.h")
+add_custom_command(OUTPUT "${CED_LOGO_HEADER}"
+    COMMAND "${CMAKE_COMMAND}"
+        "-DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/assets/ced-256.png"
+        "-DOUTPUT=${CED_LOGO_HEADER}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedLogo.cmake"
+    DEPENDS assets/ced-256.png cmake/EmbedLogo.cmake
+    VERBATIM)
+add_executable(ced src/main.c src/terminal_view.c src/editor_assist.c src/editor_logo.c "${CED_LOGO_HEADER}")
+target_include_directories(ced PRIVATE "${CED_CUI_SOURCE_DIR}/src" "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(ced PRIVATE ced_core cui::cui)
 target_compile_options(ced PRIVATE -Wall -Wextra -Wpedantic)
 cui_app_target(ced)
 if(APPLE)
     enable_language(OBJC)
+    find_program(CED_CODESIGN_EXECUTABLE codesign REQUIRED)
     target_sources(ced PRIVATE src/macos.m)
     target_compile_options(ced PRIVATE $<$<COMPILE_LANGUAGE:OBJC>:-fobjc-arc>)
+    # The standalone CLI also needs a Dock icon, without external resources.
+    target_link_options(ced PRIVATE
+        "LINKER:-sectcreate,__DATA,__ced_icon,${CMAKE_CURRENT_SOURCE_DIR}/assets/ced-256.png")
+    set_property(TARGET ced APPEND PROPERTY LINK_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/ced-256.png"
+        "${CMAKE_CURRENT_SOURCE_DIR}/packaging/ced.icns"
+        "${CMAKE_BINARY_DIR}/Info.plist")
     # Keep the CLI executable and also provide a Finder-launchable application.
     configure_file(packaging/Info.plist.in ${CMAKE_BINARY_DIR}/Info.plist @ONLY)
     add_custom_command(TARGET ced POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/CED.app/Contents/MacOS"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/CED.app/Contents/Resources"
         COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:ced>" "${CMAKE_BINARY_DIR}/CED.app/Contents/MacOS/ced"
-        COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_BINARY_DIR}/Info.plist" "${CMAKE_BINARY_DIR}/CED.app/Contents/Info.plist")
+        COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_BINARY_DIR}/Info.plist" "${CMAKE_BINARY_DIR}/CED.app/Contents/Info.plist"
+        COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/packaging/ced.icns" "${CMAKE_BINARY_DIR}/CED.app/Contents/Resources/ced.icns"
+        COMMAND "${CED_CODESIGN_EXECUTABLE}" --force --sign - "${CMAKE_BINARY_DIR}/CED.app"
+        VERBATIM)
 endif()
 
 include(CTest)
