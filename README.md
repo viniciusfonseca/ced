@@ -6,6 +6,8 @@
 
 A desktop text editor written in C99 with [CUI](https://github.com/yappologistic/CUI), organized around a VS Code-inspired workspace.
 
+![CED interface with the file explorer, C editor, and integrated terminal](assets/ced-interface.png)
+
 - **Files:** expandable file tree, file opening, project refresh, and context menus for creating, renaming, and deleting files and folders.
 - **Search:** literal search in the background; click a result to open its line and column.
 - **Git:** current branch, staged and local changes, side-by-side diffs, staging/unstaging individual files or all changes, commits with confirmation, push, and pull.

@@ -4,6 +4,7 @@ The blue angular C with a terminal cursor is the project's primary logo.
 
 - `ced.png`: 1024 × 1024 transparent PNG for the README and general use.
 - `ced-256.png`: 256 × 256 PNG embedded for the empty editor pane and macOS CLI icon, and installed in the Linux icon theme.
+- `ced-interface.png`: user-provided screenshot presenting the editor interface in the main README.
 - `../packaging/ced.icns`: macOS bundle icon, containing standard and Retina sizes from 16 to 1024 pixels.
 
 The chosen concept was generated with the built-in ImageGen tool. Its white presentation background was removed with ImageGen, preserving the dark tile and blue mark. PNG sizes were exported with `sips`; the macOS icon was assembled with `iconutil`.
