@@ -536,6 +536,50 @@ bool ced_git_stage_all(CedGit *git, bool unstage, char *error) {
     return ok;
 }
 
+bool ced_git_discard(CedGit *git, const char *path, char *error) {
+    if (!git->available || !path || !*path || *path == '/' || strlen(path) >= CED_PATH)
+        return fail(error, "Invalid Git path.");
+    /* Only one repository-relative literal file may be discarded. */
+    for (const char *part = path; *part;) {
+        const char *end = strchr(part, '/');
+        size_t length = end ? (size_t)(end - part) : strlen(part);
+        if (!length || (length == 1 && *part == '.') || (length == 2 && !memcmp(part,"..",2)) ||
+            (length == 4 && !memcmp(part,".git",4))) return fail(error, "Invalid Git path.");
+        if (!end) break;
+        part = end + 1;
+        if (!*part) return fail(error, "Discarding directories is not supported.");
+    }
+    CedGit current = {0};
+    if (!ced_git_refresh(&current, git->root, error)) return false;
+    const CedChange *change = NULL;
+    for (int n = 0; n < current.count; n++)
+        if (!strcmp(current.changes[n].path,path) && current.changes[n].worktree != ' ') { change = &current.changes[n]; break; }
+    bool ok = false;
+    if (!change || change->worktree == ' ') { fail(error, "No unstaged changes for this file."); goto done; }
+    if (change->index == 'U' || change->worktree == 'U' ||
+        (change->index == 'A' && change->worktree == 'A') || (change->index == 'D' && change->worktree == 'D')) {
+        fail(error, "Resolve this file's merge conflict before discarding changes."); goto done;
+    }
+    char absolute[CED_PATH]; struct stat st;
+    if (!ced_join(absolute,sizeof absolute,current.root,path)) { fail(error,"Path too long."); goto done; }
+    int exists = lstat(absolute,&st);
+    if (!exists && S_ISDIR(st.st_mode)) { fail(error,"Discarding directories or submodules is not supported."); goto done; }
+    if (exists && errno != ENOENT) { fail(error,"Could not inspect this file: %s",strerror(errno)); goto done; }
+    char *out = NULL;
+    if (change->index == '?' && change->worktree == '?') {
+        const char *args[] = {"git","--literal-pathspecs","-C",current.root,"clean","-f","--",path,NULL};
+        ok = git_run(args,&out,error);
+        if (ok && (!lstat(absolute,&st) || errno != ENOENT)) ok = fail(error,"The untracked file could not be removed.");
+    } else {
+        /* The default source is the index, not HEAD: staged content survives. */
+        const char *args[] = {"git","--literal-pathspecs","-C",current.root,"restore","--worktree","--",path,NULL};
+        ok = git_run(args,&out,error);
+    }
+    free(out);
+done:
+    ced_git_free(&current); return ok;
+}
+
 bool ced_git_sync(CedGit *git, bool pull, char *error) {
     const char *args[] = {"env", "GIT_TERMINAL_PROMPT=0", "git", "-C", git->root,
                          pull ? "pull" : "push", pull ? "--ff-only" : NULL, NULL};

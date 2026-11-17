@@ -202,6 +202,71 @@ static void test_git(void) {
     puts("OK: Git status, literal filenames, unborn unstage, stage, commit, staged/unstaged diff, rename, delete, subdirectory");
 }
 
+static void test_git_discard(void) {
+    char repository[CED_PATH], file[CED_PATH];
+    path_for(repository,"discard"); assert(!mkdir(repository,0700));
+    const char *init[]={"git","-C",repository,"init","-b","main",NULL}; command(init);
+    const char *name[]={"git","-C",repository,"config","user.name","CED Test",NULL}; command(name);
+    const char *email[]={"git","-C",repository,"config","user.email","test@example.invalid",NULL}; command(email);
+    write_text("discard/a [literal] ' ü.txt","original\n");
+    write_text("discard/other.txt","other original\n");
+    write_text("discard/staged-delete.txt","keep deletion staged\n");
+    CedGit git={0}; assert(ced_git_refresh(&git,repository,error));
+    assert(ced_git_stage_all(&git,false,error)); assert(ced_git_commit(&git,"initial",error));
+    write_text("discard/a [literal] ' ü.txt","staged\n");
+    assert(ced_git_stage(&git,"a [literal] ' ü.txt",false,error));
+    write_text("discard/a [literal] ' ü.txt","unstaged\n");
+    write_text("discard/other.txt","keep this change\n");
+    assert(ced_git_discard(&git,"a [literal] ' ü.txt",error));
+    assert(ced_git_refresh(&git,repository,error));
+    CedChange *change=find_change(&git,"a [literal] ' ü.txt"); assert(change && change->index=='M' && change->worktree==' ');
+    assert(find_change(&git,"other.txt"));
+    char *before=NULL,*after=NULL;
+    assert(ced_git_versions(&git,change,true,&before,&after,error));
+    assert(!strcmp(before,"original\n") && !strcmp(after,"staged\n")); free(before); free(after);
+    CedDocument restored={0}; path_for(file,"discard/a [literal] ' ü.txt");
+    assert(ced_document_open(&restored,file,error)); assert(!strcmp(restored.text,"staged\n")); ced_document_free(&restored);
+    assert(!unlink(file)); assert(ced_git_discard(&git,"a [literal] ' ü.txt",error));
+    assert(ced_document_open(&restored,file,error)); assert(!strcmp(restored.text,"staged\n")); ced_document_free(&restored);
+    write_text("discard/new [file].txt","untracked\n");
+    assert(ced_git_discard(&git,"new [file].txt",error)); path_for(file,"discard/new [file].txt"); assert(access(file,F_OK));
+    write_text("discard/added.txt","index version\n"); assert(ced_git_stage(&git,"added.txt",false,error));
+    write_text("discard/added.txt","working version\n"); assert(ced_git_discard(&git,"added.txt",error));
+    path_for(file,"discard/added.txt"); assert(ced_document_open(&restored,file,error));
+    assert(!strcmp(restored.text,"index version\n")); ced_document_free(&restored);
+    assert(!ced_git_discard(&git,"added.txt",error)); /* staged-only changes are never discarded */
+    write_text("discard/.gitignore","ignored.tmp\n"); write_text("discard/ignored.tmp","keep ignored\n");
+    assert(!ced_git_discard(&git,"ignored.tmp",error)); path_for(file,"discard/ignored.tmp"); assert(!access(file,F_OK));
+    assert(!ced_git_discard(&git,"../other.txt",error)); assert(!ced_git_discard(&git,".",error));
+    assert(!ced_git_discard(&git,".git/config",error)); assert(!ced_git_discard(&git,repository,error));
+    path_for(file,"discard/link"); assert(!symlink("other.txt",file));
+    assert(ced_git_discard(&git,"link",error)); assert(access(file,F_OK));
+    path_for(file,"discard/other.txt"); assert(ced_document_open(&restored,file,error));
+    assert(!strcmp(restored.text,"keep this change\n")); ced_document_free(&restored);
+    const char *cached_delete[]={"git","-C",repository,"rm","--cached","--","staged-delete.txt",NULL}; command(cached_delete);
+    assert(ced_git_discard(&git,"staged-delete.txt",error));
+    assert(ced_git_refresh(&git,repository,error));
+    change=find_change(&git,"staged-delete.txt"); assert(change && change->index=='D' && change->worktree==' ');
+    assert(ced_git_stage_all(&git,false,error)); assert(ced_git_commit(&git,"checkpoint",error));
+    const char *rename[]={"git","-C",repository,"mv","--","a [literal] ' ü.txt","renamed.txt",NULL}; command(rename);
+    write_text("discard/renamed.txt","unstaged after rename\n");
+    assert(ced_git_discard(&git,"renamed.txt",error)); assert(ced_git_refresh(&git,repository,error));
+    change=find_change(&git,"renamed.txt"); assert(change && change->index=='R' && change->worktree==' ');
+    assert(!strcmp(change->original,"a [literal] ' ü.txt"));
+    assert(ced_git_commit(&git,"rename",error));
+    const char *branch[]={"git","-C",repository,"checkout","-b","side",NULL}; command(branch);
+    write_text("discard/renamed.txt","side version\n"); assert(ced_git_stage_all(&git,false,error)); assert(ced_git_commit(&git,"side",error));
+    const char *checkout[]={"git","-C",repository,"checkout","main",NULL}; command(checkout);
+    write_text("discard/renamed.txt","main version\n"); assert(ced_git_stage_all(&git,false,error)); assert(ced_git_commit(&git,"main",error));
+    const char *merge[]={"git","-C",repository,"merge","--no-edit","side",NULL}; char *output=NULL;
+    assert(ced_command(merge,&output,NULL)!=0); free(output);
+    assert(!ced_git_discard(&git,"renamed.txt",error) && strstr(error,"merge conflict"));
+    path_for(file,"discard/renamed.txt"); assert(ced_document_open(&restored,file,error));
+    assert(strstr(restored.text,"<<<<<<<")); ced_document_free(&restored);
+    ced_git_free(&git);
+    puts("OK: discard restores the index, preserves staged/other/ignored files, restores deletions, deletes untracked literal paths and never follows symlink targets");
+}
+
 static void test_git_bulk_and_sync(void) {
     char repository[CED_PATH], remote[CED_PATH], peer_path[CED_PATH], path[CED_PATH];
     path_for(repository, "bulk"); assert(!mkdir(repository, 0700));
@@ -275,60 +340,52 @@ static void test_git_bulk_and_sync(void) {
 }
 
 static void test_preferences(void) {
-    const char *home = getenv("HOME");
-    char *original_home = home ? strdup(home) : NULL;
-    assert(!setenv("HOME", root, 1));
-    assert(ced_font_size_load() == CED_FONT_SIZE_DEFAULT);
-    assert(!ced_terminal_right_load());
-    assert(ced_font_size_save(21));
-    assert(ced_font_size_load() == 21);
-    assert(!ced_terminal_right_load());
-    assert(ced_terminal_right_save(true));
-    assert(ced_terminal_right_load());
-    assert(ced_font_size_load() == 21);
-    assert(ced_font_size_save(22));
-    assert(ced_terminal_right_load());
-    assert(ced_terminal_right_save(false));
-    assert(!ced_terminal_right_load());
-    assert(ced_font_size_load() == 22);
-    assert(ced_font_size_save(CED_FONT_SIZE_MIN));
-    assert(ced_font_size_load() == CED_FONT_SIZE_MIN);
-    assert(ced_font_size_save(CED_FONT_SIZE_MAX));
-    assert(ced_font_size_load() == CED_FONT_SIZE_MAX);
-    assert(!ced_font_size_save(CED_FONT_SIZE_MIN - 1));
-    assert(!ced_font_size_save(CED_FONT_SIZE_MAX + 1));
-    assert(ced_font_size_load() == CED_FONT_SIZE_MAX);
-    const char *invalid[] = {"", "font_size=oops\n", "font_size=7\n", "font_size=33\n",
-                             "font_size=21oops\n", "font_size=999999999999999999999999\n"};
-    for (size_t i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
-        write_text(".ced/settings.conf", invalid[i]);
-        assert(ced_font_size_load() == CED_FONT_SIZE_DEFAULT);
+    const char *home=getenv("HOME"); char *original_home=home ? strdup(home) : NULL;
+    assert(!setenv("HOME",root,1));
+    char directory[CED_PATH],path[CED_PATH]; path_for(directory,".ced"); assert(!mkdir(directory,0700));
+    assert(ced_font_size_load()==CED_FONT_SIZE_DEFAULT && !ced_terminal_right_load());
+    write_text(".ced/settings.conf","font_size=21\nterminal_position=right\n");
+    assert(ced_font_size_load()==21 && ced_terminal_right_load());
+    assert(ced_preferences_ensure(path,error));
+    CedPreferences settings; assert(ced_preferences_load(&settings,error));
+    assert(settings.font_size==21 && settings.terminal_right && !strcmp(settings.font_family,"Geist Mono"));
+    write_text(".ced/settings.conf","font_size=30\nterminal_position=bottom\n");
+    assert(ced_font_size_load()==21 && ced_terminal_right_load()); /* JSON takes precedence. */
+    write_text(".ced/settings.json","{\"editor.fontSize\":19,\"editor.fontFamily\":\"Menlo\",\"editor.fontPath\":\"\",\"terminal.position\":\"right\",\"future\":{\"enabled\":true}}");
+    assert(ced_font_size_save(22)); assert(ced_terminal_right_save(false));
+    assert(ced_preferences_load(&settings,error));
+    assert(settings.font_size==22 && !settings.terminal_right && !strcmp(settings.font_family,"Menlo"));
+    CedDocument doc={0}; assert(ced_document_open(&doc,path,error));
+    assert(strstr(doc.text,"future") && strstr(doc.text,"enabled") && strstr(doc.text,"Menlo")); ced_document_free(&doc);
+    assert(ced_font_size_save(CED_FONT_SIZE_MIN) && ced_font_size_load()==CED_FONT_SIZE_MIN);
+    assert(ced_font_size_save(CED_FONT_SIZE_MAX) && ced_font_size_load()==CED_FONT_SIZE_MAX);
+    assert(!ced_font_size_save(CED_FONT_SIZE_MIN-1) && !ced_font_size_save(CED_FONT_SIZE_MAX+1));
+    const char *invalid[]={"", "[]", "{", "{} garbage", "{\"editor.fontSize\":7}",
+        "{\"editor.fontSize\":33}", "{\"editor.fontSize\":14.5}", "{\"editor.fontSize\":\"14\"}",
+        "{\"editor.fontSize\":014}", "{\"editor.fontSize\":1e999}",
+        "{\"terminal.position\":\"left\"}", "{\"editor.fontFamily\":42}",
+        "{\"editor.fontPath\":\"relative.ttf\"}", "{\"editor.fontFamily\":\"Menlo\\u0000hidden\"}",
+        "{\"editor.fontSize\":14,\"editor.fontSize\":15}"};
+    for (size_t n=0;n<sizeof invalid/sizeof *invalid;n++) {
+        CedPreferences previous=settings;
+        assert(!ced_preferences_validate(invalid[n],strlen(invalid[n]),&settings,error));
+        assert(settings.font_size==previous.font_size && !strcmp(settings.font_family,previous.font_family));
+        write_text(".ced/settings.json",invalid[n]);
+        assert(!ced_font_size_save(18) && !ced_terminal_right_save(true));
+        assert(ced_preferences_ensure(path,error)); /* Invalid JSON can still be opened for repair. */
+        assert(ced_document_open(&doc,path,error)); assert(!strcmp(doc.text,invalid[n])); ced_document_free(&doc);
     }
-    write_text(".ced/settings.conf", "terminal_position=right\nfont_size=19\n");
-    assert(ced_terminal_right_load());
-    assert(ced_font_size_load() == 19);
-    write_text(".ced/settings.conf", "font_size=invalid\nterminal_position=right\n");
-    assert(ced_terminal_right_load());
-    assert(ced_font_size_load() == CED_FONT_SIZE_DEFAULT);
-    write_text(".ced/settings.conf", "font_size=20\nterminal_position=unknown\n");
-    assert(!ced_terminal_right_load());
-    assert(ced_font_size_load() == 20);
-    char path[CED_PATH];
-    path_for(path, ".ced/settings.conf");
-    assert(!unlink(path));
-    assert(!mkdir(path, 0700));
-    assert(!ced_font_size_save(18));
-    assert(!ced_terminal_right_save(true));
-    assert(!rmdir(path));
-    assert(ced_font_size_save(18));
-    assert(ced_font_size_load() == 18);
+    char *large=malloc(CED_PREFERENCES_LIMIT+2); assert(large);
+    memset(large,' ',CED_PREFERENCES_LIMIT+1); large[CED_PREFERENCES_LIMIT+1]=0;
+    write_text(".ced/settings.json",large); assert(!ced_font_size_save(18)); free(large);
+    assert(!unlink(path)); assert(!mkdir(path,0700));
+    assert(!ced_font_size_save(18) && !ced_terminal_right_save(true) && !ced_preferences_ensure(path,error));
+    assert(!rmdir(path)); assert(ced_font_size_save(18)); assert(ced_font_size_load()==18);
     assert(!unsetenv("HOME"));
-    assert(ced_font_size_load() == CED_FONT_SIZE_DEFAULT);
-    assert(!ced_terminal_right_load());
-    assert(!ced_font_size_save(18));
-    assert(!ced_terminal_right_save(true));
-    if (original_home) { assert(!setenv("HOME", original_home, 1)); free(original_home); }
-    puts("OK: persistent zoom and terminal position, independent settings, defaults, bounds and write failures");
+    assert(ced_font_size_load()==CED_FONT_SIZE_DEFAULT && !ced_terminal_right_load());
+    assert(!ced_font_size_save(18) && !ced_terminal_right_save(true));
+    if (original_home) { assert(!setenv("HOME",original_home,1)); free(original_home); }
+    puts("OK: JSON preferences, legacy migration, preserved fields, validation, limits and atomic-write failures");
 }
 
 static void test_file_operations(void) {
@@ -396,6 +453,7 @@ int main(void) {
     test_documents();
     test_workspace_search();
     test_git();
+    test_git_discard();
     test_git_bulk_and_sync();
     const char *remove[] = {"rm", "-rf", "--", root, NULL}; command(remove);
     puts("Todos os testes passaram.");

@@ -1,5 +1,6 @@
 #include "workspace.h"
 #include "preferences.h"
+#include "editor_font.h"
 #include "lsp.h"
 #include "terminal_view.h"
 #include "editor_assist.h"
@@ -56,14 +57,25 @@ typedef struct {
 } GitSync;
 
 typedef struct {
+    bool open, execute;
+    char root[CED_PATH], path[CED_PATH], error[CED_ERROR];
+} GitDiscard;
+
+typedef struct {
     CedWorkspace workspace;
     CedGit git;
     GitSync git_sync;
+    GitDiscard git_discard;
     CedSearch search;
     EditorTab docs[MAX_DOCS];
     int count, selected, next_id, panel, close_index;
     float split;
     int font_size;
+    CedPreferences preferences;
+    CedEditorFont editor_font;
+    bool preferences_loaded, preferences_reload;
+    double next_preferences_poll;
+    char preferences_error[CED_ERROR];
     uint64_t memory_usage;
     double next_memory_sample;
     bool sidebar, close_dialog, commit_dialog, palette;
@@ -94,6 +106,7 @@ typedef struct {
 #endif
 } Editor;
 static void dispatch(Editor *e, const char *id);
+static void remove_tab(Editor *e, int index);
 
 static bool extension_modal(const Editor *e) {
 #ifdef CED_ENABLE_EXTENSIONS
@@ -228,12 +241,19 @@ static bool save_document(Editor *e, int index, bool save_as) {
         if (i != index && !strcmp(e->docs[i].file.path, path)) { notify(e, "File already open in another tab."); return false; }
     }
     /* A native Save dialog confirms replacing an existing destination. */
+    char settings_path[CED_PATH];
+    bool preferences_file = ced_preferences_path(settings_path,error) && !strcmp(path,settings_path);
+    if (preferences_file) {
+        CedPreferences candidate;
+        if (!ced_preferences_validate(tab->file.text,strlen(tab->file.text),&candidate,error)) { notify(e,error); return false; }
+    }
     char previous_path[CED_PATH];
     snprintf(previous_path, sizeof previous_path, "%s", tab->file.path);
 #ifdef CED_ENABLE_EXTENSIONS
     unsigned previous_access = ced_extensions_document_access(e->extensions, &tab->file);
 #endif
     if (!ced_document_save(&tab->file, path, chosen, error)) { notify(e, error); return false; }
+    if (preferences_file) e->preferences_reload = true;
 #ifdef CED_ENABLE_EXTENSIONS
     ced_extensions_document_changed(e->extensions, &tab->file, previous_access);
 #endif
@@ -244,6 +264,39 @@ static bool save_document(Editor *e, int index, bool save_as) {
     notify(e, "Saved.");
     refresh(e);
     return true;
+}
+
+static void perform_git_discard(Editor *e) {
+    GitDiscard *action = &e->git_discard;
+    if (!action->execute) return;
+    action->execute = false;
+    if (strcmp(action->root,e->git.root)) { notify(e,"The repository changed. Discard was cancelled."); return; }
+    if (e->git_sync.running) { snprintf(action->error,sizeof action->error,"Wait for the Git operation to finish."); action->open = true; return; }
+    if (!ced_git_discard(&e->git,action->path,action->error)) { action->open = true; refresh_git(e); return; }
+    char path[CED_PATH];
+    if (ced_join(path,sizeof path,action->root,action->path)) {
+        for (int n = e->count - 1; n >= 0; n--) {
+            EditorTab *tab = &e->docs[n];
+            if (strcmp(tab->file.path,path)) continue;
+            struct stat st;
+            if (lstat(path,&st) || !S_ISREG(st.st_mode)) { remove_tab(e,n); continue; }
+            CedDocument restored = {0};
+            if (!ced_document_open(&restored,path,action->error)) { notify(e,action->error); continue; }
+#ifdef CED_ENABLE_EXTENSIONS
+            ced_extensions_document_closed(e->extensions,tab->file.id);
+#endif
+            ced_lsp_close(e->lsp,tab->file.path);
+            ced_document_free(&tab->file); tab->file = restored;
+            tab->id = ++e->next_id;
+            ced_document_identify(&tab->file,(uint64_t)tab->id);
+            tab->anchor = tab->cursor = 0; tab->lsp_synced = false; tab->focus = n == e->selected;
+            tab_title(tab);
+        }
+    }
+    e->diff = false; e->goto_line = 0; e->goto_offset = -1;
+    ced_assist_reset(&e->assist);
+    refresh(e);
+    if (!*action->error) notify(e,"Changes discarded.");
 }
 
 static void remove_tab(Editor *e, int index) {
@@ -266,6 +319,50 @@ static void request_close(Editor *e, int index) {
         e->close_index = index;
         e->close_dialog = true;
     } else remove_tab(e, index);
+}
+
+static void poll_preferences(cui_ctx *ui, Editor *e) {
+    double now=cui_time(ui);
+    if (!e->preferences_reload && now<e->next_preferences_poll) return;
+    bool force=e->preferences_reload; e->preferences_reload=false; e->next_preferences_poll=now+1;
+    CedPreferences settings; char error[CED_ERROR];
+    if (!ced_preferences_load(&settings,error)) {
+        if (strcmp(error,e->preferences_error)) notify(e,error);
+        snprintf(e->preferences_error,sizeof e->preferences_error,"%s",error); return;
+    }
+    bool settings_changed=force || !e->preferences_loaded || settings.font_size!=e->preferences.font_size ||
+        settings.terminal_right!=e->preferences.terminal_right || strcmp(settings.font_family,e->preferences.font_family) || strcmp(settings.font_path,e->preferences.font_path);
+    bool font_changed=force || !e->preferences_loaded || *e->preferences_error || strcmp(settings.font_family,e->preferences.font_family) || strcmp(settings.font_path,e->preferences.font_path);
+    if (font_changed && !ced_editor_font_apply(ui,&e->editor_font,&settings,error)) {
+        if (strcmp(error,e->preferences_error)) notify(e,error);
+        snprintf(e->preferences_error,sizeof e->preferences_error,"%s",error);
+    } else if (font_changed) {
+        if (*e->preferences_error && !strcmp(e->message,e->preferences_error)) notify(e,"Preferences reloaded.");
+        *e->preferences_error=0;
+    }
+    e->font_size=settings.font_size; e->terminal_right=settings.terminal_right;
+    e->preferences=settings; e->preferences_loaded=true;
+    if (!settings_changed) return;
+    /* Refresh only clean settings buffers; never replace unsaved JSON edits. */
+    char path[CED_PATH];
+    if (!ced_preferences_path(path,error)) return;
+    for (int n=0;n<e->count;n++) {
+        EditorTab *tab=&e->docs[n];
+        if (strcmp(tab->file.path,path) || ced_document_dirty(&tab->file)) continue;
+        CedDocument next={0};
+        if (!ced_document_open(&next,path,error)) continue;
+        if (!strcmp(next.text,tab->file.text)) { ced_document_free(&next); continue; }
+#ifdef CED_ENABLE_EXTENSIONS
+        ced_extensions_document_closed(e->extensions,tab->file.id);
+#endif
+        ced_lsp_close(e->lsp,tab->file.path); ced_document_free(&tab->file); tab->file=next;
+        tab->id=++e->next_id; ced_document_identify(&tab->file,(uint64_t)tab->id);
+        size_t cursor=(size_t)tab->cursor;
+        if (cursor>next.length) cursor=next.length;
+        while (cursor && !ced_utf8_boundary(next.text,next.length,cursor)) cursor--;
+        tab->anchor=tab->cursor=(int)cursor; tab->lsp_synced=false; tab->focus=n==e->selected;
+        tab_title(tab);
+    }
 }
 
 /* CUI has no public close-veto callback. Keep unsaved buffers in a private
@@ -392,7 +489,7 @@ static void lsp_tick(Editor *e) {
     if (strcmp(tab->file.path, r->path)) return;
     if (r->kind == CED_LSP_HOVER) {
         if (e->assist.hover_tab == tab->id && e->assist.hover_offset == r->offset && e->assist.hover_requested &&
-            !e->palette && !e->close_dialog && !e->commit_dialog && !r->error[0])
+            !e->palette && !e->close_dialog && !e->commit_dialog && !e->git_discard.open && !r->error[0])
             ced_assist_show_hover(&e->assist, r->hover);
         return;
     }
@@ -556,7 +653,7 @@ static int tree_node(cui_ctx *ui, Editor *e, int index) {
     if (!ced_join(path, sizeof path, e->workspace.root, entry->path)) return index + 1;
     if (e->selected >= 0) selected = !strcmp(path, e->docs[e->selected].file.path);
     cui_push_id(ui, entry->path);
-    bool expanded = cui_tree_begin(ui, ced_basename(entry->path), &entry->expanded,
+    bool expanded = ced_tree_begin(ui, ced_basename(entry->path), &entry->expanded,
         &(cui_tree_opts){.leaf = !entry->directory, .selected = selected,
                         .icon = entry->directory ? CUI_ICON_FOLDER : CUI_ICON_FILE_TEXT});
     if (!entry->directory && cui_tree_clicked(ui)) open_document(e, path, 0, 0);
@@ -659,6 +756,13 @@ static void git_panel(cui_ctx *ui, Editor *e) {
                 cui_row(ui, .gap = 2) {
                     cui_column(ui, .width = CUI_FILL) {
                         if (cui_nav_item(ui, label, .selected = e->diff && e->diff_staged == staged && !strcmp(e->diff_path, change->path))) open_diff(e, change, staged);
+                    }
+                    if (!staged && cui_icon_button(ui, CUI_ICON_TRASH_2, .size = CUI_SIZE_SM,
+                            .variant = CUI_BUTTON_GHOST, .tooltip = "Discard Changes")) {
+                        GitDiscard *action = &e->git_discard;
+                        snprintf(action->root,sizeof action->root,"%s",e->git.root);
+                        snprintf(action->path,sizeof action->path,"%s",change->path);
+                        *action->error = 0; action->open = true;
                     }
                     if (cui_icon_button(ui, staged ? CUI_ICON_MINUS : CUI_ICON_PLUS, .size = CUI_SIZE_SM,
                                         .tooltip = staged ? "Unstage Changes" : "Stage Changes")) {
@@ -802,7 +906,7 @@ static void editor_pane(cui_ctx *ui, Editor *e) {
                           .size = e->font_size);
         } else if (e->selected >= 0 && e->selected < e->count) {
             EditorTab *tab = &e->docs[e->selected];
-            bool assist_enabled = !e->close_dialog && !e->commit_dialog && !e->file_action.open && !e->palette && !extension_modal(e) && ced_lsp_language(tab->file.path);
+            bool assist_enabled = !e->close_dialog && !e->commit_dialog && !e->git_discard.open && !e->file_action.open && !e->palette && !extension_modal(e) && ced_lsp_language(tab->file.path);
             if (!assist_enabled) ced_assist_reset(&e->assist);
             int accepted = assist_enabled ? ced_assist_keys(ui, &e->assist) : -1;
             if (accepted >= 0) apply_completion(ui, e, accepted);
@@ -870,6 +974,7 @@ static void set_terminal_position(Editor *e, bool right) {
     if (e->terminal_right == right) return;
     e->terminal_right = right;
     if (!ced_terminal_right_save(right)) notify(e, "Could not save editor settings.");
+    else e->preferences_reload=true;
 }
 
 static void terminal_panel(cui_ctx *ui, Editor *e) {
@@ -910,6 +1015,26 @@ static void document_area(cui_ctx *ui, Editor *e) {
 }
 
 static void dialogs(cui_ctx *ui, Editor *e) {
+    GitDiscard *discard = &e->git_discard;
+    cui_dialog(ui, "Discard Changes?", &discard->open, .width = 520) {
+        cui_text(ui, discard->path, .size = 13, .width = CUI_FILL);
+        cui_text(ui, "Discard unstaged changes to this file? New untracked files will be deleted. Staged changes will be kept.", .size = 13);
+        char path[CED_PATH];
+        if (ced_join(path,sizeof path,discard->root,discard->path)) {
+            for (int n = 0; n < e->count; n++)
+                if (!strcmp(e->docs[n].file.path,path) && ced_document_dirty(&e->docs[n].file)) {
+                    cui_text(ui, "Unsaved edits in the open editor will also be discarded.", .size = 13);
+                    break;
+                }
+        }
+        if (*discard->error) cui_text(ui, discard->error, .size = 13);
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "Cancel", .variant = CUI_BUTTON_DEFAULT)) discard->open = false;
+            if (cui_button(ui, "Discard Changes", .variant = CUI_BUTTON_DANGER, .disabled = e->git_sync.running)) {
+                discard->open = false; discard->execute = true;
+            }
+        }
+    }
     cui_dialog(ui, "Save Changes?", &e->close_dialog, .description = "Unsaved changes will be lost.", .width = 480) {
         cui_dialog_footer(ui) {
             if (cui_button(ui, "Cancel", .variant = CUI_BUTTON_DEFAULT)) e->close_dialog = false;
@@ -1031,11 +1156,19 @@ static const struct { const char *id, *title, *category, *shortcut; } builtin_co
     {"ced.extensions.install", "Install Extension from Folder", "Extensions", ""},
     {"ced.extensions.manage", "Manage Extensions", "Extensions", ""},
 #endif
+    {"ced.preferences.open", "Open Preferences (JSON)", "Preferences", "Cmd/Ctrl ,"},
+    {"ced.preferences.reload", "Reload Preferences", "Preferences", ""},
 };
 
 static bool builtin_execute(void *user, const char *id, const CedCommandContext *context, char *error) {
     (void)context;
     Editor *e = user; cui_ctx *ui = cui_app_ui(e->app);
+    if (!strcmp(id,"ced.preferences.open")) {
+        char path[CED_PATH];
+        if (!ced_preferences_ensure(path,error)) return false;
+        return open_document(e,path,0,0);
+    }
+    if (!strcmp(id,"ced.preferences.reload")) { e->preferences_reload=true; return true; }
     size_t action = 0;
     while (action < sizeof builtin_commands / sizeof *builtin_commands && strcmp(builtin_commands[action].id, id)) action++;
     switch (action) {
@@ -1104,6 +1237,8 @@ static void frame(cui_ctx *ui, Editor *e) {
     /* Tree paths and document buffers from the previous frame are no longer
      * needed by the renderer here, so filesystem actions can refresh them. */
     perform_file_action(e);
+    perform_git_discard(e);
+    poll_preferences(ui,e);
     for (int n = 0; n < e->count; n++) {
         cui_push_id_int(ui, e->docs[n].id); ced_editor_touch(ui, "source"); cui_pop_id(ui);
     }
@@ -1117,7 +1252,7 @@ static void frame(cui_ctx *ui, Editor *e) {
         free(e->before); free(e->after);
         e->before = e->after = NULL;
     }
-    if (e->selected < 0 || e->diff || e->close_dialog || e->commit_dialog || e->file_action.open || e->palette) ced_assist_reset(&e->assist);
+    if (e->selected < 0 || e->diff || e->close_dialog || e->commit_dialog || e->git_discard.open || e->file_action.open || e->palette) ced_assist_reset(&e->assist);
     lsp_tick(e);
     if (ced_lsp_running(e->lsp)) cui_request_wakeup(ui, 0.05f);
     if (e->terminal) {
@@ -1126,13 +1261,15 @@ static void frame(cui_ctx *ui, Editor *e) {
     }
     if (e->search.running && ced_search_done(&e->search)) ced_search_finish(&e->search);
     if (e->search.running) cui_request_wakeup(ui, 0.05f);
-    if (!e->close_dialog && !e->commit_dialog && !e->file_action.open && !e->palette && !extension_modal(e)) {
+    if (!e->close_dialog && !e->commit_dialog && !e->git_discard.open && !e->file_action.open && !e->palette && !extension_modal(e)) {
         int previous_font_size = e->font_size;
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_MINUS) && e->font_size > CED_FONT_SIZE_MIN) e->font_size--;
         if ((cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_EQUAL) ||
              cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_EQUAL)) && e->font_size < CED_FONT_SIZE_MAX) e->font_size++;
         if (e->font_size != previous_font_size && !ced_font_size_save(e->font_size))
             notify(e, "Could not save editor settings.");
+        else if (e->font_size != previous_font_size) e->preferences_reload=true;
+        if (cui_shortcut(ui,CUI_MOD_PRIMARY,CUI_KEY_COMMA)) dispatch(e,"ced.preferences.open");
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_N)) dispatch(e, "ced.file.new");
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_O)) dispatch(e, "ced.file.open");
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_O)) dispatch(e, "ced.workspace.open");
@@ -1233,6 +1370,7 @@ static void editor_free(Editor *e) {
         if (e->logo) cui_image_destroy(cui_app_ui(e->app), e->logo);
         cui_app_destroy(e->app);
     }
+    ced_editor_font_free(&e->editor_font);
 }
 
 int main(int argc, char **argv) {
@@ -1247,8 +1385,8 @@ int main(int argc, char **argv) {
     e.selected = -1;
     e.sidebar = true;
     e.split = 0.27f;
-    e.font_size = ced_font_size_load();
-    e.terminal_right = ced_terminal_right_load();
+    ced_preferences_defaults(&e.preferences);
+    e.font_size=e.preferences.font_size;
     e.goto_offset = -1; e.problems_open = true;
     e.terminal_bottom_split = 0.65f; e.terminal_right_split = 0.6f;
     pthread_mutex_init(&e.search.mutex, NULL);
@@ -1269,6 +1407,8 @@ int main(int argc, char **argv) {
         .app_id = "dev.ced.Editor"});
     if (!e.app) { fprintf(stderr, "Could not create window.\n"); editor_free(&e); return 1; }
     e.logo = ced_editor_logo_create(cui_app_ui(e.app));
+    e.preferences_reload=true;
+    poll_preferences(cui_app_ui(e.app),&e);
     register_commands(&e);
 #ifdef CED_ENABLE_EXTENSIONS
     const char *home = getenv("HOME"); char profile[CED_PATH];

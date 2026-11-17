@@ -10,7 +10,7 @@ A desktop text editor written in C99 with [CUI](https://github.com/yappologistic
 
 - **Files:** expandable file tree, file opening, project refresh, and context menus for creating, renaming, and deleting files and folders.
 - **Search:** literal search in the background; click a result to open its line and column.
-- **Git:** current branch, staged and local changes, side-by-side diffs, staging/unstaging individual files or all changes, commits with confirmation, push, and pull.
+- **Git:** current branch, staged and local changes, side-by-side diffs, staging/unstaging individual files or all changes, confirmed discard of unstaged changes, commits with confirmation, push, and pull.
 - **Editor:** multiple reorderable tabs, unsaved-change indicators, syntax highlighting, line numbers, indentation, undo/redo, copy/paste, in-file search, and go-to-line navigation.
 - **Markdown:** rendered previews of the current buffer, including unsaved changes.
 - **LSP:** clangd integration for C/C++, with diagnostics, completion, symbol information, and go-to-definition.
@@ -114,6 +114,7 @@ Ensure the chosen prefix's `bin` directory is on your `PATH`. On Linux, a per-us
 | Mod Shift F | Project search |
 | Mod Shift G | Git view |
 | Mod Shift P | Command palette |
+| Mod , | Open preferences JSON |
 | Mod F | Find in the editor |
 | Mod G | Go to line |
 | Mod Z / Mod Shift Z | Undo / redo |
@@ -125,7 +126,28 @@ Ensure the chosen prefix's `bin` directory is on your `PATH`. On Linux, a per-us
 | Mod Shift K | Symbol information |
 | Tab / Shift Tab | Indent / unindent |
 
-Text size is saved automatically to `~/.ced/settings.conf` whenever you change the zoom and restored when CED starts, across all projects. Without a valid setting, the default is 14 px.
+Text size is saved automatically to `~/.ced/settings.json` whenever you change the zoom and restored when CED starts, across all projects. Without a valid setting, the default is 14 px.
+
+## Preferences
+
+Press **Mod ,** or run **Open Preferences (JSON)** from the command palette to edit `~/.ced/settings.json`. The file is created with these defaults, importing any saved zoom and terminal position from the older `settings.conf`:
+
+```json
+{
+  "editor.fontSize": 14,
+  "editor.fontFamily": "Geist Mono",
+  "editor.fontPath": "",
+  "terminal.position": "bottom"
+}
+```
+
+Save to apply changes. CED also checks external changes once per second; **Reload Preferences** forces a reload. Preferences apply across projects. Invalid JSON or invalid setting values keep the last valid configuration in use and display an error. Automatic zoom and terminal-position updates preserve unknown JSON fields and never overwrite an invalid preferences file. The legacy file is left untouched.
+
+`editor.fontSize` accepts integers from 8 to 32. `terminal.position` accepts `"bottom"` or `"right"`. JSON must be an object without comments or duplicate keys, up to 64 KiB.
+
+Set `editor.fontFamily` to an installed monospaced font, such as `"Menlo"` on macOS. Alternatively, set `editor.fontPath` to an absolute path or a path beginning with `~/` to a TTF, OTF, or TTC file; this takes precedence over the family name. Linux family lookup requires `fc-match` from fontconfig; a file path works without it. The built-in Geist Mono remains available without a system installation.
+
+The selected font applies to the code editor and other monospaced surfaces, including diffs and the terminal. Missing, unsupported, or proportional fonts keep the previous font in use. To restore the default, clear `editor.fontPath` and set `editor.fontFamily` to `"Geist Mono"`. Font files are limited to 32 MiB; collections use their first face. Up to eight distinct font files can be loaded per session; restart CED to load more.
 
 ## File tree actions
 
@@ -141,6 +163,8 @@ Existing destination names are never overwritten. The tree, search results, and 
 ## Git actions
 
 The Git view provides **Stage All**, **Unstage All**, **Push**, and **Pull**. Bulk staging includes additions, modifications, and deletions across the repository and respects `.gitignore`. Unstaging clears the index while preserving working files, including before the first commit.
+
+Each unstaged file has a **Discard Changes** icon. Confirmation restores tracked files from the index, preserving staged changes, or deletes the selected untracked file. Open buffers are reloaded or closed as appropriate; the confirmation warns when unsaved editor changes will also be lost. Conflicted files, directories and submodules are not discarded by this action.
 
 Push and pull use Git's configured remote, upstream branch, and credential helpers. Pull uses `--ff-only`: divergent history produces an error instead of an automatic merge or rebase. Push uses normal Git behavior without requesting a force push. Remote operations run in the background; Git controls and project switching wait until they finish. Completion refreshes Git status, and a successful pull also refreshes the file tree. Open editor buffers keep their contents. Configure remotes and authentication through Git first; errors appear in the status bar.
 
@@ -176,7 +200,7 @@ Click **Terminal** in the top bar or press Mod J. The panel offers **Bottom** an
 
 The terminal starts the shell specified by `SHELL` (or `/bin/sh`) in the project folder. The session preserves `cd`, variables, and processes between commands. It supports ANSI colors, the alternate screen, function keys, and Ctrl+C to interrupt the foreground process. Drag to select and use Mod C to copy; Mod V pastes. On Linux, Ctrl Shift C/V also copies/pastes. The mouse wheel and Shift PageUp/PageDown navigate up to 2,000 lines of scrollback.
 
-Terminal position is saved to `~/.ced/settings.conf` whenever you change it through the panel or command palette, and restored on startup across projects. The default is **Bottom** when no valid preference exists. Changing the position preserves your saved editor zoom.
+Terminal position is saved to `~/.ced/settings.json` whenever you change it through the panel or command palette, and restored on startup across projects. The default is **Bottom** when no valid preference exists. Changing the position preserves your saved editor zoom and font preferences.
 
 Hiding the panel keeps the session running. **Restart Terminal** ends the session and starts another; switching projects or closing CED ends the shell and foreground process. Multiple sessions, mouse-event forwarding to terminal programs, and scrollback reflow on resize are not implemented yet; font attributes such as bold/italic do not change glyph rendering.
 
@@ -193,7 +217,7 @@ When the operating system closes the window, unsaved drafts are preserved in `~/
 - The tree and search skip symbolic links and the `.git`, `node_modules`, `build`, `dist`, `target`, `.venv`, `venv`, and `__pycache__` directories. Other `.gitignore` rules are not interpreted by the explorer/search; the Git panel uses Git's own rules.
 - Use the refresh button to update files/Git. Automatic filesystem monitoring is not implemented yet.
 - A diff is a snapshot of the versions at the time of the click; click the item again after refreshing to reload it.
-- Git operations may wait for hooks, signing, credential helpers, or user configuration. The editor does not discard working-tree changes.
+- Git operations may wait for hooks, signing, credential helpers, or user configuration. Working-tree changes are discarded only through the explicit **Discard Changes** confirmation.
 - Windows is not implemented yet.
 
 ## Extensions (experimental)
