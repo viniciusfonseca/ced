@@ -6,12 +6,13 @@
 #define EDITOR_SALT 0xED17C0DEu
 typedef struct { cui_edit_state edit; double sy; float sx; int preferred_column; } EditorStatePrefix;
 
-bool ced_tree_begin(cui_ctx *ui, const char *label, bool *open, const cui_tree_opts *options) {
+bool ced_tree_begin(cui_ctx *ui, const char *label, bool *open, const cui_tree_opts *options, bool ignored) {
     int row = ui->node_count;
     bool expanded = cui_tree_begin(ui, label, open, options);
     /* The pinned CUI creates the row first and fixes its height at 30 px.
      * Adjust its layout so drawing and hit testing both use the compact height. */
     ui->nodes[row].h = CUI_PX(24);
+    ui->nodes[row].opacity = ignored ? 0.5f : 1.0f;
     return expanded;
 }
 

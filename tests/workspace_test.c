@@ -99,6 +99,41 @@ static void test_documents(void) {
     puts("OK: open/save, CRLF, conflict detection, binary/size limits, permissions");
 }
 
+static void assert_ignored(CedWorkspace *ws, const char *path, bool ignored) {
+    for (int i = 0; i < ws->count; i++) if (!strcmp(ws->entries[i].path, path)) {
+        assert(ws->entries[i].ignored == ignored); return;
+    }
+    fprintf(stderr, "Missing tree entry: %s\n", path); assert(false);
+}
+
+static void test_workspace_ignored(void) {
+    char repo[CED_PATH], folder[CED_PATH]; path_for(repo, "ignore-tree"); assert(!mkdir(repo, 0700));
+    const char *init[] = {"git", "-C", repo, "init", "-q", NULL}; command(init);
+    write_text("ignore-tree/.gitignore", "*.tmp\n!keep.tmp\ncache/\n");
+    write_text("ignore-tree/hidden.tmp", "ignored"); write_text("ignore-tree/keep.tmp", "visible");
+    write_text("ignore-tree/tracked.tmp", "tracked"); write_text("ignore-tree/odd\nname.tmp", "ignored");
+    const char *add[] = {"git", "-C", repo, "add", "-f", "--", "tracked.tmp", NULL}; command(add);
+    path_for(folder, "ignore-tree/cache"); assert(!mkdir(folder, 0700));
+    write_text("ignore-tree/cache/file.c", "ignored");
+    path_for(folder, "ignore-tree/nested"); assert(!mkdir(folder, 0700));
+    write_text("ignore-tree/nested/.gitignore", "*.log\n!keep.log\n");
+    write_text("ignore-tree/nested/hidden.log", "ignored"); write_text("ignore-tree/nested/keep.log", "visible");
+    write_text("ignore-tree/.git/info/exclude", "local.txt\n"); write_text("ignore-tree/local.txt", "ignored");
+    CedWorkspace ws = {0}; assert(ced_workspace_open(&ws, repo, error));
+    assert_ignored(&ws, "hidden.tmp", true); assert_ignored(&ws, "odd\nname.tmp", true);
+    assert_ignored(&ws, "keep.tmp", false); assert_ignored(&ws, "tracked.tmp", false);
+    assert_ignored(&ws, "cache", true); assert_ignored(&ws, "cache/file.c", true);
+    assert_ignored(&ws, "nested", false); assert_ignored(&ws, "nested/hidden.log", true);
+    assert_ignored(&ws, "nested/keep.log", false); assert_ignored(&ws, "local.txt", true);
+    assert(ced_workspace_open(&ws, folder, error));
+    assert_ignored(&ws, "hidden.log", true); assert_ignored(&ws, "keep.log", false);
+    write_text("ignore-tree/nested/.gitignore", "");
+    assert(ced_workspace_open(&ws, folder, error)); assert_ignored(&ws, "hidden.log", false);
+    ced_workspace_free(&ws);
+    assert(ced_file_delete(root, repo, error));
+    puts("OK: tree ignore flags follow Git rules, negation, tracked files, nested workspaces, excluded directories, unusual names and refresh");
+}
+
 static void test_workspace_search(void) {
     char path[CED_PATH]; path_for(path, "nested"); assert(!mkdir(path, 0700));
     write_text("nested/find.txt", "first\nneedle here\nneedle needle\n");
@@ -451,6 +486,7 @@ int main(void) {
     test_preferences();
     test_file_operations();
     test_documents();
+    test_workspace_ignored();
     test_workspace_search();
     test_git();
     test_git_discard();

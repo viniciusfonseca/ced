@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <pthread.h>
 #include <stdint.h>
+#include "windows_compat.h"
 
 #define CED_PATH 4096
 #define CED_TEXT_CAP (2 * 1024 * 1024 + 1)
@@ -16,7 +17,7 @@
 typedef struct {
     char *path;                    /* Relative to the workspace; sorted depth first. */
     int parent;
-    bool directory, expanded;
+    bool directory, expanded, ignored;
 } CedEntry;
 
 typedef struct {

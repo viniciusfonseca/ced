@@ -1,0 +1,15 @@
+# syntax=docker/dockerfile:1
+FROM --platform=$BUILDPLATFORM ubuntu:24.04 AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl xz-utils cmake ninja-build perl file \
+    && rm -rf /var/lib/apt/lists/*
+COPY docker/install-llvm-mingw.sh /tmp/install-llvm-mingw.sh
+RUN sh /tmp/install-llvm-mingw.sh
+ENV PATH="/opt/llvm-mingw/bin:${PATH}"
+WORKDIR /src
+COPY . .
+ARG BUILD_JOBS=4
+RUN BUILD_JOBS="$BUILD_JOBS" sh docker/build-windows.sh i686
+
+FROM scratch AS artifacts
+COPY --from=build /out/ /

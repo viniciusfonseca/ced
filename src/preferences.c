@@ -119,7 +119,12 @@ static cJSON *parse(const char *text, size_t length, CedPreferences *settings, c
     if (position) next.terminal_right=!strcmp(position->valuestring,"right");
     if (!text_field(root,"editor.fontFamily",next.font_family,sizeof next.font_family,error) ||
         !text_field(root,"editor.fontPath",next.font_path,sizeof next.font_path,error)) goto failed;
-    if (*next.font_path && *next.font_path!='/' && strncmp(next.font_path,"~/",2)) {
+    bool absolute_font = *next.font_path=='/';
+#ifdef _WIN32
+    absolute_font |= strlen(next.font_path)>2 && isalpha((unsigned char)next.font_path[0]) && next.font_path[1]==':' &&
+        (next.font_path[2]=='/' || next.font_path[2]=='\\');
+#endif
+    if (*next.font_path && !absolute_font && strncmp(next.font_path,"~/",2)) {
         failure(error,"editor.fontPath must be absolute or start with ~/."); goto failed;
     }
     *settings=next; return root;

@@ -1,0 +1,66 @@
+name: Windows VM Validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["codex/windows-vm-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows VM (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            arch: x86_64
+            checksum: 4d002e330a0f703625aa5ccbc37e96f8f824413e163bfc7336774aabd2c3a412
+          - runner: windows-11-arm
+            arch: aarch64
+            checksum: c7f56de1d7aca15196c19083a799205390397b8b87a825aec3485e1e4f3c2cdd
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install pinned LLVM-MinGW
+        run: |
+          $archive = 'llvm-mingw-20261117-ucrt-${{ matrix.arch }}.zip'
+          $zip = Join-Path $env:RUNNER_TEMP $archive
+          Invoke-WebRequest "https://github.com/mstorsjo/llvm-mingw/releases/download/20261117/$archive" -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne '${{ matrix.checksum }}') { throw 'Toolchain checksum mismatch' }
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          $toolchain = Join-Path $env:RUNNER_TEMP 'llvm-mingw-20261117-ucrt-${{ matrix.arch }}'
+          "CED_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
+          "$toolchain/bin" >> $env:GITHUB_PATH
+      - name: Build native Windows application and tests
+        id: build
+        run: |
+          $compiler = Join-Path $env:CED_TOOLCHAIN 'bin/${{ matrix.arch }}-w64-mingw32-clang.exe'
+          cmake -S . -B build-windows -G Ninja "-DCMAKE_C_COMPILER=$compiler" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCED_ENABLE_EXTENSIONS=OFF -DCMAKE_EXE_LINKER_FLAGS=-static
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build-windows --parallel 4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Test Win32 files, processes and ConPTY
+        run: ctest --test-dir build-windows --output-on-failure --no-tests=error
+      - name: Launch CED and capture its window
+        if: always() && steps.build.outcome == 'success'
+        run: ./packaging/windows-vm-smoke.ps1 -Executable ./build-windows/ced.exe -OutputDirectory ./windows-evidence
+      - name: Upload Windows evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-vm-${{ matrix.arch }}
+          path: |
+            windows-evidence/
+            build-windows/Testing/Temporary/LastTest.log
+          if-no-files-found: warn
+          retention-days: 7

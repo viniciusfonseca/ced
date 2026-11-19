@@ -17,11 +17,13 @@ A desktop text editor written in C99 with [CUI](https://github.com/yappologistic
 - **Terminal:** an interactive PTY shell in a resizable panel to the right of or below the editor.
 - **Extensions (experimental):** reviewed local packages, workspace trust, lazy command activation in separate processes, and version-checked buffer edits with undo/redo.
 - Resizable sidebar, light/dark themes, and a command palette.
-- Status bar memory usage: the CED process's physical footprint on macOS (the metric used by Activity Monitor's Memory column), or resident memory (RSS) on Linux, in MB (1 MB = 1,000,000 bytes). Refreshed every second; small differences can occur between tools due to sampling times. Shell and language-server child processes are excluded.
+- Status bar memory usage: the CED process's physical footprint on macOS (the metric used by Activity Monitor's Memory column), resident memory (RSS) on Linux, or working set on Windows, in MB (1 MB = 1,000,000 bytes). Refreshed every second; small differences can occur between tools due to sampling times. Shell and language-server child processes are excluded.
 
 ## Build and run
 
-Requirements: GNU Make, CMake 3.20+, a C compiler, Git, and Perl 5 on your PATH. Perl generates libvterm's encoding headers during the build. The current implementation uses POSIX APIs and supports **macOS and Linux**. On Linux, install the X11 development headers (`libx11-dev` on Debian/Ubuntu); file dialogs require `zenity` or `kdialog`.
+Requirements: GNU Make, CMake 3.20+, a C compiler, Git, and Perl 5 on your PATH. Perl generates libvterm's encoding headers during the build. The primary supported platforms are **macOS and Linux**. On Linux, install the X11 development headers (`libx11-dev` on Debian/Ubuntu); file dialogs require `zenity` or `kdialog`.
+
+Experimental **native Windows** executables for x86, x64 and ARM64 can be cross-compiled through Docker. See [Docker build instructions](docker/README.md) and [Windows requirements and limitations](docker/WINDOWS.md). These builds use the Win32 backend and disable the experimental POSIX extension host.
 
 Clone this repository with `git clone --recurse-submodules`, or initialize the submodules in an existing checkout before configuring:
 
