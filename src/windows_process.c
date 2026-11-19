@@ -68,6 +68,10 @@ bool ced_windows_spawn(CedWindowsProcess *p, const char *const args[], const cha
     ok = ok && attributes;
     HANDLE inherited[3] = {child_input, child_output, NULL};
     if (ok && terminal) {
+        /* NULL standard handles let ConPTY supply its own console handles.
+         * Without this flag, redirected parent handles can be duplicated into
+         * the child even when CreateProcess disables handle inheritance. */
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
         ok = UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
                                        p->console, sizeof p->console, NULL, NULL);
     } else if (ok) {

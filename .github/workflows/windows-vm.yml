@@ -42,6 +42,7 @@ jobs:
           "CED_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
           "$toolchain/bin" >> $env:GITHUB_PATH
       - name: Build native Windows application and tests
+        id: build
         run: |
           $compiler = Join-Path $env:CED_TOOLCHAIN 'bin/${{ matrix.arch }}-w64-mingw32-clang.exe'
           cmake -S . -B build-windows -G Ninja "-DCMAKE_C_COMPILER=$compiler" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCED_ENABLE_EXTENSIONS=OFF -DCMAKE_EXE_LINKER_FLAGS=-static
@@ -51,6 +52,7 @@ jobs:
       - name: Test Win32 files, processes and ConPTY
         run: ctest --test-dir build-windows --output-on-failure --no-tests=error
       - name: Launch CED and capture its window
+        if: always() && steps.build.outcome == 'success'
         run: ./packaging/windows-vm-smoke.ps1 -Executable ./build-windows/ced.exe -OutputDirectory ./windows-evidence
       - name: Upload Windows evidence
         if: always()
