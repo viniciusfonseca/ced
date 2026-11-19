@@ -6,17 +6,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <sys/ioctl.h>
 #include <sys/wait.h>
+#endif
 #include <time.h>
 #include <unistd.h>
-#ifdef __APPLE__
+#if defined(_WIN32)
+#elif defined(__APPLE__)
 #include <util.h>
 #else
 #include <pty.h>
 #endif
 
+#ifndef _WIN32
 extern char **environ;
+#endif
 
 static void output(const char *bytes, size_t length, void *user) {
     ced_terminal_send(user, bytes, length);
@@ -59,7 +64,12 @@ static int pop_line(int columns, VTermScreenCell *cells, void *user) {
 }
 
 CedTerminal *ced_terminal_start(const char *root, const char *shell, char *error, size_t cap) {
+#ifdef _WIN32
+    if (!shell || !*shell) shell=getenv("COMSPEC");
+    if (!shell || !*shell) shell="cmd.exe";
+#else
     if (!shell || !*shell) shell = "/bin/sh";
+#endif
     CedTerminal *t = calloc(1, sizeof *t);
     if (!t) { snprintf(error, cap, "Out of memory."); return NULL; }
     t->fd = -1; t->rows = 24; t->columns = 80; t->cursor_visible = true;
@@ -75,6 +85,14 @@ CedTerminal *ced_terminal_start(const char *root, const char *shell, char *error
     vterm_color_rgb(&fg, 220, 223, 228); vterm_color_rgb(&bg, 23, 24, 27);
     vterm_state_set_default_colors(vterm_obtain_state(t->vt), &fg, &bg);
     vterm_screen_reset(t->screen, 1);
+#ifdef _WIN32
+    const char *args[]={shell,NULL};
+    if (!ced_windows_spawn(&t->process,args,root,true,false,NULL)) {
+        snprintf(error,cap,"Could not start the Windows pseudoconsole (Windows 10 1809+ required).");
+        ced_terminal_stop(t); return NULL;
+    }
+    t->alive=true;
+#else
     size_t count = 0;
     while (environ[count]) count++;
     char **env = calloc(count + 3, sizeof *env);
@@ -101,6 +119,7 @@ CedTerminal *ced_terminal_start(const char *root, const char *shell, char *error
     t->alive = true;
     fcntl(t->fd, F_SETFD, FD_CLOEXEC);
     fcntl(t->fd, F_SETFL, O_NONBLOCK);
+#endif
     return t;
 }
 
@@ -115,22 +134,38 @@ bool ced_terminal_send(CedTerminal *t, const char *data, size_t length) {
 bool ced_terminal_poll(CedTerminal *t) {
     if (!t) return false;
     bool changed = false;
-    if (t->pending_length && t->fd >= 0) {
+    bool writable=t->fd>=0;
+#ifdef _WIN32
+    writable=t->alive;
+#endif
+    if (t->pending_length && writable) {
+#ifdef _WIN32
+        ssize_t n=ced_windows_write(&t->process,t->pending,t->pending_length);
+#else
         ssize_t n = write(t->fd, t->pending, t->pending_length);
+#endif
         if (n > 0) {
             memmove(t->pending, t->pending + n, t->pending_length - (size_t)n);
             t->pending_length -= (size_t)n;
         }
     }
     char bytes[8192];
-    for (int i = 0; t->fd >= 0 && i < 8; i++) {
+    for (int i = 0; i < 8; i++) {
+#ifdef _WIN32
+        ssize_t n=ced_windows_read(&t->process,bytes,sizeof bytes);
+#else
+        if (t->fd<0) break;
         ssize_t n = read(t->fd, bytes, sizeof bytes);
+#endif
         if (n <= 0) break;
         vterm_input_write(t->vt, bytes, (size_t)n);
         changed = true;
     }
     vterm_screen_flush_damage(t->screen);
     if (t->alive) {
+#ifdef _WIN32
+        if (ced_windows_exited(&t->process,&t->exit_status)) { t->alive=false; changed=true; }
+#else
         int status;
         pid_t result = waitpid(t->pid, &status, WNOHANG);
         if (result == t->pid || (result < 0 && errno == ECHILD)) {
@@ -138,6 +173,7 @@ bool ced_terminal_poll(CedTerminal *t) {
             t->exit_status = result > 0 && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
             changed = true;
         }
+#endif
     }
     return changed;
 }
@@ -149,8 +185,12 @@ void ced_terminal_resize(CedTerminal *t, int rows, int columns) {
     if (rows == t->rows && columns == t->columns) return;
     t->rows = rows; t->columns = columns;
     vterm_set_size(t->vt, rows, columns);
+#ifdef _WIN32
+    if (t->process.console) ResizePseudoConsole(t->process.console,(COORD){(SHORT)columns,(SHORT)rows});
+#else
     struct winsize size = {.ws_row = (unsigned short)rows, .ws_col = (unsigned short)columns};
     if (t->fd >= 0) ioctl(t->fd, TIOCSWINSZ, &size);
+#endif
 }
 
 void ced_terminal_key(CedTerminal *t, VTermKey key, VTermModifier mods) {
@@ -180,6 +220,9 @@ bool ced_terminal_cell(CedTerminal *t, int row, int column, VTermScreenCell *cel
 
 void ced_terminal_stop(CedTerminal *t) {
     if (!t) return;
+#ifdef _WIN32
+    ced_windows_process_close(&t->process);
+#else
     if (t->alive) {
         pid_t foreground = tcgetpgrp(t->fd);
         if (foreground > 0 && foreground != getpgrp()) kill(-foreground, SIGHUP);
@@ -194,6 +237,7 @@ void ced_terminal_stop(CedTerminal *t) {
         }
         if (t->alive) { kill(-t->pid, SIGKILL); while (waitpid(t->pid, &status, 0) < 0 && errno == EINTR) {} }
     }
+#endif
     for (int i = 0; i < t->history_count; i++) free(t->history[(t->history_first + i) % CED_TERM_HISTORY].cells);
     if (t->vt) vterm_free(t->vt);
     free(t);

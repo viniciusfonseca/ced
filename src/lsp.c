@@ -5,19 +5,25 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#ifdef _WIN32
+#include "windows_process.h"
+#else
 #include <spawn.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #define MESSAGE_CAP (16 * 1024 * 1024)
 #define DOCUMENT_CAP 32
 
+#ifndef _WIN32
 extern char **environ;
+#endif
 typedef struct {
     char path[CED_PATH];
     char *text;
@@ -25,6 +31,9 @@ typedef struct {
     CedDiagnostic diagnostics[CED_LSP_DIAGNOSTICS];
 } Document;
 struct CedLsp {
+#ifdef _WIN32
+    CedWindowsProcess process;
+#endif
     int fd;
     pid_t pid;
     bool ready, running, shutting_down;
@@ -96,13 +105,21 @@ int ced_lsp_offset(const char *text, CedLspPosition pos) {
 
 char *ced_lsp_uri(const char *path) {
     size_t length = strlen(path);
-    char *uri = malloc(length * 3 + 8);
+    char *uri = malloc(length * 3 + 9);
     if (!uri) return NULL;
     char *out = uri;
     memcpy(out, "file://", 7); out += 7;
+#ifdef _WIN32
+    if (length>1 && path[1]==':') *out++='/';
+#endif
     static const char hex[] = "0123456789ABCDEF";
+#ifdef _WIN32
+    const char *safe="/:-._~";
+#else
+    const char *safe="/-._~";
+#endif
     for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
-        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || strchr("/-._~", *p)) *out++ = (char)*p;
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || strchr(safe, *p)) *out++ = (char)*p;
         else { *out++ = '%'; *out++ = hex[*p >> 4]; *out++ = hex[*p & 15]; }
     }
     *out = 0;
@@ -119,7 +136,11 @@ static int hex(char c) {
 bool ced_lsp_path(const char *uri, char *out, size_t cap) {
     if (strncmp(uri, "file:///", 8)) return false;
     size_t n = 0;
-    for (const char *p = uri + 7; *p; p++) {
+    const char *start = uri + 7;
+#ifdef _WIN32
+    if (start[0]=='/' && start[1] && start[2]==':') start++;
+#endif
+    for (const char *p = start; *p; p++) {
         unsigned char c = (unsigned char)*p;
         if (c == '%') {
             if (!p[1] || !p[2] || hex(p[1]) < 0 || hex(p[2]) < 0) return false;
@@ -335,18 +356,28 @@ void ced_lsp_poll(CedLsp *lsp) {
         lsp->result.ready = true;
     }
     if (lsp->output_length) {
+#ifndef _WIN32
 #ifdef MSG_NOSIGNAL
         int flags = MSG_NOSIGNAL;
 #else
         int flags = 0;
 #endif
+#endif
+#ifdef _WIN32
+        ssize_t n = ced_windows_write(&lsp->process,lsp->output,lsp->output_length);
+#else
         ssize_t n = send(lsp->fd, lsp->output, lsp->output_length, flags);
+#endif
         if (n > 0) { memmove(lsp->output, lsp->output + n, lsp->output_length - (size_t)n); lsp->output_length -= (size_t)n; }
         else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { stopped(lsp, "clangd: disconnected"); return; }
     }
     if (!lsp->output_length) { free(lsp->output); lsp->output = NULL; }
     char bytes[65536];
+#ifdef _WIN32
+    ssize_t n = ced_windows_read(&lsp->process,bytes,sizeof bytes);
+#else
     ssize_t n = recv(lsp->fd, bytes, sizeof bytes, 0);
+#endif
     if (n > 0) {
         if ((size_t)n > MESSAGE_CAP - lsp->input_length) { stopped(lsp, "clangd: message too large"); return; }
         size_t needed = lsp->input_length + (size_t)n + 1;
@@ -386,6 +417,14 @@ CedLsp *ced_lsp_start(const char *root, const char *executable, char *error, siz
     CedLsp *lsp = calloc(1, sizeof *lsp);
     if (!lsp) { snprintf(error, cap, "Out of memory."); return NULL; }
     lsp->fd = -1; lsp->next_id = 1;
+#ifdef _WIN32
+    if (!executable || !*executable) executable="clangd";
+    const char *args[]={executable,"--background-index","--log=error","--header-insertion=never",NULL};
+    if (!ced_windows_spawn(&lsp->process,args,root,false,false,NULL)) {
+        free(lsp); snprintf(error,cap,"Could not start clangd. Install clangd and add it to PATH."); return NULL;
+    }
+    lsp->running=true; lsp->initialize_started=now();
+#else
     int sockets[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets)) { free(lsp); snprintf(error, cap, "Could not create LSP connection."); return NULL; }
     fcntl(sockets[0], F_SETFD, FD_CLOEXEC); fcntl(sockets[1], F_SETFD, FD_CLOEXEC);
@@ -406,6 +445,7 @@ CedLsp *ced_lsp_start(const char *root, const char *executable, char *error, siz
     if (result) { close(sockets[0]); free(lsp); snprintf(error, cap, "clangd unavailable: %s", strerror(result)); return NULL; }
     lsp->fd = sockets[0]; lsp->running = true; lsp->initialize_started = now();
     fcntl(lsp->fd, F_SETFL, O_NONBLOCK);
+#endif
     snprintf(lsp->status, sizeof lsp->status, "clangd: starting");
     cJSON *params = cJSON_CreateObject();
     cJSON_AddNumberToObject(params, "processId", getpid());
@@ -502,6 +542,9 @@ void ced_lsp_stop(CedLsp *lsp) {
             struct timespec pause = {.tv_nsec = 10000000}; nanosleep(&pause, NULL);
         }
     }
+#ifdef _WIN32
+    ced_windows_process_close(&lsp->process);
+#else
     if (lsp->fd >= 0) close(lsp->fd);
     int status;
     if (lsp->pid > 0 && waitpid(lsp->pid, &status, WNOHANG) == 0) {
@@ -513,6 +556,7 @@ void ced_lsp_stop(CedLsp *lsp) {
         }
         if (!exited) { kill(lsp->pid, SIGKILL); while (waitpid(lsp->pid, &status, 0) < 0 && errno == EINTR) {} }
     }
+#endif
     for (int i = 0; i < lsp->document_count; i++) {
         free(lsp->documents[i]->text);
         free(lsp->documents[i]);

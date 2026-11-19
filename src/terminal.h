@@ -5,10 +5,16 @@
 #include <stddef.h>
 #include <sys/types.h>
 #include <vterm.h>
+#ifdef _WIN32
+#include "windows_process.h"
+#endif
 
 #define CED_TERM_HISTORY 2000
 typedef struct { int columns; VTermScreenCell *cells; } CedTermLine;
 typedef struct {
+#ifdef _WIN32
+    CedWindowsProcess process;
+#endif
     int fd, rows, columns, scroll;
     pid_t pid;
     bool alive, cursor_visible;

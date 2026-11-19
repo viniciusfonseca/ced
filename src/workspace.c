@@ -1,19 +1,28 @@
 #include "workspace.h"
 
+#ifdef _WIN32
+#include "windows_directory.h"
+#include "windows_process.h"
+#else
 #include <dirent.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#endif
 #include <errno.h>
 #include <fcntl.h>
-#include <spawn.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
+#ifndef _WIN32
 extern char **environ;
+#endif
+
+static int command_run(const char *const argv[], char **output, size_t *length, int input_fd);
 
 static bool fail(char *error, const char *format, ...) {
     va_list args;
@@ -128,6 +137,44 @@ static bool scan(CedWorkspace *ws, const char *relative, int parent, int depth, 
     return ok;
 }
 
+static int compare_entry_paths(const void *left, const void *right) {
+    const CedEntry *const *a = left, *const *b = right;
+    return strcmp((*a)->path, (*b)->path);
+}
+
+static void mark_ignored(CedWorkspace *ws) {
+    if (!ws->count) return;
+    FILE *input = tmpfile();
+    if (!input) return;
+    CedEntry **entries = malloc((size_t)ws->count * sizeof *entries);
+    if (!entries) { fclose(input); return; }
+    bool ready = true;
+    for (int i = 0; i < ws->count; i++) {
+        entries[i] = &ws->entries[i];
+        size_t length = strlen(entries[i]->path) + 1;
+        if (fwrite(entries[i]->path, 1, length, input) != length) { ready = false; break; }
+    }
+    if (fflush(input) || fseek(input, 0, SEEK_SET)) ready = false;
+    /* A seekable input avoids pipe deadlocks and argv limits for large trees.
+     * Git handles nested rules, negation, tracked files and unusual filenames. */
+    const char *args[] = {"git", "-C", ws->root, "check-ignore", "--stdin", "-z", NULL};
+    char *output = NULL; size_t length = 0;
+    int status = ready ? command_run(args, &output, &length, fileno(input)) : -1;
+    fclose(input);
+    if (!status) {
+        qsort(entries, (size_t)ws->count, sizeof *entries, compare_entry_paths);
+        for (size_t offset = 0; offset < length;) {
+            char *path = output + offset, *end = memchr(path, 0, length - offset);
+            if (!end) break;
+            CedEntry key = {.path = path}, *key_ptr = &key;
+            CedEntry **entry = bsearch(&key_ptr, entries, (size_t)ws->count, sizeof *entries, compare_entry_paths);
+            if (entry) (*entry)->ignored = true;
+            offset = (size_t)(end - output) + 1;
+        }
+    }
+    free(output); free(entries);
+}
+
 bool ced_workspace_open(CedWorkspace *ws, const char *path, char *error) {
     CedWorkspace next = {0};
     struct stat st;
@@ -138,6 +185,7 @@ bool ced_workspace_open(CedWorkspace *ws, const char *path, char *error) {
         ced_workspace_free(&next);
         return fail(error, "Could not read folder: access denied or out of memory.");
     }
+    mark_ignored(&next);
     /* Preserve expansion on refresh. */
     for (int i = 0; i < next.count; i++) {
         if (!next.entries[i].directory) continue;
@@ -265,7 +313,11 @@ bool ced_document_save(CedDocument *doc, const char *path, bool force, char *err
     }
     free(doc->saved);
     doc->saved = saved;
+#ifdef _WIN32
+    if (!realpath(path,doc->path)) snprintf(doc->path,sizeof doc->path,"%s",path);
+#else
     snprintf(doc->path, sizeof doc->path, "%s", path);
+#endif
     doc->length = strlen(doc->text);
     return true;
 }
@@ -368,14 +420,20 @@ void ced_search_cancel(CedSearch *s) {
     ced_search_finish(s);
 }
 
-int ced_command(const char *const argv[], char **output, size_t *length) {
+static int command_run(const char *const argv[], char **output, size_t *length, int input_fd) {
+#ifdef _WIN32
+    return ced_windows_command(argv, output, length, input_fd);
+#else
     int pipes[2];
     *output = NULL;
     if (length) *length = 0;
     if (pipe(pipes)) return -1;
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    if (input_fd >= 0) {
+        posix_spawn_file_actions_adddup2(&actions, input_fd, STDIN_FILENO);
+        if (input_fd != STDIN_FILENO) posix_spawn_file_actions_addclose(&actions, input_fd);
+    } else posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
     posix_spawn_file_actions_adddup2(&actions, pipes[1], STDOUT_FILENO);
     posix_spawn_file_actions_adddup2(&actions, pipes[1], STDERR_FILENO);
     posix_spawn_file_actions_addclose(&actions, pipes[0]);
@@ -420,6 +478,11 @@ int ced_command(const char *const argv[], char **output, size_t *length) {
     if (length) *length = used;
     if (!buf || truncated || status == -1) return -1;
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
+int ced_command(const char *const argv[], char **output, size_t *length) {
+    return command_run(argv, output, length, -1);
 }
 
 static bool git_run(const char *const argv[], char **out, char *error) {

@@ -1,4 +1,9 @@
 #include "process_memory.h"
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <psapi.h>
+#endif
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -8,7 +13,10 @@
 #endif
 
 uint64_t ced_memory_usage_bytes(void) {
-#if defined(__APPLE__)
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS info = {0}; info.cb = sizeof info;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &info, sizeof info)) return (uint64_t)info.WorkingSetSize;
+#elif defined(__APPLE__)
     task_vm_info_data_t info = {0};
     mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) == KERN_SUCCESS &&

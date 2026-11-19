@@ -41,7 +41,7 @@ typedef struct {
     bool markdown_preview;
 } EditorTab;
 
-typedef enum { FILE_CREATE, FILE_RENAME, FILE_DELETE, DIRECTORY_CREATE } FileOperation;
+typedef enum { CED_FILE_CREATE, CED_FILE_RENAME, CED_FILE_DELETE, CED_DIRECTORY_CREATE } FileOperation;
 typedef struct {
     FileOperation operation;
     bool open, execute, directory;
@@ -552,22 +552,22 @@ static void toggle_terminal(Editor *e) {
 static void request_file_action(Editor *e, FileOperation operation, const char *path, bool directory) {
     FileAction *a = &e->file_action;
     a->operation = operation; a->directory = directory;
-    if ((operation == FILE_CREATE || operation == DIRECTORY_CREATE) && !directory) {
+    if ((operation == CED_FILE_CREATE || operation == CED_DIRECTORY_CREATE) && !directory) {
         if (!ced_parent_path(path, a->path, sizeof a->path)) { notify(e, "Invalid parent folder."); return; }
     } else snprintf(a->path, sizeof a->path, "%s", path);
-    snprintf(a->name, sizeof a->name, "%s", operation == FILE_RENAME ? ced_basename(path) : "");
+    snprintf(a->name, sizeof a->name, "%s", operation == CED_FILE_RENAME ? ced_basename(path) : "");
     a->error[0] = 0; a->open = true; a->execute = false; a->serial++;
     ced_assist_reset(&e->assist);
 }
 
 static void file_context_menu(cui_ctx *ui, Editor *e, const char *path, bool directory, bool root) {
     cui_context_menu(ui, "file-context") {
-        if (cui_menu_item(ui, "New File...", .icon = CUI_ICON_PLUS)) request_file_action(e, FILE_CREATE, path, directory);
-        if (cui_menu_item(ui, "New Folder...", .icon = CUI_ICON_FOLDER)) request_file_action(e, DIRECTORY_CREATE, path, directory);
+        if (cui_menu_item(ui, "New File...", .icon = CUI_ICON_PLUS)) request_file_action(e, CED_FILE_CREATE, path, directory);
+        if (cui_menu_item(ui, "New Folder...", .icon = CUI_ICON_FOLDER)) request_file_action(e, CED_DIRECTORY_CREATE, path, directory);
         if (!root) {
-            if (cui_menu_item(ui, "Rename...", .icon = CUI_ICON_SQUARE_PEN)) request_file_action(e, FILE_RENAME, path, directory);
+            if (cui_menu_item(ui, "Rename...", .icon = CUI_ICON_SQUARE_PEN)) request_file_action(e, CED_FILE_RENAME, path, directory);
             cui_menu_separator(ui);
-            if (cui_menu_item(ui, "Delete", .icon = CUI_ICON_TRASH_2, .danger = true)) request_file_action(e, FILE_DELETE, path, directory);
+            if (cui_menu_item(ui, "Delete", .icon = CUI_ICON_TRASH_2, .danger = true)) request_file_action(e, CED_FILE_DELETE, path, directory);
         }
     }
 }
@@ -578,11 +578,11 @@ static void perform_file_action(Editor *e) {
     a->execute = false;
     char result[CED_PATH] = {0};
     bool ok = false;
-    if (a->operation == FILE_CREATE) {
+    if (a->operation == CED_FILE_CREATE) {
         ok = ced_file_create(e->workspace.root, a->path, a->name, result, a->error);
-    } else if (a->operation == DIRECTORY_CREATE) {
+    } else if (a->operation == CED_DIRECTORY_CREATE) {
         ok = ced_directory_create(e->workspace.root, a->path, a->name, result, a->error);
-    } else if (a->operation == FILE_RENAME) {
+    } else if (a->operation == CED_FILE_RENAME) {
 #ifdef CED_ENABLE_EXTENSIONS
         unsigned previous_access[MAX_DOCS];
         for (int n = 0; n < e->count; n++) previous_access[n] = ced_extensions_document_access(e->extensions, &e->docs[n].file);
@@ -635,15 +635,15 @@ static void perform_file_action(Editor *e) {
     refresh(e);
     if (e->query[0]) ced_search_start(&e->search, &e->workspace, e->query);
     if (!ok) { a->open = true; notify(e, a->error); return; }
-    if (a->operation == FILE_CREATE || a->operation == DIRECTORY_CREATE) {
+    if (a->operation == CED_FILE_CREATE || a->operation == CED_DIRECTORY_CREATE) {
         for (int i = 0; i < e->workspace.count; i++) {
             char path[CED_PATH];
             CedEntry *entry = &e->workspace.entries[i];
             if (entry->directory && ced_join(path, sizeof path, e->workspace.root, entry->path) && ced_path_within(result, path)) entry->expanded = true;
         }
-        if (a->operation == FILE_CREATE) open_document(e, result, 0, 0);
+        if (a->operation == CED_FILE_CREATE) open_document(e, result, 0, 0);
     }
-    notify(e, a->operation == FILE_CREATE ? "File created." : a->operation == DIRECTORY_CREATE ? "Folder created." : a->operation == FILE_RENAME ? "Renamed." : "Deleted.");
+    notify(e, a->operation == CED_FILE_CREATE ? "File created." : a->operation == CED_DIRECTORY_CREATE ? "Folder created." : a->operation == CED_FILE_RENAME ? "Renamed." : "Deleted.");
 }
 
 static int tree_node(cui_ctx *ui, Editor *e, int index) {
@@ -655,7 +655,7 @@ static int tree_node(cui_ctx *ui, Editor *e, int index) {
     cui_push_id(ui, entry->path);
     bool expanded = ced_tree_begin(ui, ced_basename(entry->path), &entry->expanded,
         &(cui_tree_opts){.leaf = !entry->directory, .selected = selected,
-                        .icon = entry->directory ? CUI_ICON_FOLDER : CUI_ICON_FILE_TEXT});
+                        .icon = entry->directory ? CUI_ICON_FOLDER : CUI_ICON_FILE_TEXT}, entry->ignored);
     if (!entry->directory && cui_tree_clicked(ui)) open_document(e, path, 0, 0);
     file_context_menu(ui, e, path, entry->directory, false);
     int next = index + 1;
@@ -1060,13 +1060,13 @@ static void dialogs(cui_ctx *ui, Editor *e) {
         }
     }
     FileAction *a = &e->file_action;
-    const char *title = a->operation == FILE_CREATE ? "New File" : a->operation == DIRECTORY_CREATE ? "New Folder" : a->operation == FILE_RENAME ? "Rename" : "Delete?";
+    const char *title = a->operation == CED_FILE_CREATE ? "New File" : a->operation == CED_DIRECTORY_CREATE ? "New Folder" : a->operation == CED_FILE_RENAME ? "Rename" : "Delete?";
     cui_dialog(ui, title, &a->open, .width = 500) {
         cui_text(ui, a->path, .size = 12, .color = CUI_COLOR_TEXT_MUTED, .width = CUI_FILL);
         bool submitted = false;
-        if (a->operation != FILE_DELETE) {
+        if (a->operation != CED_FILE_DELETE) {
             cui_push_id_int(ui, a->serial);
-            submitted = (cui_input(ui, "file-name", a->name, sizeof a->name, .placeholder = a->operation == DIRECTORY_CREATE ? "Folder name" : "File name", .autofocus = true,
+            submitted = (cui_input(ui, "file-name", a->name, sizeof a->name, .placeholder = a->operation == CED_DIRECTORY_CREATE ? "Folder name" : "File name", .autofocus = true,
                 .error = a->error[0] ? a->error : NULL) & CUI_SUBMITTED) != 0;
             cui_pop_id(ui);
         } else {
@@ -1079,9 +1079,9 @@ static void dialogs(cui_ctx *ui, Editor *e) {
         }
         cui_dialog_footer(ui) {
             if (cui_button(ui, "Cancel", .variant = CUI_BUTTON_DEFAULT)) a->open = false;
-            bool clicked = cui_button(ui, a->operation == FILE_RENAME ? "Rename" : a->operation == FILE_DELETE ? "Delete" : "Create",
-                .variant = a->operation == FILE_DELETE ? CUI_BUTTON_DANGER : CUI_BUTTON_PRIMARY,
-                .disabled = a->operation != FILE_DELETE && !a->name[0]);
+            bool clicked = cui_button(ui, a->operation == CED_FILE_RENAME ? "Rename" : a->operation == CED_FILE_DELETE ? "Delete" : "Create",
+                .variant = a->operation == CED_FILE_DELETE ? CUI_BUTTON_DANGER : CUI_BUTTON_PRIMARY,
+                .disabled = a->operation != CED_FILE_DELETE && !a->name[0]);
             if (clicked || (submitted && a->name[0])) { a->execute = true; a->open = false; }
         }
     }
@@ -1373,7 +1373,7 @@ static void editor_free(Editor *e) {
     ced_editor_font_free(&e->editor_font);
 }
 
-int main(int argc, char **argv) {
+static int ced_main(int argc, char **argv) {
     if (argc > 1 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
         puts("Usage: ced [--disable-extensions] [folder] [file ...]");
         return 0;
@@ -1399,7 +1399,11 @@ int main(int argc, char **argv) {
     restore_recovery(&e);
     for (int i = first + 1; i < argc; i++) {
         char path[CED_PATH];
-        if (argv[i][0] == '/') open_document(&e, argv[i], 0, 0);
+        bool absolute=argv[i][0]=='/';
+#ifdef _WIN32
+        absolute |= strlen(argv[i])>2 && argv[i][1]==':';
+#endif
+        if (absolute) open_document(&e, argv[i], 0, 0);
         else if (ced_join(path, sizeof path, e.workspace.root, argv[i])) open_document(&e, path, 0, 0);
     }
     e.app = cui_app_create(&(cui_app_desc){.title = "CED · Editor", .width = 1280, .height = 820,
@@ -1443,4 +1447,23 @@ int main(int argc, char **argv) {
     }
     editor_free(&e);
     return 0;
+}
+
+int main(int argc, char **argv) {
+#ifdef _WIN32
+    (void)argc; (void)argv;
+    ced_windows_init();
+    int count=0; wchar_t **wide=CommandLineToArgvW(GetCommandLineW(),&count);
+    if (!wide) return 1;
+    char **utf8=calloc((size_t)count+1,sizeof *utf8);
+    if (!utf8) { LocalFree(wide); return 1; }
+    bool valid=true;
+    for (int i=0;i<count;i++) { utf8[i]=ced_windows_utf8(wide[i]); if (!utf8[i]) valid=false; }
+    LocalFree(wide);
+    int result=valid ? ced_main(count,utf8) : 1;
+    for (int i=0;i<count;i++) free(utf8[i]);
+    free(utf8); return result;
+#else
+    return ced_main(argc,argv);
+#endif
 }

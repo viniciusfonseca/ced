@@ -4,6 +4,7 @@
 
 #define EDITOR_SALT 0xED17C0DEu
 #define EDITOR_BODY 0xED1B0D1u
+#define COMPLETION_ROW_HEIGHT 24
 typedef struct { cui_edit_state edit; double sy; float sx; } EditorStatePrefix;
 
 static bool inside(cui_rect r, cui_vec2 p) {
@@ -157,7 +158,7 @@ void ced_assist_hover_at_caret(cui_ctx *ui, CedEditorAssist *a, int tab, int off
     a->hover_mouse = cui_mouse_pos(ui); a->hover_anchor = a->geometry.caret;
 }
 
-static void panel_begin(cui_ctx *ui, cui_id id, cui_rect anchor, float width, float height) {
+static void panel_begin(cui_ctx *ui, cui_id id, cui_rect anchor, float width, float height, float padding) {
     cui_rect previous = cui_get_rect(ui, id);
     float h = previous.h > 0 ? previous.h : height;
     float y = anchor.y + anchor.h + 4;
@@ -166,7 +167,7 @@ static void panel_begin(cui_ctx *ui, cui_id id, cui_rect anchor, float width, fl
     cui_node *n = &ui->nodes[node];
     n->fx = anchor.x; n->fy = y;
     n->w = CUI_PX(CUI_MIN(width, ui->vw - 16)); n->max_h = 300;
-    n->pad[0] = n->pad[1] = n->pad[2] = n->pad[3] = 6;
+    n->pad[0] = n->pad[1] = n->pad[2] = n->pad[3] = padding;
     n->bg = CUI_C(ui, SURFACE_RAISED); n->border = 1; n->border_color = CUI_C(ui, BORDER);
     n->radius = CUI_CORNERS(8); n->elevation = CUI_ELEVATION_FLOATING; n->elevation_alpha = 1;
     n->flags |= CUI_NF_HIT_OPAQUE | CUI_NF_BLOCKER;
@@ -176,15 +177,27 @@ int ced_assist_draw(cui_ctx *ui, CedEditorAssist *a) {
     int selected = -1;
     if (a->completion_open) {
         cui_id id = cui_make_id(ui, "completion-popup"); a->completion_layer = id;
-        float height = (float)CUI_MIN(a->count, 8) * 32;
-        panel_begin(ui, id, a->geometry.caret, 420, height + 12);
+        float height = (float)CUI_MIN(a->count, 8) * COMPLETION_ROW_HEIGHT;
+        panel_begin(ui, id, a->geometry.caret, 420, height, 0);
+        ui->nodes[cui__current(ui)].pad[1] = ui->nodes[cui__current(ui)].pad[3] = 4;
         cui_push_id(ui, "completion-popup");
-        if (a->scroll_selection) { cui_scroll_to(ui, "suggestions", a->selected * 32.0f); a->scroll_selection = false; }
+        if (a->scroll_selection) { cui_scroll_to(ui, "suggestions", a->selected * (float)COMPLETION_ROW_HEIGHT); a->scroll_selection = false; }
         cui_scroll(ui, .id = "suggestions", .height = CUI_PX(height)) {
             for (int i = 0; i < a->count; i++) {
                 cui_push_id_int(ui, i);
-                if (cui_nav_item(ui, a->completions[i].label, .icon = CUI_ICON_CODE, .selected = i == a->selected)) selected = i;
-                cui_tooltip(ui, a->completions[i].detail);
+                int row = ui->node_count;
+                const char *detail = a->completions[i].detail;
+                if (cui_nav_item(ui, a->completions[i].label, .icon = CUI_ICON_CODE,
+                        .badge = *detail ? detail : NULL, .selected = i == a->selected)) selected = i;
+                /* Adapt the pinned CUI navigation row without changing its input handling. */
+                cui_node *node = &ui->nodes[row];
+                node->h = CUI_PX(COMPLETION_ROW_HEIGHT);
+                memset(node->pad, 0, sizeof node->pad);
+                if (*detail) {
+                    cui_node *description = &ui->nodes[node->last];
+                    description->max_w = 180;
+                    description->text_align = CUI_TEXT_RIGHT;
+                }
                 cui_pop_id(ui);
             }
         }
@@ -192,7 +205,7 @@ int ced_assist_draw(cui_ctx *ui, CedEditorAssist *a) {
     } else if (a->hover_open) {
         cui_id id = cui_make_id(ui, "symbol-popover");
         a->hover_rect = cui_get_rect(ui, id);
-        panel_begin(ui, id, a->hover_anchor, 500, 160);
+        panel_begin(ui, id, a->hover_anchor, 500, 160, 6);
         cui_box(ui, .id = "symbol-content", .max_height = 270, .scroll_y = true, .clip = true, .width = CUI_FILL, .pad = 6) {
             cui_markdown(ui, "symbol-markdown", a->hover, .compact = true);
         }
