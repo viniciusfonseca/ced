@@ -85,6 +85,32 @@ static bool presentation(const cJSON *object, const char *key, char *out, size_t
     snprintf(out, capacity, "%s", value->valuestring); return true;
 }
 
+static bool parse_tabs(const cJSON *list, CedExtensionManifest *manifest, char *error) {
+    if (!list) return true;
+    static const char *const fields[] = {"id", "title", "panel", "command", NULL};
+    if (!manifest->executable || !cJSON_IsArray(list) ||
+        cJSON_GetArraySize(list) > CED_EXTENSION_TAB_LIMIT) return false;
+    const cJSON *entry;
+    cJSON_ArrayForEach(entry, list) {
+        if (!ced_ext_json_fields(entry, fields, error)) return false;
+        CedExtensionTab *tab = &manifest->tabs[manifest->tab_count];
+        const char *panel = ced_ext_json_string(entry, "panel");
+        const char *command = ced_ext_json_string(entry, "command");
+        if (!panel || (strcmp(panel, "sidebar") && strcmp(panel, "terminal")) || !command ||
+            !presentation(entry, "id", tab->id, sizeof tab->id, true) || !own_name(manifest->id, tab->id) ||
+            !presentation(entry, "title", tab->title, sizeof tab->title, true)) return false;
+        while (tab->command < manifest->command_count &&
+               strcmp(command, manifest->commands[tab->command].id)) tab->command++;
+        if (tab->command == manifest->command_count) return false;
+        for (size_t i = 0; i < manifest->tab_count; i++)
+            if (!strcmp(manifest->tabs[i].id, tab->id) || manifest->tabs[i].command == tab->command)
+                return false;
+        tab->terminal = !strcmp(panel, "terminal");
+        manifest->tab_count++;
+    }
+    return true;
+}
+
 static bool condition(const cJSON *object, CedCommandCondition *when, char *error) {
     if (!object) return true;
     static const char *const fields[] = {"hasDocument", "editorTextFocus", "hasSelection", "workspaceTrusted", "languageId", NULL};
@@ -150,7 +176,7 @@ bool ced_extension_manifest_parse(const char *bytes, size_t length, CedExtension
     static const char *const fields[] = {"manifestVersion", "id", "name", "version", "description", "license",
         "ced", "kind", "entrypoints", "activationEvents", "capabilities", "untrustedWorkspaces", "contributes", "requirements", "metadata", NULL};
     static const char *const ced_fields[] = {"minVersion", "apiMajor", NULL};
-    static const char *const contributes_fields[] = {"commands", "configuration", NULL};
+    static const char *const contributes_fields[] = {"commands", "configuration", "tabs", NULL};
     const cJSON *ced = cJSON_GetObjectItemCaseSensitive(root, "ced"), *contributes = cJSON_GetObjectItemCaseSensitive(root, "contributes");
     uint64_t number;
     const char *kind = ced_ext_json_string(root, "kind");
@@ -186,6 +212,7 @@ bool ced_extension_manifest_parse(const char *bytes, size_t length, CedExtension
     }
     if (contributes && !ced_ext_json_fields(contributes, contributes_fields, error)) goto parsed_invalid;
     if (!parse_commands(cJSON_GetObjectItemCaseSensitive(contributes, "commands"), out, error) ||
+        !parse_tabs(cJSON_GetObjectItemCaseSensitive(contributes, "tabs"), out, error) ||
         !configuration(cJSON_GetObjectItemCaseSensitive(contributes, "configuration"), out, error)) goto parsed_invalid;
     const cJSON *entrypoints = cJSON_GetObjectItemCaseSensitive(root, "entrypoints");
     const cJSON *events = cJSON_GetObjectItemCaseSensitive(root, "activationEvents");

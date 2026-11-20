@@ -8,6 +8,16 @@
 static const char *const methods[] = {"editor/getContext", "documents/list", "documents/get",
     "documents/applyEdits", "window/showMessage", "log/write", NULL};
 
+static void clear_tab_state(CedExtensionInstance *i) {
+    cJSON_Delete(i->invocation_arguments);
+    i->invocation_arguments = NULL;
+    i->tab_action = false;
+    for (size_t n = 0; n < i->record.manifest.tab_count; n++) {
+        cJSON_Delete(i->tabs[n].model);
+        i->tabs[n] = (CedExtensionTabState){0};
+    }
+}
+
 static void report(CedExtensions *m, const char *text) {
     snprintf(m->error, sizeof m->error, "%s", text);
     if (*text && m->host.message) m->host.message(m->host.user, text);
@@ -64,6 +74,7 @@ void ced_extensions_stop(CedExtensionInstance *i, const char *reason) {
     *i->command = 0;
     i->invocation_document = 0;
     cJSON_Delete(i->invocation_editor); i->invocation_editor = NULL;
+    clear_tab_state(i);
 }
 
 void ced_extensions_violation(CedExtensionInstance *i, const char *reason) {
@@ -122,15 +133,30 @@ void ced_extensions_document_closed(CedExtensions *m, uint64_t id) {
 
 static void invoke(CedExtensionInstance *i) {
     cJSON *params = cJSON_CreateObject();
-    cJSON_AddStringToObject(params, "commandId", i->command);
-    cJSON_AddNullToObject(params, "arguments");
-    cJSON_AddItemToObject(params, "editor", i->invocation_editor); i->invocation_editor = NULL;
+    bool have_command = cJSON_AddStringToObject(params, "commandId", i->command) != NULL;
+    bool have_arguments = ced_ext_json_add(params, "arguments",
+        i->invocation_arguments ? i->invocation_arguments : cJSON_CreateNull());
+    i->invocation_arguments = NULL;
+    bool have_editor = ced_ext_json_add(params, "editor", i->invocation_editor);
+    i->invocation_editor = NULL;
+    if (!have_command || !have_arguments || !have_editor) {
+        cJSON_Delete(params);
+        snprintf(i->error, sizeof i->error, "ResourceLimit: command allocation");
+        ced_extension_process_stop(i->process);
+        *i->command = 0;
+        i->invocation_document = 0;
+        i->state = EXT_FAILED;
+        report(i->manager, i->error);
+        return;
+    }
     request(i, "commands/invoke", params, 5);
 }
 
 static void initialize(CedExtensionInstance *i) {
     cJSON *p = cJSON_CreateObject(), *host = cJSON_AddObjectToObject(p, "host");
     cJSON_AddStringToObject(host, "name", "CED"); cJSON_AddStringToObject(host, "version", CED_EXTENSION_APP_VERSION);
+    cJSON_AddNumberToObject(host, "tabProtocol", 1);
+    cJSON_AddNumberToObject(host, "tabWidgets", 3);
     cJSON *extension = cJSON_AddObjectToObject(p, "extension");
     cJSON_AddStringToObject(extension, "id", i->record.manifest.id);
     cJSON_AddStringToObject(extension, "version", i->record.manifest.version);
@@ -159,8 +185,9 @@ static void initialize(CedExtensionInstance *i) {
     request(i, "ced/initialize", p, 3);
 }
 
-static bool execute(void *user, const char *id, const CedCommandContext *context, char *error) {
-    CedExtensionInstance *i = user; CedExtensions *m = i->manager;
+static bool execute_command(CedExtensionInstance *i, const char *id, const CedCommandContext *context,
+                            cJSON *arguments, char *error) {
+    CedExtensions *m = i->manager;
     const char *failure = NULL;
     if (!m->trusted) failure = "Trust this workspace in Manage Extensions before running extensions.";
     else if (m->job.running || m->reload || i->state == EXT_STOPPING) failure = "Extension manager is busy.";
@@ -172,18 +199,187 @@ static bool execute(void *user, const char *id, const CedCommandContext *context
     if (failure) { snprintf(error, CED_ERROR, "%s", failure); return false; }
     *i->error = 0;
     snprintf(i->command, sizeof i->command, "%s", id);
-    i->invocation_editor = ced_extensions_editor(i, *context);
+    i->invocation_editor = ced_extensions_editor(i, arguments ? (CedCommandContext){0} : *context);
     if (!i->invocation_editor) { *i->command = 0; snprintf(error, CED_ERROR, "ResourceLimit: editor context allocation"); return false; }
-    i->invocation_document = context->has_document ? context->document_id : 0;
-    if (i->process) { invoke(i); return true; }
+    i->invocation_document = !arguments && context->has_document ? context->document_id : 0;
+    if (i->process) {
+        i->invocation_arguments = arguments;
+        i->tab_action = arguments != NULL;
+        invoke(i);
+        return true;
+    }
     snprintf(i->session, sizeof i->session, "session-%ld-%llu", (long)getpid(), (unsigned long long)++m->next_session);
     i->last_request = 0;
     i->activation_started = ced_ext_now(); i->activation_ms = 0;
     i->violations = 0; i->violation_window = ced_ext_now();
     i->process = ced_extension_process_start(m->profile, &i->record, i->session, error);
     if (!i->process) { *i->command = 0; i->invocation_document = 0; cJSON_Delete(i->invocation_editor); i->invocation_editor = NULL; return false; }
+    i->invocation_arguments = arguments;
+    i->tab_action = arguments != NULL;
     initialize(i);
     return true;
+}
+
+static bool execute(void *user, const char *id, const CedCommandContext *context, char *error) {
+    return execute_command(user, id, context, NULL, error);
+}
+
+bool ced_extensions_tab_action(CedExtensionInstance *i, size_t tab_index, const char *action, const char *value) {
+    if (tab_index >= i->record.manifest.tab_count || !i->record.valid || !i->record.enabled) return false;
+    CedExtensionTab *tab = &i->record.manifest.tabs[tab_index];
+    CedExtensionCommand *command = &i->record.manifest.commands[tab->command];
+    CedCommandContext context = i->manager->host.context(i->manager->host.user);
+    if (!ced_command_condition(&command->when, &context)) {
+        report(i->manager, "This tab is unavailable in the current context.");
+        return false;
+    }
+    cJSON *args = cJSON_CreateArray();
+    cJSON *event = cJSON_CreateObject();
+    if (!args || !event || !cJSON_AddStringToObject(event, "tabId", tab->id) ||
+        !cJSON_AddStringToObject(event, "action", action) || !cJSON_AddStringToObject(event, "value", value)) {
+        cJSON_Delete(args); cJSON_Delete(event);
+        report(i->manager, "Could not prepare the extension tab action.");
+        return false;
+    }
+    char error[CED_ERROR] = {0};
+    if (ced_ext_json_append(args, event) && execute_command(i, command->id, &context, args, error)) {
+        i->tabs[tab_index].requested = true;
+        return true;
+    }
+    cJSON_Delete(args);
+    report(i->manager, *error ? error : "Could not send the extension tab action.");
+    return false;
+}
+
+static bool tab_text(const char *text, size_t limit, bool multiline) {
+    if (!text || strlen(text) > limit) return false;
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++)
+        if ((*p < 32 && !(multiline && (*p == '\n' || *p == '\t'))) || *p == 127) return false;
+    return true;
+}
+
+static bool valid_tab_choices(const cJSON *choices, int limit, size_t label_limit) {
+    static const char *const fields[] = {"id", "label", NULL};
+    char error[CED_ERROR];
+    if (!cJSON_IsArray(choices) || cJSON_GetArraySize(choices) > limit) return false;
+    const cJSON *entry;
+    cJSON_ArrayForEach(entry, choices) {
+        const char *id = ced_ext_json_string(entry, "id");
+        if (!ced_ext_json_fields(entry, fields, error) ||
+            !tab_text(id, 128, false) || !*id ||
+            !tab_text(ced_ext_json_string(entry, "label"), label_limit, false)) return false;
+        for (const cJSON *previous = choices->child; previous != entry; previous = previous->next)
+            if (!strcmp(id, ced_ext_json_string(previous, "id"))) return false;
+    }
+    return true;
+}
+
+static bool valid_tab_selectors(const cJSON *selectors) {
+    static const char *const fields[] = {"id", "label", "selected", "options", "disabled", "placement", NULL};
+    char error[CED_ERROR];
+    if (!cJSON_IsArray(selectors) || cJSON_GetArraySize(selectors) > 2) return false;
+    const cJSON *entry;
+    cJSON_ArrayForEach(entry, selectors) {
+        const char *id = ced_ext_json_string(entry, "id");
+        const char *selected = ced_ext_json_string(entry, "selected");
+        const cJSON *disabled = cJSON_GetObjectItemCaseSensitive(entry, "disabled");
+        const cJSON *options = cJSON_GetObjectItemCaseSensitive(entry, "options");
+        if (!ced_ext_json_fields(entry, fields, error) ||
+            !tab_text(id, 128, false) || !*id || !strcmp(id, "refresh") ||
+            !tab_text(ced_ext_json_string(entry, "label"), 80, false) ||
+            !tab_text(selected, 128, false) || (disabled && !cJSON_IsBool(disabled)) ||
+            !valid_tab_choices(options, CED_EXTENSION_TAB_CHOICES, 128)) return false;
+        for (const cJSON *previous = selectors->child; previous != entry; previous = previous->next)
+            if (!strcmp(id, ced_ext_json_string(previous, "id"))) return false;
+        bool found = !*selected;
+        const cJSON *choice;
+        cJSON_ArrayForEach(choice, options)
+            if (!strcmp(selected, ced_ext_json_string(choice, "id"))) found = true;
+        if (!found) return false;
+        if (cJSON_GetObjectItemCaseSensitive(entry, "placement")) {
+            const char *placement = ced_ext_json_string(entry, "placement");
+            if (!placement || strcmp(placement, "composer")) return false;
+        }
+    }
+    return true;
+}
+
+static bool valid_tab_chat(const cJSON *chat) {
+    static const char *const fields[] = {"author", "messages", "status", NULL};
+    static const char *const message_fields[] = {"role", "text", NULL};
+    char error[CED_ERROR];
+    const cJSON *messages = cJSON_GetObjectItemCaseSensitive(chat, "messages");
+    const cJSON *status_item = cJSON_GetObjectItemCaseSensitive(chat, "status");
+    const char *status = ced_ext_json_string(chat, "status");
+    if (!ced_ext_json_fields(chat, fields, error) ||
+        !tab_text(ced_ext_json_string(chat, "author"), 80, false) ||
+        !cJSON_IsArray(messages) || cJSON_GetArraySize(messages) > 64 ||
+        (status_item && (!status || (strcmp(status, "pending") && strcmp(status, "running") &&
+                                     strcmp(status, "failed"))))) return false;
+    size_t bytes = 0;
+    const cJSON *message;
+    cJSON_ArrayForEach(message, messages) {
+        const char *role = ced_ext_json_string(message, "role");
+        const char *text = ced_ext_json_string(message, "text");
+        if (!ced_ext_json_fields(message, message_fields, error) ||
+            !role || (strcmp(role, "user") && strcmp(role, "agent")) ||
+            !tab_text(text, 9000 - bytes, true)) return false;
+        bytes += strlen(text);
+    }
+    return true;
+}
+
+static bool valid_tab_model(const cJSON *model) {
+    static const char *const fields[] = {"heading", "text", "actions", "input", "refresh", "selectors", "chat", NULL};
+    static const char *const input_fields[] = {"id", "label", "placeholder", "disabled", NULL};
+    char error[CED_ERROR];
+    if (!ced_ext_json_fields(model, fields, error)) return false;
+    const cJSON *actions = cJSON_GetObjectItemCaseSensitive(model, "actions");
+    const cJSON *input = cJSON_GetObjectItemCaseSensitive(model, "input");
+    const cJSON *refresh = cJSON_GetObjectItemCaseSensitive(model, "refresh");
+    const cJSON *selectors = cJSON_GetObjectItemCaseSensitive(model, "selectors");
+    const cJSON *chat = cJSON_GetObjectItemCaseSensitive(model, "chat");
+    if (!tab_text(ced_ext_json_string(model, "heading"), 256, false) ||
+        !tab_text(ced_ext_json_string(model, "text"), 24000, true) ||
+        !valid_tab_choices(actions, 32, 256) || (refresh && !cJSON_IsBool(refresh)) ||
+        (selectors && !valid_tab_selectors(selectors)) || (chat && !valid_tab_chat(chat))) return false;
+    const cJSON *action;
+    cJSON_ArrayForEach(action, actions)
+        if (!strcmp(ced_ext_json_string(action, "id"), "refresh")) return false;
+    if (!input) return true;
+    const char *id = ced_ext_json_string(input, "id");
+    const cJSON *disabled = cJSON_GetObjectItemCaseSensitive(input, "disabled");
+    return ced_ext_json_fields(input, input_fields, error) &&
+        tab_text(id, 128, false) && *id && strcmp(id, "refresh") &&
+        tab_text(ced_ext_json_string(input, "label"), 80, false) &&
+        tab_text(ced_ext_json_string(input, "placeholder"), 160, false) &&
+        (!disabled || cJSON_IsBool(disabled));
+}
+
+static void receive_tab(CedExtensionInstance *i, cJSON *result) {
+    cJSON *model = cJSON_GetObjectItemCaseSensitive(result, "tab");
+    for (size_t n = 0; n < i->record.manifest.tab_count; n++) {
+        const CedExtensionTab *tab = &i->record.manifest.tabs[n];
+        if (strcmp(i->command, i->record.manifest.commands[tab->command].id)) continue;
+        CedExtensionTabState *state = &i->tabs[n];
+        bool submitted = state->submitted;
+        state->submitted = false;
+        if (!valid_tab_model(model)) {
+            snprintf(i->error, sizeof i->error, "Invalid extension tab model.");
+            report(i->manager, i->error);
+            return;
+        }
+        const char *old_input = ced_ext_json_string(cJSON_GetObjectItemCaseSensitive(state->model, "input"), "id");
+        const char *new_input = ced_ext_json_string(cJSON_GetObjectItemCaseSensitive(model, "input"), "id");
+        if (submitted || (old_input && (!new_input || strcmp(old_input, new_input)))) *state->input = 0;
+        cJSON_Delete(state->model);
+        state->model = cJSON_DetachItemViaPointer(result, model);
+        state->requested = true;
+        state->next_refresh = ced_ext_now() + .75;
+        if (!i->tab_action)
+            snprintf(i->manager->reveal_tab, sizeof i->manager->reveal_tab, "%s", tab->id);
+        return;
+    }
 }
 
 static bool handshake(CedExtensionInstance *i, cJSON *result) {
@@ -217,6 +413,7 @@ static void response(CedExtensionInstance *i, const cJSON *message) {
     ced_extension_process_log(i->process, log);
     *i->pending = 0;
     if (error) {
+        for (size_t n = 0; n < i->record.manifest.tab_count; n++) i->tabs[n].submitted = false;
         const char *text = ced_ext_json_string(error, "message");
         snprintf(i->error, sizeof i->error, "%s", text ? text : "Invalid extension response");
         snprintf(log,sizeof log,"%s %s: error code %.0f\n",id,i->pending_method,cJSON_GetObjectItemCaseSensitive(error,"code")->valuedouble);
@@ -237,7 +434,10 @@ static void response(CedExtensionInstance *i, const cJSON *message) {
         if (!cJSON_IsObject(result)) { ced_extensions_stop(i, "shutdown"); i->state = EXT_FAILED; return; }
         i->activation_ms = (ced_ext_now() - i->activation_started) * 1000;
         i->state = EXT_ACTIVE; invoke(i);
-    } else if (i->state == EXT_ACTIVE) { *i->command = 0; i->invocation_document = 0; }
+    } else if (i->state == EXT_ACTIVE) {
+        receive_tab(i, result);
+        *i->command = 0; i->invocation_document = 0; i->tab_action = false;
+    }
 }
 
 static void *catalog_worker(void *user) {
@@ -283,7 +483,9 @@ bool ced_extensions_job(CedExtensions *m, CedExtensionJobKind kind, const char *
 }
 
 static void publish(CedExtensions *m) {
+    *m->reveal_tab = 0;
     for (size_t n = 0; n < m->count; n++) {
+        clear_tab_state(&m->instances[n]);
         ced_commands_remove_owner(m->commands, &m->instances[n]);
         ced_extension_record_free(&m->instances[n].record);
         cJSON_Delete(m->instances[n].invocation_editor);
@@ -349,6 +551,7 @@ void ced_extensions_tick(CedExtensions *m) {
             } else i->state = EXT_REGISTERED;
             *i->pending = 0; *i->command = 0; i->invocation_document = 0;
             cJSON_Delete(i->invocation_editor); i->invocation_editor = NULL;
+            clear_tab_state(i);
         } else stopped = false;
     }
     CedExtensionJob *j = &m->job;
@@ -374,6 +577,7 @@ void ced_extensions_workspace(CedExtensions *m, const char *workspace) {
     if (!m) return;
     for (size_t n = 0; n < m->count; n++) { ced_extensions_stop(&m->instances[n], "workspaceChanged"); m->instances[n].grant_count = 0; }
     ++m->generation; m->trusted = false; m->reload = true;
+    *m->reveal_tab = 0;
     snprintf(m->workspace, sizeof m->workspace, "%s", workspace);
     snprintf(m->workspace_id, sizeof m->workspace_id, "workspace-%ld-%llu", (long)getpid(), (unsigned long long)m->generation);
 }

@@ -106,6 +106,7 @@ typedef struct {
     size_t selection_anchor, selection_cursor;
 #ifdef CED_ENABLE_EXTENSIONS
     CedExtensions *extensions;
+    char sidebar_tab[257], terminal_tab[257];
 #endif
 } Editor;
 static void dispatch(Editor *e, const char *id);
@@ -470,6 +471,7 @@ static bool open_folder(Editor *e, const char *path) {
     if (!ced_workspace_open(&next, path, error)) { notify(e, error); return false; }
 #ifdef CED_ENABLE_EXTENSIONS
     ced_extensions_workspace(e->extensions, next.root);
+    *e->sidebar_tab = *e->terminal_tab = 0;
 #endif
     ced_lsp_stop(e->lsp); e->lsp = NULL; e->lsp_attempted = false;
     ced_assist_reset(&e->assist);
@@ -866,18 +868,38 @@ static void sidebar(cui_ctx *ui, Editor *e) {
     };
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .bg = CUI_COLOR_SURFACE_MUTED, .clip = true) {
         int old = e->panel;
-        cui_row(ui, .width = CUI_FILL, .gap = 0, .pad = 0) {
-            cui_theme *theme = cui_theme_get(ui);
-            float radius = theme->radius_control;
-            theme->radius_control = 0;
-            for (int i = 0; i < (int)(sizeof tabs / sizeof *tabs); i++)
-                if (cui_icon_button(ui, tabs[i].icon, .tooltip = tabs[i].label, .size = CUI_SIZE_SM, .selected = e->panel == i)) e->panel = i;
-            theme->radius_control = radius;
+#ifdef CED_ENABLE_EXTENSIONS
+        if (!ced_extension_tab_find(e->extensions, e->sidebar_tab, NULL, NULL)) *e->sidebar_tab = 0;
+#endif
+        cui_scroll(ui, .id = "sidebar-tabs", .horizontal = true, .width = CUI_FILL, .height = CUI_PX(32)) {
+            cui_row(ui, .width = CUI_FILL, .gap = 0, .pad = 0) {
+                cui_theme *theme = cui_theme_get(ui);
+                float radius = theme->radius_control;
+                theme->radius_control = 0;
+                for (int i = 0; i < (int)(sizeof tabs / sizeof *tabs); i++) {
+                    bool selected = e->panel == i;
+#ifdef CED_ENABLE_EXTENSIONS
+                    selected &= !*e->sidebar_tab;
+#endif
+                    if (cui_icon_button(ui, tabs[i].icon, .tooltip = tabs[i].label, .size = CUI_SIZE_SM, .selected = selected)) {
+                        e->panel = i;
+#ifdef CED_ENABLE_EXTENSIONS
+                        *e->sidebar_tab = 0;
+#endif
+                    }
+                }
+#ifdef CED_ENABLE_EXTENSIONS
+                ced_extension_tab_buttons(ui, e->extensions, false, e->sidebar_tab);
+#endif
+                theme->radius_control = radius;
+            }
         }
         if (old != e->panel && e->panel == 2) refresh_git(e);
         cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 10, .gap = 10) {
 #ifdef CED_ENABLE_EXTENSIONS
-            if (e->panel == 3) {
+            if (*e->sidebar_tab) {
+                ced_extension_tab_body(ui, e->extensions, e->sidebar_tab);
+            } else if (e->panel == 3) {
                 if (ced_extensions_panel(ui, e->extensions)) dispatch(e, "ced.extensions.install");
             } else
 #endif
@@ -1065,7 +1087,12 @@ static void set_terminal_position(Editor *e, bool right) {
 }
 
 static void terminal_panel(cui_ctx *ui, Editor *e) {
-    if (!e->terminal) {
+    bool shell = true;
+#ifdef CED_ENABLE_EXTENSIONS
+    if (!ced_extension_tab_find(e->extensions, e->terminal_tab, NULL, NULL)) *e->terminal_tab = 0;
+    shell = !*e->terminal_tab;
+#endif
+    if (shell && !e->terminal) {
         char error[CED_ERROR];
         e->terminal = ced_terminal_start(e->workspace.root, getenv("SHELL"), error, sizeof error);
         if (!e->terminal) { notify(e, error); e->terminal_visible = false; return; }
@@ -1077,12 +1104,34 @@ static void terminal_panel(cui_ctx *ui, Editor *e) {
             static const char *positions[] = {"Bottom", "Right"};
             int position = e->terminal_right ? 1 : 0;
             if (cui_segmented(ui, "terminal-position", positions, 2, &position, .size = CUI_SIZE_SM)) set_terminal_position(e, position == 1);
-            if (cui_icon_button(ui, CUI_ICON_REFRESH_CW, .size = CUI_SIZE_SM, .tooltip = "Restart Terminal")) {
+            if (shell && cui_icon_button(ui, CUI_ICON_REFRESH_CW, .size = CUI_SIZE_SM, .tooltip = "Restart Terminal")) {
                 ced_terminal_stop(e->terminal); e->terminal = NULL;
             }
             if (cui_icon_button(ui, CUI_ICON_X, .size = CUI_SIZE_SM, .tooltip = "Hide Terminal")) dispatch(e,"ced.terminal.toggle");
         }
-        if (e->terminal) {
+#ifdef CED_ENABLE_EXTENSIONS
+        if (ced_extension_has_tabs(e->extensions, true)) {
+            cui_scroll(ui, .id = "terminal-tabs", .horizontal = true, .width = CUI_FILL, .height = CUI_PX(32)) {
+                cui_row(ui, .width = CUI_FILL, .gap = 0, .pad_x = 4) {
+                    cui_theme *theme = cui_theme_get(ui);
+                    float radius = theme->radius_control;
+                    theme->radius_control = 0;
+                    if (cui_button(ui, "Shell", .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST, .selected = shell)) {
+                        *e->terminal_tab = 0;
+                        e->terminal_view.autofocus = true;
+                    }
+                    ced_extension_tab_buttons(ui, e->extensions, true, e->terminal_tab);
+                    theme->radius_control = radius;
+                }
+            }
+        }
+        shell = !*e->terminal_tab;
+        if (!shell) {
+            e->terminal_view.focused = false;
+            ced_extension_tab_body(ui, e->extensions, e->terminal_tab);
+        }
+#endif
+        if (shell && e->terminal) {
             if (!e->terminal->alive) cui_secondary(ui, "Shell exited.");
             ced_terminal_view(ui, e->terminal, &e->terminal_view, (float)e->font_size);
         }
@@ -1360,6 +1409,17 @@ static void frame(cui_ctx *ui, Editor *e) {
     editor_context(e);
 #ifdef CED_ENABLE_EXTENSIONS
     ced_extensions_tick(e->extensions);
+    if (e->extensions && *e->extensions->reveal_tab) {
+        const CedExtensionTab *tab = ced_extension_tab_find(e->extensions, e->extensions->reveal_tab, NULL, NULL);
+        if (tab && tab->terminal) {
+            snprintf(e->terminal_tab, sizeof e->terminal_tab, "%s", tab->id);
+            e->terminal_visible = true;
+        } else if (tab) {
+            snprintf(e->sidebar_tab, sizeof e->sidebar_tab, "%s", tab->id);
+            e->sidebar = true;
+        }
+        *e->extensions->reveal_tab = 0;
+    }
     if (e->extensions) cui_request_wakeup(ui, .03f);
 #endif
     /* Release diff sources only after the previous frame has finished painting. */
@@ -1391,6 +1451,12 @@ static void frame(cui_ctx *ui, Editor *e) {
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_S)) dispatch(e, "ced.file.save");
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_S)) dispatch(e, "ced.file.saveAs");
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_B)) e->sidebar = !e->sidebar;
+#ifdef CED_ENABLE_EXTENSIONS
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_E) ||
+            cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_F) ||
+            cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_G))
+            *e->sidebar_tab = 0;
+#endif
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_E)) { e->panel = 0; e->sidebar = true; }
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_F)) { e->panel = 1; e->sidebar = true; }
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_G)) { e->panel = 2; e->sidebar = true; refresh_git(e); }

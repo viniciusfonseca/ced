@@ -7,6 +7,7 @@ CED 0.2.0 development implements phases 0 and 1 of the [architecture](arquitetur
 - Manifest format 1; exact `MAJOR.MINOR.PATCH` versions; API major 1, negotiated version `1.0`.
 - Executable packages with platform entrypoints (`darwin-arm64`, `darwin-x86_64`, `linux-arm64`, `linux-x86_64`), declared `onCommand:<own-command-id>` activation and `documents.read`/`documents.edit` capabilities.
 - Command titles/categories and AND conditions: `hasDocument`, `editorTextFocus`, `hasSelection`, `workspaceTrusted`, `languageId`.
+- Executable extensions can contribute native tabs to the sidebar and the terminal panel using [tab protocol 1](#native-tab-contributions).
 - Declarative configuration schemas with string/boolean/number defaults and user/workspace scope can be validated and installed. Effective configuration consumption/overrides are deferred; `configuration/get` is not advertised. Schema enums and numeric ranges are unsupported.
 - Lifecycle: `ced/initialize`, `ced/activate`, `commands/invoke`, `ced/deactivate`, `ced/cancel`.
 - Host methods: `editor/getContext`, `documents/list`, `documents/get`, `documents/applyEdits`, `window/showMessage`, `log/write`.
@@ -15,6 +16,36 @@ CED 0.2.0 development implements phases 0 and 1 of the [architecture](arquitetur
 All offsets are UTF-8 bytes, not character indexes or UTF-16 units. Documents have session-local opaque IDs and monotonic revisions. Real edits, native input, completion, undo and redo update the revision; saving, renaming and tab reordering preserve it. A prepared extension transaction validates every range, UTF-8 boundary, insertion and final selection before committing once through the private CUI adapter. The complete success envelope and an outgoing queue slot are reserved before commit, in addition to undo allocation. Allocation failure or queue saturation cannot commit an edit with a partial reply. Transport loss after a confirmed commit still has an unknown outcome and never triggers replay. No-op extension edits preserve the revision, selection and history. An initialized inactive tab can be edited without stealing focus; a tab that has never initialized its editor state returns `Unavailable`.
 
 Requests include the initialization context. Stale session/workspace/generation, document revision and optional selection revision are checked before a commit. A workspace switch invalidates requests before closing documents. Extension text edits run at the start of a UI frame, before rendering consumes buffer pointers. Document reads include unsaved text; API edits never save to disk. Legacy non-UTF-8 buffers remain open but text access returns `Unavailable`.
+
+## Native tab contributions
+
+The host advertises `host.tabProtocol: 1` in `ced/initialize`. A manifest can declare up to four tabs under `contributes.tabs`. Each has an extension-owned `id`, a `title` of up to 80 UTF-8 bytes, a `panel` of `"sidebar"` or `"terminal"`, and a `command` declared by the same extension. Each tab uses a different command with its normal `onCommand` activation and conditions.
+
+Selecting a tab lazily activates its command in a trusted workspace. The host sends ordinary `commands/invoke` requests with a single element in `arguments`, such as `[{"tabId":"example.tools.panel","action":"open","value":""}]`. Button clicks supply the action ID and an empty value. Submitting the optional input supplies its action ID and up to 8192 UTF-8 bytes of user input. Running the command directly still passes `null` arguments, and a successful result selects the contributed tab. Tab events receive an empty document context.
+
+The command returns a complete model for its tab.
+
+```json
+{
+  "tab": {
+    "heading": "Tools",
+    "text": "Ready.",
+    "actions": [{"id": "back", "label": "Back"}],
+    "input": {"id": "send", "label": "Send", "placeholder": "Message"},
+    "refresh": false
+  }
+}
+```
+
+The host renders plain text and native controls. `heading` is limited to 256 bytes, `text` to 24,000 bytes and `actions` to 32 entries with distinct IDs. Action and input IDs are limited to 128 bytes. `input` and `refresh` are optional. If `refresh` is true, the host sends the reserved `refresh` action about every 750 ms while the tab is displayed and idle. It should return a snapshot without side effects. Models are expected to fit the existing 64 KiB command response limit. Models and input drafts are cleared when the extension stops or the workspace changes.
+
+### Native tab widgets
+
+When `host.tabWidgets` is at least `1`, a model can also set `selectors` and `chat`. The basic tab fields still apply.
+
+- `selectors` holds up to two dropdowns. Each has an `id`, a `label` of up to 80 bytes, a `selected` option ID, an `options` array, and an optional `disabled` flag. Options use `{id, label}` with up to 256 distinct entries and 128 bytes per ID or label. Use an empty `selected` value when there is no selection and an empty `options` array when the control is unavailable. A choice sends the selector ID as `action` and the option ID as `value`. Return the confirmed selection in the next model.
+- `chat` has an `author` label of up to 80 bytes and a `messages` array of `{role, text}` objects in chronological order. Roles are `"user"` and `"agent"`. The array supports up to 64 messages and 9,000 bytes of combined message text. Agent messages render as Markdown. When `chat.status` is `"pending"`, `"running"`, or `"failed"`, the tab's `text` displays the corresponding status. The optional `input` becomes a multiline composer and supports an optional `disabled` flag. Enter submits an enabled draft, and Shift+Enter inserts a newline.
+- With `host.tabWidgets` at least `2`, a selector can set `placement: "composer"` to appear in the chat composer. Version `3` supports placing both selectors there. The first selector uses the CUI Model Picker. Large model catalogs can be searched via **Browse all models…**. When there is no chat input, the selectors appear above the transcript. A disabled input keeps the composer visible and preserves the draft.
 
 ## Installation and trust
 

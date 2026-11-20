@@ -3,6 +3,309 @@
 #include <string.h>
 #include <math.h>
 
+const CedExtensionTab *ced_extension_tab_find(CedExtensions *m, const char *id,
+    CedExtensionInstance **owner, size_t *index) {
+    if (!m || !*id || m->reload) return NULL;
+    for (size_t n = 0; n < m->count; n++) {
+        CedExtensionInstance *instance = &m->instances[n];
+        if (!instance->record.valid || !instance->record.enabled) continue;
+        for (size_t t = 0; t < instance->record.manifest.tab_count; t++) {
+            const CedExtensionTab *tab = &instance->record.manifest.tabs[t];
+            if (strcmp(id, tab->id)) continue;
+            if (owner) *owner = instance;
+            if (index) *index = t;
+            return tab;
+        }
+    }
+    return NULL;
+}
+
+bool ced_extension_tab_buttons(cui_ctx *ui, CedExtensions *m, bool terminal, char *selected) {
+    bool clicked = false;
+    if (!m || m->reload) return false;
+    for (size_t n = 0; n < m->count; n++) {
+        const CedExtensionRecord *record = &m->instances[n].record;
+        if (!record->valid || !record->enabled) continue;
+        for (size_t t = 0; t < record->manifest.tab_count; t++) {
+            const CedExtensionTab *tab = &record->manifest.tabs[t];
+            if (tab->terminal != terminal) continue;
+            cui_push_id(ui, tab->id);
+            const cui_button_opts options = {.size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST,
+                .tooltip = tab->title, .selected = !strcmp(tab->id, selected)};
+            if (terminal ? cui_button_ex(ui, tab->title, &options) : cui_icon_button_ex(ui, CUI_ICON_PACKAGE, &options)) {
+                snprintf(selected, 257, "%s", tab->id);
+                clicked = true;
+            }
+            cui_pop_id(ui);
+        }
+    }
+    return clicked;
+}
+
+bool ced_extension_has_tabs(const CedExtensions *m, bool terminal) {
+    if (!m || m->reload) return false;
+    for (size_t n = 0; n < m->count; n++) {
+        const CedExtensionRecord *record = &m->instances[n].record;
+        if (!record->valid || !record->enabled) continue;
+        for (size_t t = 0; t < record->manifest.tab_count; t++)
+            if (record->manifest.tabs[t].terminal == terminal) return true;
+    }
+    return false;
+}
+
+static bool composer_selector(const cJSON *selector) {
+    const char *placement = ced_ext_json_string(selector, "placement");
+    return placement && !strcmp(placement, "composer");
+}
+
+static void tab_selectors(cui_ctx *ui, CedExtensionInstance *instance, size_t index,
+    const cJSON *selectors, bool has_composer, bool toolbar, const cJSON *model, bool *busy) {
+    const cJSON *entry;
+    bool any = false;
+    cJSON_ArrayForEach(entry, selectors)
+        if (entry != model && (has_composer && composer_selector(entry)) == toolbar) any = true;
+    if (!any) return;
+    /* The composer reserves a 32 px button and 10 px inset on each side. */
+    cui_row(ui, .width = toolbar && model ? CUI_PCT(48) : CUI_FILL, .max_width = toolbar && model ? 220 : 0,
+            .gap = 6, .pad_left = toolbar && !model ? 48 : 0, .pad_right = toolbar ? 48 : 0,
+            .pad_bottom = toolbar ? 8 : 0) {
+        const cJSON *selector;
+        cJSON_ArrayForEach(selector, selectors) {
+            if (selector == model || (has_composer && composer_selector(selector)) != toolbar) continue;
+            const char *label = ced_ext_json_string(selector, "label");
+            const char *id = ced_ext_json_string(selector, "id");
+            const char *selected = ced_ext_json_string(selector, "selected");
+            const char *labels[CED_EXTENSION_TAB_CHOICES], *values[CED_EXTENSION_TAB_CHOICES];
+            int choice_count = 0, current = -1;
+            const cJSON *option;
+            cJSON_ArrayForEach(option, cJSON_GetObjectItemCaseSensitive(selector, "options")) {
+                values[choice_count] = ced_ext_json_string(option, "id");
+                labels[choice_count] = ced_ext_json_string(option, "label");
+                if (!strcmp(selected, values[choice_count])) current = choice_count;
+                choice_count++;
+            }
+            bool disabled = *busy || choice_count == 0 || cui_is_disabled(ui) ||
+                cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(selector, "disabled"));
+            bool changed = cui_select_ex(ui, id, labels, choice_count, &current, &(cui_select_opts){
+                .label = toolbar ? NULL : label, .placeholder = toolbar ? label : "Unavailable",
+                .width = CUI_FILL, .disabled = disabled, .searchable = choice_count > 8});
+            if (toolbar) cui_tooltip(ui, label);
+            if (changed && !disabled && current >= 0 && current < choice_count)
+                *busy = ced_extensions_tab_action(instance, index, id, values[current]);
+        }
+    }
+}
+
+static void tab_buttons(cui_ctx *ui, CedExtensionInstance *instance, size_t index,
+    const cJSON *actions, bool *busy) {
+    const cJSON *action;
+    cJSON_ArrayForEach(action, actions) {
+        const char *id = ced_ext_json_string(action, "id");
+        cui_push_id(ui, id);
+        if (cui_button(ui, ced_ext_json_string(action, "label"), .size = CUI_SIZE_SM,
+                .variant = CUI_BUTTON_SECONDARY, .disabled = *busy))
+            *busy = ced_extensions_tab_action(instance, index, id, "");
+        cui_pop_id(ui);
+    }
+}
+
+static void tab_chat(cui_ctx *ui, const cJSON *chat, const char *text) {
+    const char *author = ced_ext_json_string(chat, "author");
+    const char *previous_role = NULL;
+    const cJSON *message;
+    cJSON_ArrayForEach(message, cJSON_GetObjectItemCaseSensitive(chat, "messages")) {
+        const char *role = ced_ext_json_string(message, "role");
+        const char *next_role = ced_ext_json_string(message->next, "role");
+        bool mine = !strcmp(role, "user");
+        cui_chat_message(ui, ced_ext_json_string(message, "text"), .mine = mine, .author = author,
+            .grouped = previous_role && !strcmp(role, previous_role),
+            .last_in_group = !next_role || strcmp(role, next_role), .markdown = !mine);
+        previous_role = role;
+    }
+    if (!*text) return;
+    const char *status = ced_ext_json_string(chat, "status");
+    if (!status) cui_text(ui, text, .width = CUI_FILL);
+    else if (!strcmp(status, "pending")) cui_text(ui, text, .width = CUI_FILL, .color = CUI_COLOR_TEXT_SECONDARY);
+    else cui_agent_status(ui, text, .status = !strcmp(status, "failed") ? CUI_TASK_FAILED : CUI_TASK_RUNNING);
+}
+
+/* The native picker has a short menu. Larger catalogs are searchable from it. */
+enum { COMPOSER_QUICK_MODELS = 8, COMPOSER_LABEL_BYTES = 128 };
+
+static void fit_model_label(cui_ctx *ui, cui_model *model, char *label, size_t capacity, float available) {
+    const char *name = model->name;
+    const cui_theme *theme = cui_theme_get(ui);
+    float size = theme->text_sm * theme->font_scale;
+    size_t length = strlen(name);
+    if (!length || cui_measure_text(ui, CUI_FONT_MEDIUM, size, name, (int)length).width <= available) return;
+    available -= cui_measure_text(ui, CUI_FONT_MEDIUM, size, "…", -1).width;
+    size_t end = length;
+    do {
+        do { end--; } while (end && !ced_utf8_boundary(name, length, end));
+    } while (end && cui_measure_text(ui, CUI_FONT_MEDIUM, size, name, (int)end).width > available);
+    snprintf(label, capacity, "%.*s…", (int)end, name);
+    model->name = label;
+    model->detail = name;
+}
+
+static void tab_composer(cui_ctx *ui, CedExtensionInstance *instance, size_t index,
+    const cJSON *input, const cJSON *selectors, bool *busy) {
+    CedExtensionTabState *state = &instance->tabs[index];
+    bool disabled = *busy || state->submitted || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(input, "disabled"));
+    const cJSON *model;
+    cJSON_ArrayForEach(model, selectors) {
+        if (composer_selector(model)) break;
+    }
+    const cJSON *options = cJSON_GetObjectItemCaseSensitive(model, "options");
+    const char *selected = ced_ext_json_string(model, "selected");
+    const char *values[CED_EXTENSION_TAB_CHOICES];
+    cui_command catalog[CED_EXTENSION_TAB_CHOICES] = {0};
+    int count = 0, current = -1;
+    const cJSON *option;
+    cJSON_ArrayForEach(option, options) {
+        values[count] = ced_ext_json_string(option, "id");
+        catalog[count].title = ced_ext_json_string(option, "label");
+        catalog[count].group = "Models";
+        if (!strcmp(selected, values[count])) current = count;
+        count++;
+    }
+    bool model_disabled = disabled || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(model, "disabled"));
+    bool overflow = count > COMPOSER_QUICK_MODELS;
+    cui_model quick[COMPOSER_QUICK_MODELS] = {0};
+    int mapped[COMPOSER_QUICK_MODELS];
+    int quick_count = 0, picked = 0;
+    if (current >= 0) {
+        if (overflow || model_disabled) {
+            mapped[quick_count] = current;
+            quick[quick_count++].name = catalog[current].title;
+            if (!model_disabled) {
+                mapped[quick_count] = -1;
+                quick[quick_count++].name = "Browse all models…";
+            }
+        } else {
+            for (int n = 0; n < count; n++) {
+                mapped[n] = n;
+                quick[n].name = catalog[n].title;
+            }
+            quick_count = count;
+            picked = current;
+        }
+    }
+    char compact[COMPOSER_LABEL_BYTES + 4];
+    float width = cui_get_rect(ui, cui_make_id(ui, "tab-input")).w;
+    if (quick_count && width > 0) {
+        float effort_width = cJSON_GetArraySize(selectors) > 1 ? fminf(width * .48f, 220) : 48;
+        fit_model_label(ui, &quick[picked], compact, sizeof compact, width - effort_width - 92);
+    }
+
+    int event = 0;
+    cui_push_disabled(ui, disabled);
+    cui_box(ui, .dir = CUI_STACK, .width = CUI_FILL, .align = CUI_ALIGN_END, .justify = CUI_JUSTIFY_END) {
+        event = cui_chat_composer(ui, "tab-input", state->input, sizeof state->input,
+            .placeholder = ced_ext_json_string(input, "placeholder"), .width = CUI_FILL, .max_lines = 3,
+            .models = quick, .model_count = quick_count, .model = &picked);
+        tab_selectors(ui, instance, index, selectors, true, true, quick_count ? model : NULL, busy);
+    }
+    cui_pop_disabled(ui);
+
+    bool *browse = cui_state(ui, cui_make_id(ui, "browse-models"), sizeof *browse);
+    if (model_disabled || !overflow) *browse = false;
+    int choice = -1;
+    if (!model_disabled && (event & CUI_COMPOSER_MODEL) && picked >= 0 && picked < quick_count) {
+        choice = mapped[picked];
+        if (choice < 0) *browse = true;
+    }
+    if (overflow && quick_count) {
+        int result = cui_command_palette(ui, browse, catalog, count);
+        if (result >= 0) choice = result;
+    }
+    if (disabled || *busy) return;
+    if (choice >= 0 && choice < count && choice != current) {
+        *busy = ced_extensions_tab_action(instance, index, ced_ext_json_string(model, "id"), values[choice]);
+        return;
+    }
+    if ((event & CUI_COMPOSER_SEND) && *state->input) {
+        *busy = ced_extensions_tab_action(instance, index, ced_ext_json_string(input, "id"), state->input);
+        state->submitted = *busy;
+    } else if (event & CUI_COMPOSER_ATTACH) {
+        cui_toast_ex(ui, "File attachments are unavailable in this chat.", NULL);
+    }
+}
+
+void ced_extension_tab_body(cui_ctx *ui, CedExtensions *m, const char *selected) {
+    CedExtensionInstance *instance;
+    size_t index;
+    if (!ced_extension_tab_find(m, selected, &instance, &index)) return;
+    cui_push_id(ui, selected);
+    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 8, .gap = 6) {
+        CedExtensionTabState *state = &instance->tabs[index];
+        if (!m->trusted) {
+            if (cui_button(ui, "Trust Workspace", .size = CUI_SIZE_SM, .disabled = m->job.running))
+                m->trust_open = true;
+        } else {
+            bool busy = m->job.running || instance->state == EXT_STOPPING || *instance->command;
+            if (!state->requested && !busy && instance->state != EXT_FAILED && !*instance->error) {
+                state->requested = true;
+                ced_extensions_tab_action(instance, index, "open", "");
+                busy = *instance->command != 0;
+            }
+            if (*instance->error) cui_text(ui, instance->error, .size = 12, .width = CUI_FILL);
+            if (state->model) {
+                const cJSON *model = state->model;
+                const char *heading = ced_ext_json_string(model, "heading");
+                const cJSON *chat = cJSON_GetObjectItemCaseSensitive(model, "chat");
+                const cJSON *actions = cJSON_GetObjectItemCaseSensitive(model, "actions");
+                const cJSON *input = cJSON_GetObjectItemCaseSensitive(model, "input");
+                const cJSON *selectors = cJSON_GetObjectItemCaseSensitive(model, "selectors");
+                const char *text = ced_ext_json_string(model, "text");
+                if (chat) {
+                    cui_row(ui, .width = CUI_FILL, .gap = 4, .align = CUI_ALIGN_CENTER, .wrap = true) {
+                        if (*heading) cui_text(ui, heading, .font = CUI_FONT_MEDIUM, .nowrap = true, .width = CUI_FILL);
+                        tab_buttons(ui, instance, index, actions, &busy);
+                    }
+                } else if (*heading) cui_text(ui, heading, .font = CUI_FONT_MEDIUM, .width = CUI_FILL);
+                tab_selectors(ui, instance, index, selectors, chat && input, false, NULL, &busy);
+                cui_scroll(ui, .id = chat ? "chat" : "contents", .height = CUI_FILL, .width = CUI_FILL, .gap = 4) {
+                    if (chat) tab_chat(ui, chat, text);
+                    else {
+                        tab_buttons(ui, instance, index, actions, &busy);
+                        if (*text) cui_text(ui, text, .width = CUI_FILL);
+                    }
+                }
+                if (input) {
+                    const char *input_id = ced_ext_json_string(input, "id");
+                    const char *placeholder = ced_ext_json_string(input, "placeholder");
+                    bool disabled = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(input, "disabled"));
+                    cui_push_id(ui, input_id);
+                    if (chat) tab_composer(ui, instance, index, input, selectors, &busy);
+                    else cui_row(ui, .width = CUI_FILL, .gap = 4, .align = CUI_ALIGN_END) {
+                        int changed = cui_input(ui, "tab-input", state->input, sizeof state->input,
+                            .placeholder = placeholder, .width = CUI_FILL,
+                            .disabled = disabled || state->submitted);
+                        bool send = cui_button(ui, ced_ext_json_string(input, "label"), .size = CUI_SIZE_SM,
+                            .variant = CUI_BUTTON_PRIMARY, .disabled = busy || disabled || !*state->input);
+                        if (!busy && !disabled && *state->input && (send || (changed & CUI_SUBMITTED))) {
+                            busy = ced_extensions_tab_action(instance, index, input_id, state->input);
+                            state->submitted = busy;
+                        }
+                    }
+                    cui_pop_id(ui);
+                }
+                if (!busy && !*instance->error && ced_ext_now() >= state->next_refresh &&
+                    cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(model, "refresh"))) {
+                    state->next_refresh = ced_ext_now() + .75;
+                    ced_extensions_tab_action(instance, index, "refresh", "");
+                }
+            } else if (busy) cui_secondary(ui, "Loading…");
+            else if (cui_button(ui, "Open", .size = CUI_SIZE_SM)) {
+                if (instance->state == EXT_FAILED && !instance->process) instance->state = EXT_REGISTERED;
+                ced_extensions_tab_action(instance, index, "open", "");
+            }
+        }
+    }
+    cui_pop_id(ui);
+}
+
 bool ced_extensions_panel(cui_ctx *ui, const CedExtensions *m) {
     bool install = false;
     bool updating = m && (m->job.running || m->reload);
@@ -120,6 +423,10 @@ void ced_extensions_ui(cui_ctx *ui, CedExtensions *m) {
             cui_text(ui, r->manifest.version, .size = 13);
             cui_text(ui, r->source, .size = 13);
             cui_text(ui, r->hash, .size = 13);
+            for (size_t n = 0; n < r->manifest.tab_count; n++) {
+                const CedExtensionTab *tab = &r->manifest.tabs[n];
+                cui_textf(ui, "%s tab: %s", tab->terminal ? "Terminal" : "Sidebar", tab->title);
+            }
             if (r->manifest.capabilities & CED_EXT_READ) cui_text(ui, "Permission: read authorized open documents", .size = 13);
             if (r->manifest.capabilities & CED_EXT_EDIT) cui_text(ui, "Permission: edit authorized open documents", .size = 13);
             cJSON *requirement;

@@ -165,7 +165,7 @@ Unknown fields are errors at every manifest object level, except for arbitrary J
 | `capabilities` | Required for executable; unique string array, possibly empty | Only `documents.read` and `documents.edit` are defined. Edit requires read. |
 | `untrustedWorkspaces` | Required for executable; `false` | Executables cannot run in untrusted workspaces in this version. |
 | `requirements` | Optional; array | Each item is exactly `{ "name": string, "minVersion": string }`; informational external tool/runtime requirement, not an install instruction. |
-| `contributes` | Optional; object | Only `commands`, `keybindings`, `menus`, and `configuration` arrays. Missing arrays mean empty arrays. |
+| `contributes` | Optional; object | `commands`, `keybindings`, `menus`, `configuration`, and [native tabs](extensions.md#native-tab-contributions). See the host profile for supported arrays. Missing arrays mean empty arrays. |
 | `metadata` | Optional; object | Non-executable author metadata, still subject to file size/depth limits. |
 
 Display strings MUST be valid UTF-8, contain no NUL or terminal escape sequences, and fit 512 encoded bytes. Entrypoint paths MUST be nonempty and shorter than 4,096 UTF-8 bytes. Local command suffixes and configuration key suffixes use `[a-zA-Z0-9_-]+` components separated by `.`, following `<extension-id>.`; the full ID/key MUST fit 256 ASCII bytes. IDs/keys are case-sensitive.
@@ -301,7 +301,7 @@ The extension transitions through `waiting-for-initialize → initialized → ac
 
 ```typescript
 type InitializeParams = {
-  host: { name: "CED"; version: Version };
+  host: { name: "CED"; version: Version; tabProtocol?: 1; tabWidgets?: 1 | 2 | 3 };
   extension: { id: string; version: Version };
   apiVersions: string[]; // exact values, initially ["1.0"]
   context: Context; // establishes context; no prior-context check
