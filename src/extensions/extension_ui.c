@@ -3,6 +3,40 @@
 #include <string.h>
 #include <math.h>
 
+bool ced_extensions_panel(cui_ctx *ui, const CedExtensions *m) {
+    bool install = false;
+    bool updating = m && (m->job.running || m->reload);
+    cui_row(ui, .width = CUI_FILL, .align = CUI_ALIGN_CENTER, .gap = 6) {
+        cui_text(ui, "Extensions", .font = CUI_FONT_MEDIUM, .width = CUI_FILL);
+        install = cui_icon_button(ui, CUI_ICON_PLUS, .size = CUI_SIZE_SM,
+            .variant = CUI_BUTTON_GHOST, .tooltip = "Install Extension from Folder",
+            .disabled = !m || updating || m->review_open);
+    }
+    if (!m) {
+        cui_secondary(ui, "Extensions are disabled.");
+        return false;
+    }
+    if (updating) cui_secondary(ui, "Updating extensions...");
+    else if (!m->count) cui_secondary(ui, "No installed extensions");
+    if (*m->error) cui_text(ui, m->error, .size = 12, .width = CUI_FILL);
+    cui_scroll(ui, .id = "installed-extensions", .height = CUI_FILL, .gap = 8) {
+        for (size_t n = 0; n < m->count; n++) {
+            const CedExtensionInstance *instance = &m->instances[n];
+            const CedExtensionManifest *manifest = &instance->record.manifest;
+            cui_column(ui, .width = CUI_FILL, .gap = 2) {
+                cui_text(ui, *manifest->name ? manifest->name : manifest->id,
+                    .size = 13, .font = CUI_FONT_MEDIUM, .nowrap = true, .width = CUI_FILL);
+                char detail[128];
+                snprintf(detail, sizeof detail, "%s%s%s", manifest->version,
+                    *manifest->version ? " · " : "", ced_extensions_status(instance));
+                cui_text(ui, detail, .size = 12, .color = CUI_COLOR_TEXT_SECONDARY,
+                    .nowrap = true, .width = CUI_FILL);
+            }
+        }
+    }
+    return install;
+}
+
 void ced_extensions_ui(cui_ctx *ui, CedExtensions *m) {
     if (!m) return;
     cui_dialog(ui, "Manage Extensions · Experimental", &m->manage_open, .width = 720) {
@@ -26,6 +60,9 @@ void ced_extensions_ui(cui_ctx *ui, CedExtensions *m) {
             break;
         }
         cui_scroll(ui, .id = "extension-list", .height = CUI_PX(fmaxf(100, fminf(340, cui_viewport_size(ui).y - 460))), .gap = 12) {
+            cui_theme *theme = cui_theme_get(ui);
+            float radius = theme->radius_control;
+            theme->radius_control = 0;
             for (size_t n = 0; n < m->count; n++) {
                 CedExtensionInstance *i = &m->instances[n];
                 cui_push_id_int(ui, (int)n);
@@ -71,6 +108,7 @@ void ced_extensions_ui(cui_ctx *ui, CedExtensions *m) {
                 }
                 cui_pop_id(ui);
             }
+            theme->radius_control = radius;
         }
         cui_dialog_footer(ui) { if (cui_button(ui, "Close", .size = CUI_SIZE_SM)) m->manage_open = false; }
     }

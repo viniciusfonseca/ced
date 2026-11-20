@@ -12,12 +12,98 @@ bool ced_tree_begin(cui_ctx *ui, const char *label, bool *open, const cui_tree_o
     /* The pinned CUI creates the row first and fixes its height at 30 px.
      * Adjust its layout so drawing and hit testing both use the compact height. */
     ui->nodes[row].h = CUI_PX(24);
+    ui->nodes[row].radius = CUI_CORNERS(0);
     ui->nodes[row].opacity = ignored ? 0.5f : 1.0f;
     return expanded;
 }
 
+bool ced_list_item_ex(cui_ctx *ui, const char *label, const cui_list_item_opts *opts) {
+    int row = ui->node_count;
+    bool clicked = cui_list_item_ex(ui, label, opts);
+    ui->nodes[row].radius = CUI_CORNERS(0);
+    return clicked;
+}
+
+/* CUI paints the animated navigation selection separately from the row. */
+extern void cui__paint_nav_highlight(cui_ctx *ui, cui_node *node, void *data);
+
+static void paint_square_nav_highlight(cui_ctx *ui, cui_node *node, void *data) {
+    if (node->abs_anchor < 0) return;
+    cui_rect rect = node->rect;
+    rect.w = ui->nodes[node->abs_anchor].rect.w;
+    cui_draw_rect(ui, rect, CUI_CORNERS(0), *(const cui_color *)data);
+}
+
+bool ced_nav_item_ex(cui_ctx *ui, const char *label, const cui_nav_opts *opts) {
+    int row = ui->node_count;
+    bool clicked = cui_nav_item_ex(ui, label, opts);
+    ui->nodes[row].radius = CUI_CORNERS(0);
+    for (int i = row + 1; i < ui->node_count; i++) {
+        cui_node *node = &ui->nodes[i];
+        if (node->paint != cui__paint_nav_highlight) continue;
+        cui_color *color = CUI_PAINT_DATA(ui, cui_color);
+        *color = CUI_C(ui, ACTIVE);
+        node->paint_data = color;
+        node->paint = paint_square_nav_highlight;
+    }
+    return clicked;
+}
+
+bool ced_menu_item_ex(cui_ctx *ui, const char *label, const cui_menu_item_opts *opts) {
+    int row = ui->node_count;
+    bool clicked = cui_menu_item_ex(ui, label, opts);
+    ui->nodes[row].radius = CUI_CORNERS(0);
+    return clicked;
+}
+
+int ced_command_palette(cui_ctx *ui, bool *open, const cui_command *commands, int count) {
+    int first = ui->node_count;
+    int selected = cui_command_palette(ui, open, commands, count);
+    /* The pinned palette builds command rows directly in its scroll area. */
+    for (int i = first; i < ui->node_count; i++) {
+        cui_node *node = &ui->nodes[i];
+        if ((node->flags & CUI_NF_INTERACTIVE) && node->parent >= first &&
+            (ui->nodes[node->parent].flags & CUI_NF_SCROLL_Y))
+            node->radius = CUI_CORNERS(0);
+    }
+    return selected;
+}
+
+bool ced_anchored_menu_begin(cui_ctx *ui, const char *id, float width) {
+    return cui__popup_begin(ui, cui_make_id(ui, id), cui_last_id(ui),
+        CUI_PLACE_BOTTOM_START, width, 6, 0, true);
+}
+
 void ced_editor_touch(cui_ctx *ui, const char *id) {
     cui__state_entry(ui, cui_make_id(ui, id) ^ EDITOR_SALT);
+}
+
+int ced_editor_tabs_close_menu(cui_ctx *ui, const char *id, const cui_doc_tab *tabs, int count) {
+    cui_id previous = ui->last_id;
+    ui->last_id = 0;
+    cui_push_id(ui, id);
+    cui_id *target = cui_state(ui, cui_make_id(ui, "tab-context-target"), sizeof *target);
+    int keep = -1;
+    for (int i = 0; i < count; i++) {
+        /* The pinned CUI scopes tab IDs by the strip ID and derives the
+         * close button ID from the tab title in cui__dtf_build_tab. */
+        cui_id tab = cui_make_id(ui, tabs[i].title);
+        if (ui->mpressed[CUI_MOUSE_RIGHT] && (ui->hot == tab || ui->hot == (tab ^ 0xC105Eu))) {
+            ui->last_id = ui->hot;
+            *target = tab;
+            keep = i;
+            break;
+        }
+        if (*target == tab) keep = i;
+    }
+    int action = CED_TAB_MENU_NONE;
+    cui_context_menu(ui, "tab-context") {
+        if (ced_menu_item_ex(ui, "Close All Tabs", NULL)) action = CED_TAB_MENU_CLOSE_ALL;
+        if (ced_menu_item(ui, "Close Other Tabs", .disabled = count < 2 || keep < 0)) action = keep;
+    }
+    cui_pop_id(ui);
+    ui->last_id = previous;
+    return action;
 }
 
 cui_code_editor_result ced_editor_render(cui_ctx *ui, const char *id, CedDocument *doc,

@@ -29,7 +29,46 @@ static void frame(float dt) {
 
 static void release(cui_key key) { cui_input_key(ui, key, false, 0); frame(0.02f); }
 
+static int tab_menu_frame(cui_ctx *ctx, const cui_doc_tab *tabs, int *selected) {
+    cui_begin_frame(ctx, 0.05f);
+    cui_doc_tabs(ctx, "documents", tabs, 2, selected);
+    int close = ced_editor_tabs_close_menu(ctx, "documents", tabs, 2);
+    cui_end_frame(ctx);
+    return close;
+}
+
+static void test_tab_menu(int action) {
+    cui_ctx *ctx = cui_create(NULL);
+    assert(ctx);
+    cui_set_viewport(ctx, 800, 500, 1);
+    cui_input_focus(ctx, true);
+    const cui_doc_tab tabs[] = {{.title = "first.c"}, {.title = "second.c"}};
+    int selected = 1;
+    assert(tab_menu_frame(ctx, tabs, &selected) == CED_TAB_MENU_NONE);
+    cui_push_id(ctx, "documents");
+    cui_rect first = cui_get_rect(ctx, cui_make_id(ctx, tabs[0].title));
+    cui_pop_id(ctx);
+    assert(first.w > 0 && first.h > 0);
+    cui_input_mouse_move(ctx, first.x + 8, first.y + first.h / 2);
+    cui_input_mouse_button(ctx, CUI_MOUSE_RIGHT, true);
+    assert(tab_menu_frame(ctx, tabs, &selected) == CED_TAB_MENU_NONE);
+    cui_input_mouse_button(ctx, CUI_MOUSE_RIGHT, false);
+    assert(tab_menu_frame(ctx, tabs, &selected) == CED_TAB_MENU_NONE);
+    for (int i = 0; i < (action == CED_TAB_MENU_CLOSE_ALL ? 1 : 2); i++) {
+        cui_input_key(ctx, CUI_KEY_DOWN, true, 0);
+        assert(tab_menu_frame(ctx, tabs, &selected) == CED_TAB_MENU_NONE);
+        cui_input_key(ctx, CUI_KEY_DOWN, false, 0);
+        assert(tab_menu_frame(ctx, tabs, &selected) == CED_TAB_MENU_NONE);
+    }
+    cui_input_key(ctx, CUI_KEY_ENTER, true, 0);
+    assert(tab_menu_frame(ctx, tabs, &selected) == action);
+    assert(selected == 1);
+    cui_destroy(ctx);
+}
+
 int main(void) {
+    test_tab_menu(CED_TAB_MENU_CLOSE_ALL);
+    test_tab_menu(0); /* The first tab was clicked even though the second is active. */
     ui = cui_create(NULL); assert(ui);
     cui_set_viewport(ui, 800, 500, 1);
     cui_input_focus(ui, true);

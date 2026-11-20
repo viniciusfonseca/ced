@@ -1,4 +1,5 @@
 #include "editor_assist.h"
+#include "editor_bridge.h"
 #include "cui_internal.h"
 #include <ctype.h>
 
@@ -187,7 +188,7 @@ int ced_assist_draw(cui_ctx *ui, CedEditorAssist *a) {
                 cui_push_id_int(ui, i);
                 int row = ui->node_count;
                 const char *detail = a->completions[i].detail;
-                if (cui_nav_item(ui, a->completions[i].label, .icon = CUI_ICON_CODE,
+                if (ced_nav_item(ui, a->completions[i].label, .icon = CUI_ICON_CODE,
                         .badge = *detail ? detail : NULL, .selected = i == a->selected)) selected = i;
                 /* Adapt the pinned CUI navigation row without changing its input handling. */
                 cui_node *node = &ui->nodes[row];

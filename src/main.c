@@ -69,9 +69,12 @@ typedef struct {
     CedSearch search;
     EditorTab docs[MAX_DOCS];
     int count, selected, next_id, panel, close_index;
+    int close_keep_id;
     float split;
     int font_size;
     CedPreferences preferences;
+    CedRecentFolders recent_folders;
+    bool open_menu_requested;
     CedEditorFont editor_font;
     bool preferences_loaded, preferences_reload;
     double next_preferences_poll;
@@ -321,6 +324,29 @@ static void request_close(Editor *e, int index) {
     } else remove_tab(e, index);
 }
 
+static void close_tabs_except(Editor *e, int keep_id) {
+    for (int i = e->count - 1; i >= 0; i--)
+        if (e->docs[i].id != keep_id) remove_tab(e, i);
+    if (e->count) {
+        e->selected = 0;
+        e->docs[0].focus = true;
+    }
+    e->diff = false;
+    ced_assist_reset(&e->assist);
+}
+
+static void request_close_tabs(Editor *e, int keep_id) {
+    for (int i = 0; i < e->count; i++) {
+        if (e->docs[i].id != keep_id && ced_document_dirty(&e->docs[i].file)) {
+            e->close_index = -1;
+            e->close_keep_id = keep_id;
+            e->close_dialog = true;
+            return;
+        }
+    }
+    close_tabs_except(e, keep_id);
+}
+
 static void poll_preferences(cui_ctx *ui, Editor *e) {
     double now=cui_time(ui);
     if (!e->preferences_reload && now<e->next_preferences_poll) return;
@@ -435,13 +461,13 @@ static void restore_recovery(Editor *e) {
     if (restored) notify(e, "Recovered unsaved files.");
 }
 
-static void choose_folder(Editor *e) {
-    if (e->git_sync.running) { notify(e, "Wait for the Git operation to finish."); return; }
-    char path[CED_PATH], error[CED_ERROR];
-    if (!cui_app_file_dialog(e->app, &(cui_file_dialog_opts){.kind = CUI_FILE_FOLDER, .title = "Open Folder"}, path, sizeof path)) return;
-    if (!write_recovery(e)) { notify(e, "Recovery failed. Save your files before switching folders."); return; }
+static bool open_folder(Editor *e, const char *path) {
+    if (e->git_sync.running) { notify(e, "Wait for the Git operation to finish."); return false; }
+    if (!strcmp(path, e->workspace.root)) return true;
+    if (!write_recovery(e)) { notify(e, "Recovery failed. Save your files before switching folders."); return false; }
     CedWorkspace next = {0};
-    if (!ced_workspace_open(&next, path, error)) { notify(e, error); return; }
+    char error[CED_ERROR];
+    if (!ced_workspace_open(&next, path, error)) { notify(e, error); return false; }
 #ifdef CED_ENABLE_EXTENSIONS
     ced_extensions_workspace(e->extensions, next.root);
 #endif
@@ -460,6 +486,45 @@ static void choose_folder(Editor *e) {
     recovery_path(e);
     restore_recovery(e);
     if (!e->count) notify(e, "Folder opened.");
+    if (!ced_recent_folder_record(e->workspace.root)) notify(e, "Could not save recent folders.");
+    return true;
+}
+
+static void choose_folder(Editor *e) {
+    if (e->git_sync.running) { notify(e, "Wait for the Git operation to finish."); return; }
+    char path[CED_PATH];
+    if (cui_app_file_dialog(e->app, &(cui_file_dialog_opts){.kind = CUI_FILE_FOLDER, .title = "Open Folder"}, path, sizeof path))
+        open_folder(e, path);
+}
+
+static void open_folder_menu(cui_ctx *ui, Editor *e) {
+    const char *id = "open-folder-menu";
+    bool open = cui_popover_is_open(ui, id);
+    bool clicked = cui_toolbar_button(ui, CUI_ICON_FOLDER_OPEN, .label = "Open", .flyout = true);
+    bool keyboard = cui_key_pressed(ui, CUI_KEY_ENTER) || cui_key_pressed(ui, CUI_KEY_SPACE);
+    if ((!open && clicked) || e->open_menu_requested) {
+        char error[CED_ERROR];
+        if (!ced_recent_folders_load(&e->recent_folders, error)) notify(e, error);
+        cui_popover_open(ui, id);
+        e->open_menu_requested = false;
+        ced_assist_reset(&e->assist);
+    } else if (clicked && !keyboard) {
+        cui_popover_close(ui, id);
+    }
+    if (ced_anchored_menu_begin(ui, id, 360)) {
+        const char *recent = NULL;
+        for (size_t i = 0; i < e->recent_folders.count; i++) {
+            const char *path = e->recent_folders.paths[i];
+            cui_push_id_int(ui, (int)i);
+            if (ced_menu_item(ui, path, .icon = CUI_ICON_FOLDER, .disabled = e->git_sync.running)) recent = path;
+            cui_pop_id(ui);
+        }
+        if (e->recent_folders.count) cui_menu_separator(ui);
+        bool browse = ced_menu_item(ui, "Open Folder…", .icon = CUI_ICON_FOLDER_OPEN, .disabled = e->git_sync.running);
+        cui_menu_end(ui);
+        if (recent) open_folder(e, recent);
+        else if (browse) dispatch(e, "ced.workspace.open");
+    }
 }
 
 static void lsp_tick(Editor *e) {
@@ -562,12 +627,12 @@ static void request_file_action(Editor *e, FileOperation operation, const char *
 
 static void file_context_menu(cui_ctx *ui, Editor *e, const char *path, bool directory, bool root) {
     cui_context_menu(ui, "file-context") {
-        if (cui_menu_item(ui, "New File...", .icon = CUI_ICON_PLUS)) request_file_action(e, CED_FILE_CREATE, path, directory);
-        if (cui_menu_item(ui, "New Folder...", .icon = CUI_ICON_FOLDER)) request_file_action(e, CED_DIRECTORY_CREATE, path, directory);
+        if (ced_menu_item(ui, "New File...", .icon = CUI_ICON_PLUS)) request_file_action(e, CED_FILE_CREATE, path, directory);
+        if (ced_menu_item(ui, "New Folder...", .icon = CUI_ICON_FOLDER)) request_file_action(e, CED_DIRECTORY_CREATE, path, directory);
         if (!root) {
-            if (cui_menu_item(ui, "Rename...", .icon = CUI_ICON_SQUARE_PEN)) request_file_action(e, CED_FILE_RENAME, path, directory);
+            if (ced_menu_item(ui, "Rename...", .icon = CUI_ICON_SQUARE_PEN)) request_file_action(e, CED_FILE_RENAME, path, directory);
             cui_menu_separator(ui);
-            if (cui_menu_item(ui, "Delete", .icon = CUI_ICON_TRASH_2, .danger = true)) request_file_action(e, CED_FILE_DELETE, path, directory);
+            if (ced_menu_item(ui, "Delete", .icon = CUI_ICON_TRASH_2, .danger = true)) request_file_action(e, CED_FILE_DELETE, path, directory);
         }
     }
 }
@@ -688,7 +753,7 @@ static void search_panel(cui_ctx *ui, Editor *e) {
                 char label[CED_PATH + 30];
                 snprintf(label, sizeof label, "%s:%d", hit->path, hit->line);
                 cui_push_id_int(ui, i);
-                if (cui_list_item(ui, label, .subtitle = hit->preview, .icon = CUI_ICON_SEARCH)) {
+                if (ced_list_item(ui, label, .subtitle = hit->preview, .icon = CUI_ICON_SEARCH)) {
                     char path[CED_PATH];
                     if (ced_join(path, sizeof path, e->workspace.root, hit->path)) open_document(e, path, hit->line, hit->column);
                 }
@@ -729,6 +794,9 @@ static void git_panel(cui_ctx *ui, Editor *e) {
         if (cui_button(ui, "Pull", .icon = CUI_ICON_DOWNLOAD, .size = CUI_SIZE_SM, .full_width = true)) start_git_sync(e, true);
     }
     cui_scroll(ui, .id = "git-changes", .height = CUI_FILL, .gap = 2) {
+        cui_theme *theme = cui_theme_get(ui);
+        float radius = theme->radius_control;
+        theme->radius_control = 0;
         if (!e->git.count) cui_secondary(ui, "No changes.");
         bool mutated = false;
         for (int group = 0; group < 2 && !mutated; group++) {
@@ -755,7 +823,7 @@ static void git_panel(cui_ctx *ui, Editor *e) {
                 cui_push_id_int(ui, group * CED_MAX_CHANGES + i);
                 cui_row(ui, .gap = 2) {
                     cui_column(ui, .width = CUI_FILL) {
-                        if (cui_nav_item(ui, label, .selected = e->diff && e->diff_staged == staged && !strcmp(e->diff_path, change->path))) open_diff(e, change, staged);
+                        if (ced_nav_item(ui, label, .selected = e->diff && e->diff_staged == staged && !strcmp(e->diff_path, change->path))) open_diff(e, change, staged);
                     }
                     if (!staged && cui_icon_button(ui, CUI_ICON_TRASH_2, .size = CUI_SIZE_SM,
                             .variant = CUI_BUTTON_GHOST, .tooltip = "Discard Changes")) {
@@ -784,39 +852,55 @@ static void git_panel(cui_ctx *ui, Editor *e) {
         }
         if (mutated) refresh_git(e);
         if (e->git.truncated) cui_secondary(ui, "Showing first 4096 changes.");
+        theme->radius_control = radius;
     }
     cui_pop_disabled(ui);
 }
 
 static void sidebar(cui_ctx *ui, Editor *e) {
-    static const char *labels[] = {"Files", "Search", "Git"};
-    static const char *icons[] = {CUI_ICON_FOLDER, CUI_ICON_SEARCH, CUI_ICON_GIT_BRANCH};
+    static const struct { const char *label, *icon; } tabs[] = {
+        {"Files", CUI_ICON_FOLDER}, {"Search", CUI_ICON_SEARCH}, {"Git", CUI_ICON_GIT_BRANCH},
+#ifdef CED_ENABLE_EXTENSIONS
+        {"Extensions", CUI_ICON_PACKAGE},
+#endif
+    };
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .bg = CUI_COLOR_SURFACE_MUTED, .clip = true) {
         int old = e->panel;
         cui_row(ui, .width = CUI_FILL, .gap = 0, .pad = 0) {
-            for (int i = 0; i < 3; i++)
-                if (cui_icon_button(ui, icons[i], .tooltip = labels[i], .size = CUI_SIZE_SM, .selected = e->panel == i)) e->panel = i;
+            cui_theme *theme = cui_theme_get(ui);
+            float radius = theme->radius_control;
+            theme->radius_control = 0;
+            for (int i = 0; i < (int)(sizeof tabs / sizeof *tabs); i++)
+                if (cui_icon_button(ui, tabs[i].icon, .tooltip = tabs[i].label, .size = CUI_SIZE_SM, .selected = e->panel == i)) e->panel = i;
+            theme->radius_control = radius;
         }
         if (old != e->panel && e->panel == 2) refresh_git(e);
         cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 10, .gap = 10) {
-            cui_row(ui, .gap = 4) {
-                cui_column(ui, .width = CUI_FILL) {
-                    cui_nav_item(ui, ced_basename(e->workspace.root), .icon = CUI_ICON_FOLDER);
-                    file_context_menu(ui, e, e->workspace.root, true, true);
+#ifdef CED_ENABLE_EXTENSIONS
+            if (e->panel == 3) {
+                if (ced_extensions_panel(ui, e->extensions)) dispatch(e, "ced.extensions.install");
+            } else
+#endif
+            {
+                cui_row(ui, .gap = 4) {
+                    cui_column(ui, .width = CUI_FILL) {
+                        ced_nav_item(ui, ced_basename(e->workspace.root), .icon = CUI_ICON_FOLDER);
+                        file_context_menu(ui, e, e->workspace.root, true, true);
+                    }
+                    if (cui_icon_button(ui, CUI_ICON_REFRESH_CW, .size = CUI_SIZE_SM, .tooltip = "Refresh Files and Git")) {
+                        refresh(e);
+                        if (e->panel == 1 && e->query[0]) ced_search_start(&e->search, &e->workspace, e->query);
+                    }
                 }
-                if (cui_icon_button(ui, CUI_ICON_REFRESH_CW, .size = CUI_SIZE_SM, .tooltip = "Refresh Files and Git")) {
-                    refresh(e);
-                    if (e->panel == 1 && e->query[0]) ced_search_start(&e->search, &e->workspace, e->query);
-                }
+                if (e->panel == 0) {
+                    cui_scroll(ui, .id = "files", .height = CUI_FILL) {
+                        for (int i = 0; i < e->workspace.count;) i = tree_node(ui, e, i);
+                        if (!e->workspace.count) cui_secondary(ui, "Empty folder.");
+                    }
+                    if (e->workspace.truncated) cui_secondary(ui, "Partial listing: limit reached or access denied.");
+                } else if (e->panel == 1) search_panel(ui, e);
+                else git_panel(ui, e);
             }
-            if (e->panel == 0) {
-                cui_scroll(ui, .id = "files", .height = CUI_FILL) {
-                    for (int i = 0; i < e->workspace.count;) i = tree_node(ui, e, i);
-                    if (!e->workspace.count) cui_secondary(ui, "Empty folder.");
-                }
-                if (e->workspace.truncated) cui_secondary(ui, "Partial listing: limit reached or access denied.");
-            } else if (e->panel == 1) search_panel(ui, e);
-            else git_panel(ui, e);
         }
     }
 }
@@ -840,7 +924,7 @@ static void problems_panel(cui_ctx *ui, Editor *e, EditorTab *tab, const CedDiag
                 snprintf(label, sizeof label, "%d:%d  %.*s", pos.line + 1, pos.character + 1,
                          (int)strcspn(diagnostics[i].message, "\r\n"), diagnostics[i].message);
                 cui_push_id_int(ui, i);
-                if (cui_nav_item(ui, label, .icon = diagnostics[i].severity == 1 ? CUI_ICON_TRIANGLE_ALERT : CUI_ICON_INFO)) {
+                if (ced_nav_item(ui, label, .icon = diagnostics[i].severity == 1 ? CUI_ICON_TRIANGLE_ALERT : CUI_ICON_INFO)) {
                     e->goto_offset = diagnostics[i].start; tab->focus = true;
                 }
                 cui_tooltip(ui, diagnostics[i].message);
@@ -882,6 +966,8 @@ static void editor_pane(cui_ctx *ui, Editor *e) {
                 .title = e->docs[i].title, .icon = CUI_ICON_FILE_TEXT,
                 .tooltip = e->docs[i].file.path, .dirty = ced_document_dirty(&e->docs[i].file)};
             cui_doc_tabs_result result = cui_doc_tabs(ui, "documents", tabs, e->count, &e->selected, .shortcuts = true);
+            int close_action = ced_editor_tabs_close_menu(ui, "documents", tabs, e->count);
+            int keep_id = close_action >= 0 ? e->docs[close_action].id : 0;
             if (result.changed) { e->diff = false; e->docs[e->selected].focus = true; ced_assist_reset(&e->assist); }
             if (result.move_from >= 0) {
                 EditorTab moved = e->docs[result.move_from];
@@ -890,7 +976,8 @@ static void editor_pane(cui_ctx *ui, Editor *e) {
                 else memmove(e->docs + result.move_to + 1, e->docs + result.move_to, sizeof moved * (size_t)(result.move_from - result.move_to));
                 e->docs[result.move_to] = moved;
             }
-            if (result.close >= 0) request_close(e, result.close);
+            if (close_action != CED_TAB_MENU_NONE) request_close_tabs(e, keep_id);
+            else if (result.close >= 0) request_close(e, result.close);
         }
         if (e->diff) {
             cui_row(ui, .pad = 8, .gap = 8) {
@@ -1035,14 +1122,36 @@ static void dialogs(cui_ctx *ui, Editor *e) {
             }
         }
     }
-    cui_dialog(ui, "Save Changes?", &e->close_dialog, .description = "Unsaved changes will be lost.", .width = 480) {
+    bool close_multiple = e->close_index < 0;
+    int keep_id = close_multiple ? e->close_keep_id : 0;
+    if (e->close_dialog && keep_id) {
+        bool found = false;
+        for (int i = 0; i < e->count; i++)
+            if (e->docs[i].id == keep_id) found = true;
+        if (!found) e->close_dialog = false;
+    }
+    const char *close_title = keep_id ? "Close Other Tabs?" : close_multiple ? "Close All Tabs?" : "Save Changes?";
+    cui_dialog(ui, close_title, &e->close_dialog,
+        .description = "Unsaved changes will be lost if discarded.", .width = 480) {
         cui_dialog_footer(ui) {
             if (cui_button(ui, "Cancel", .variant = CUI_BUTTON_DEFAULT)) e->close_dialog = false;
-            if (cui_button(ui, "Discard", .variant = CUI_BUTTON_DANGER)) {
-                remove_tab(e, e->close_index); e->close_dialog = false;
+            if (cui_button(ui, close_multiple ? "Discard All" : "Discard", .variant = CUI_BUTTON_DANGER)) {
+                if (close_multiple) close_tabs_except(e, keep_id);
+                else remove_tab(e, e->close_index);
+                e->close_dialog = false;
             }
-            if (cui_button(ui, "Save", .variant = CUI_BUTTON_PRIMARY)) {
-                if (save_document(e, e->close_index, false)) { remove_tab(e, e->close_index); e->close_dialog = false; }
+            if (cui_button(ui, close_multiple ? "Save All" : "Save", .variant = CUI_BUTTON_PRIMARY)) {
+                if (close_multiple) {
+                    bool saved = true;
+                    for (int i = 0; i < e->count && saved; i++) {
+                        if (e->docs[i].id != keep_id && ced_document_dirty(&e->docs[i].file))
+                            saved = save_document(e, i, false);
+                    }
+                    if (saved) { close_tabs_except(e, keep_id); e->close_dialog = false; }
+                } else if (save_document(e, e->close_index, false)) {
+                    remove_tab(e, e->close_index);
+                    e->close_dialog = false;
+                }
             }
         }
     }
@@ -1158,6 +1267,7 @@ static const struct { const char *id, *title, *category, *shortcut; } builtin_co
 #endif
     {"ced.preferences.open", "Open Preferences (JSON)", "Preferences", "Cmd/Ctrl ,"},
     {"ced.preferences.reload", "Reload Preferences", "Preferences", ""},
+    {"ced.workspace.openRecent", "Open Recent Folder", "File", ""},
 };
 
 static bool builtin_execute(void *user, const char *id, const CedCommandContext *context, char *error) {
@@ -1169,6 +1279,11 @@ static bool builtin_execute(void *user, const char *id, const CedCommandContext 
         return open_document(e,path,0,0);
     }
     if (!strcmp(id,"ced.preferences.reload")) { e->preferences_reload=true; return true; }
+    if (!strcmp(id, "ced.workspace.openRecent")) {
+        e->open_menu_requested = true;
+        cui_request_wakeup(ui, 0);
+        return true;
+    }
     size_t action = 0;
     while (action < sizeof builtin_commands / sizeof *builtin_commands && strcmp(builtin_commands[action].id, id)) action++;
     switch (action) {
@@ -1291,7 +1406,7 @@ static void frame(cui_ctx *ui, Editor *e) {
         cui_toolbar(ui, "main-toolbar", .no_border = false) {
             cui_toolbar_button(ui, CUI_ICON_PANEL_LEFT, .tooltip = "Toggle Sidebar", .toggle = &e->sidebar);
             if (cui_toolbar_button(ui, CUI_ICON_PLUS, .label = "New")) dispatch(e, "ced.file.new");
-            if (cui_toolbar_button(ui, CUI_ICON_FOLDER_OPEN, .label = "Open")) dispatch(e, "ced.workspace.open");
+            open_folder_menu(ui, e);
             if (cui_toolbar_button(ui, CUI_ICON_SAVE, .label = "Save", .disabled = e->selected < 0)) dispatch(e, "ced.file.save");
             if (cui_toolbar_button(ui, CUI_ICON_TERMINAL, .label = "Terminal")) dispatch(e, "ced.terminal.toggle");
             cui_toolbar_spacer(ui);
@@ -1344,7 +1459,7 @@ static void frame(cui_ctx *ui, Editor *e) {
         snprintf(e->palette_ids[command_count], sizeof e->palette_ids[command_count], "%s", command->id);
         command_count++;
     }
-    int chosen = cui_command_palette(ui, &e->palette, e->palette_items, command_count);
+    int chosen = ced_command_palette(ui, &e->palette, e->palette_items, command_count);
     if (chosen >= 0 && chosen < command_count) dispatch(e, e->palette_ids[chosen]);
 #ifdef CED_ENABLE_EXTENSIONS
     ced_extensions_ui(ui, e->extensions);
@@ -1413,6 +1528,7 @@ static int ced_main(int argc, char **argv) {
     e.logo = ced_editor_logo_create(cui_app_ui(e.app));
     e.preferences_reload=true;
     poll_preferences(cui_app_ui(e.app),&e);
+    if (!ced_recent_folder_record(e.workspace.root)) notify(&e, "Could not save recent folders.");
     register_commands(&e);
 #ifdef CED_ENABLE_EXTENSIONS
     const char *home = getenv("HOME"); char profile[CED_PATH];

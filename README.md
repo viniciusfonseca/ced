@@ -65,6 +65,8 @@ Pass paths containing spaces with inner quotes, for example `make run ARGS='"/pa
 
 The first argument is the project folder. Remaining arguments are file paths relative to that folder or absolute paths. With no arguments, the editor opens the current directory. On macOS, the build also creates `build/CED.app`, which you can open from Finder. Use **Open Folder** in the command palette or Mod Shift O to switch projects.
 
+Click **Open** to choose one of the last ten folders, or select **Open Folder…** at the bottom to browse for a different directory. The **Open Recent Folder** command also opens this menu. Recent folders are kept across sessions.
+
 ## Install
 
 On macOS, install the app with its Finder and Dock icon:
@@ -224,7 +226,7 @@ When the operating system closes the window, unsaved drafts are preserved in `~/
 
 ## Extensions (experimental)
 
-Build normally with `make`. Open the command palette with **Mod Shift P**, choose **Install Extension from Folder**, select a package containing `ced-extension.json`, and review its identity, version, source, SHA-256 and requested API permissions before choosing **Allow and Install**. Installation copies the package without running it. In **Manage Extensions**, choose **Trust Workspace** to authorize execution for the current canonical workspace path. Commands activate their extension on demand.
+Build normally with `make`. The **Extensions** tab next to **Git** lists installed extensions and their status. Click **+** in the tab or run **Install Extension from Folder** from the command palette. Select a package containing `ced-extension.json` and review its identity, version, source, SHA-256 and requested API permissions before choosing **Allow and Install**. Installation copies the package without running it. In **Manage Extensions**, choose **Trust Workspace** to authorize execution for the current canonical workspace path. Commands activate their extension on demand.
 
 The native C example is built into `build/examples/extensions/uppercase-selection`. Install that generated folder, open a text file inside the trusted workspace, select text, and run **Uppercase ASCII Selection**. ASCII letters become uppercase, other Unicode characters are preserved, and one undo restores the selection's original text. The command reads unsaved buffers and never saves them. Untitled documents and files outside the workspace require **Allow Active Document for This Session** for that extension in the manager.
 

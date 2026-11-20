@@ -390,6 +390,23 @@ static void test_preferences(void) {
     assert(ced_font_size_save(22)); assert(ced_terminal_right_save(false));
     assert(ced_preferences_load(&settings,error));
     assert(settings.font_size==22 && !settings.terminal_right && !strcmp(settings.font_family,"Menlo"));
+    CedRecentFolders recent;
+    assert(ced_recent_folders_load(&recent, error) && recent.count == 0);
+    for (int i = 0; i <= CED_RECENT_FOLDERS_LIMIT; i++) {
+        char name[32], folder[CED_PATH];
+        snprintf(name, sizeof name, "project %d", i);
+        path_for(folder, name);
+        assert(ced_recent_folder_record(folder));
+    }
+    char first[CED_PATH], newest[CED_PATH], name[32];
+    path_for(first, "project 1");
+    snprintf(name, sizeof name, "project %d", CED_RECENT_FOLDERS_LIMIT);
+    path_for(newest, name);
+    assert(ced_recent_folders_load(&recent, error) && recent.count == CED_RECENT_FOLDERS_LIMIT);
+    assert(!strcmp(recent.paths[0], newest) && !strcmp(recent.paths[recent.count - 1], first));
+    assert(ced_recent_folder_record(first) && ced_font_size_save(22));
+    assert(ced_recent_folders_load(&recent, error) && recent.count == CED_RECENT_FOLDERS_LIMIT);
+    assert(!strcmp(recent.paths[0], first) && !strcmp(recent.paths[1], newest));
     CedDocument doc={0}; assert(ced_document_open(&doc,path,error));
     assert(strstr(doc.text,"future") && strstr(doc.text,"enabled") && strstr(doc.text,"Menlo")); ced_document_free(&doc);
     assert(ced_font_size_save(CED_FONT_SIZE_MIN) && ced_font_size_load()==CED_FONT_SIZE_MIN);
@@ -407,6 +424,7 @@ static void test_preferences(void) {
         assert(settings.font_size==previous.font_size && !strcmp(settings.font_family,previous.font_family));
         write_text(".ced/settings.json",invalid[n]);
         assert(!ced_font_size_save(18) && !ced_terminal_right_save(true));
+        assert(!ced_recent_folder_record(first));
         assert(ced_preferences_ensure(path,error)); /* Invalid JSON can still be opened for repair. */
         assert(ced_document_open(&doc,path,error)); assert(!strcmp(doc.text,invalid[n])); ced_document_free(&doc);
     }

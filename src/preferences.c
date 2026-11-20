@@ -205,3 +205,70 @@ static bool update(const char *key, cJSON *value) {
 
 bool ced_font_size_save(int size) { return size>=CED_FONT_SIZE_MIN && size<=CED_FONT_SIZE_MAX && update("editor.fontSize",cJSON_CreateNumber(size)); }
 bool ced_terminal_right_save(bool right) { return update("terminal.position",cJSON_CreateString(right ? "right" : "bottom")); }
+
+static const char recent_key[] = "workspace.recentFolders";
+
+static bool same_folder(const char *first, const char *second) {
+#ifdef _WIN32
+    return _stricmp(first, second) == 0;
+#else
+    return strcmp(first, second) == 0;
+#endif
+}
+
+static void append_recent_folder(CedRecentFolders *folders, const char *path) {
+    size_t length = strlen(path);
+    bool absolute = path[0] == '/';
+#ifdef _WIN32
+    absolute |= length > 2 && isalpha((unsigned char)path[0]) && path[1] == ':' && path[2] == '/';
+#endif
+    if (!absolute || length >= CED_PATH || !ced_utf8_valid(path, length) ||
+        folders->count == CED_RECENT_FOLDERS_LIMIT) return;
+    for (size_t i = 0; i < folders->count; i++)
+        if (same_folder(path, folders->paths[i])) return;
+    memcpy(folders->paths[folders->count++], path, length + 1);
+}
+
+static void read_recent_folders(const cJSON *root, CedRecentFolders *folders) {
+    const cJSON *list = cJSON_GetObjectItemCaseSensitive(root, recent_key);
+    if (!cJSON_IsArray(list)) return;
+    const cJSON *item;
+    cJSON_ArrayForEach(item, list) {
+        if (cJSON_IsString(item)) append_recent_folder(folders, item->valuestring);
+    }
+}
+
+bool ced_recent_folders_load(CedRecentFolders *folders, char *error) {
+    folders->count = 0;
+    CedPreferences settings;
+    cJSON *root = load(&settings, error);
+    if (!root) return false;
+    read_recent_folders(root, folders);
+    cJSON_Delete(root);
+    return true;
+}
+
+bool ced_recent_folder_record(const char *canonical_path) {
+    CedRecentFolders folders = {0};
+    append_recent_folder(&folders, canonical_path);
+    if (!folders.count) return false;
+    CedPreferences settings;
+    char error[CED_ERROR];
+    cJSON *root = load(&settings, error);
+    if (!root) return false;
+    read_recent_folders(root, &folders);
+    cJSON *list = cJSON_CreateArray();
+    bool ok = list != NULL;
+    for (size_t i = 0; ok && i < folders.count; i++)
+        ok = cJSON_AddItemToArray(list, cJSON_CreateString(folders.paths[i]));
+    if (ok) {
+        cJSON_DeleteItemFromObjectCaseSensitive(root, recent_key);
+        if (cJSON_AddItemToObject(root, recent_key, list)) {
+            list = NULL;
+            ok = save(root, error);
+        } else ok = false;
+    }
+    cJSON_Delete(list);
+    cJSON_Delete(root);
+    return ok;
+}
