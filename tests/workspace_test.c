@@ -119,12 +119,23 @@ static void test_workspace_ignored(void) {
     write_text("ignore-tree/nested/.gitignore", "*.log\n!keep.log\n");
     write_text("ignore-tree/nested/hidden.log", "ignored"); write_text("ignore-tree/nested/keep.log", "visible");
     write_text("ignore-tree/.git/info/exclude", "local.txt\n"); write_text("ignore-tree/local.txt", "ignored");
+    path_for(folder, "ignore-tree/vendor"); assert(!mkdir(folder, 0700));
+    path_for(folder, "ignore-tree/vendor/module"); assert(!mkdir(folder, 0700));
+    write_text("ignore-tree/vendor/module/inside.tmp", "outside the parent Git index");
+    const char *gitlink[] = {"git", "-C", repo, "update-index", "--add", "--cacheinfo",
+                            "160000,1111111111111111111111111111111111111111,vendor/module", NULL};
+    command(gitlink);
+    write_text("ignore-tree/:literal.tmp", "ignored");
+    write_text("ignore-tree/zz-late.tmp", "ignored");
     CedWorkspace ws = {0}; assert(ced_workspace_open(&ws, repo, error));
     assert_ignored(&ws, "hidden.tmp", true); assert_ignored(&ws, "odd\nname.tmp", true);
     assert_ignored(&ws, "keep.tmp", false); assert_ignored(&ws, "tracked.tmp", false);
+    assert_ignored(&ws, ":literal.tmp", true); assert_ignored(&ws, "zz-late.tmp", true);
+    assert_ignored(&ws, "vendor/module", false); assert_ignored(&ws, "vendor/module/inside.tmp", false);
     assert_ignored(&ws, "cache", true); assert_ignored(&ws, "cache/file.c", true);
     assert_ignored(&ws, "nested", false); assert_ignored(&ws, "nested/hidden.log", true);
     assert_ignored(&ws, "nested/keep.log", false); assert_ignored(&ws, "local.txt", true);
+    path_for(folder, "ignore-tree/nested");
     assert(ced_workspace_open(&ws, folder, error));
     assert_ignored(&ws, "hidden.log", true); assert_ignored(&ws, "keep.log", false);
     write_text("ignore-tree/nested/.gitignore", "");

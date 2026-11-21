@@ -156,7 +156,7 @@ static void initialize(CedExtensionInstance *i) {
     cJSON *p = cJSON_CreateObject(), *host = cJSON_AddObjectToObject(p, "host");
     cJSON_AddStringToObject(host, "name", "CED"); cJSON_AddStringToObject(host, "version", CED_EXTENSION_APP_VERSION);
     cJSON_AddNumberToObject(host, "tabProtocol", 1);
-    cJSON_AddNumberToObject(host, "tabWidgets", 3);
+    cJSON_AddNumberToObject(host, "tabWidgets", 6);
     cJSON *extension = cJSON_AddObjectToObject(p, "extension");
     cJSON_AddStringToObject(extension, "id", i->record.manifest.id);
     cJSON_AddStringToObject(extension, "version", i->record.manifest.version);
@@ -307,6 +307,9 @@ static bool valid_tab_selectors(const cJSON *selectors) {
 static bool valid_tab_chat(const cJSON *chat) {
     static const char *const fields[] = {"author", "messages", "status", NULL};
     static const char *const message_fields[] = {"role", "text", NULL};
+    static const char *const agent_fields[] = {"role", "text", "id", NULL};
+    static const char *const reasoning_fields[] = {"role", "text", "id", "status", NULL};
+    static const char *const tool_fields[] = {"role", "text", "id", "status", "input", "output", NULL};
     char error[CED_ERROR];
     const cJSON *messages = cJSON_GetObjectItemCaseSensitive(chat, "messages");
     const cJSON *status_item = cJSON_GetObjectItemCaseSensitive(chat, "status");
@@ -321,17 +324,42 @@ static bool valid_tab_chat(const cJSON *chat) {
     cJSON_ArrayForEach(message, messages) {
         const char *role = ced_ext_json_string(message, "role");
         const char *text = ced_ext_json_string(message, "text");
-        if (!ced_ext_json_fields(message, message_fields, error) ||
-            !role || (strcmp(role, "user") && strcmp(role, "agent")) ||
-            !tab_text(text, 9000 - bytes, true)) return false;
+        if (!role) return false;
+        bool tool = !strcmp(role, "tool"), reasoning = !strcmp(role, "reasoning");
+        bool agent = !strcmp(role, "agent");
+        if (!tool && !reasoning && !agent && strcmp(role, "user")) return false;
+        const char *const *allowed = tool ? tool_fields : reasoning ? reasoning_fields : agent ? agent_fields : message_fields;
+        if (!ced_ext_json_fields(message, allowed, error) ||
+            !tab_text(text, tool ? 256 : 9000 - bytes, !tool)) return false;
+        if (tool || reasoning || (agent && cJSON_GetObjectItemCaseSensitive(message, "id"))) {
+            const char *id = ced_ext_json_string(message, "id");
+            const char *entry_status = ced_ext_json_string(message, "status");
+            if (!tab_text(id, 128, false) || !*id || !*text) return false;
+            if (reasoning && cJSON_GetObjectItemCaseSensitive(message, "status") &&
+                (!entry_status || strcmp(entry_status, "running"))) return false;
+            if (tool && (!entry_status || (strcmp(entry_status, "pending") && strcmp(entry_status, "running") &&
+                strcmp(entry_status, "done") && strcmp(entry_status, "failed")))) return false;
+            for (const cJSON *previous = messages->child; previous != message; previous = previous->next) {
+                const char *other_id = ced_ext_json_string(previous, "id");
+                if (other_id && !strcmp(other_id, id)) return false;
+            }
+        }
+        if (tool) {
+            const cJSON *input = cJSON_GetObjectItemCaseSensitive(message, "input");
+            const cJSON *output = cJSON_GetObjectItemCaseSensitive(message, "output");
+            if ((input && (!cJSON_IsString(input) || !tab_text(input->valuestring, 1024, true))) ||
+                (output && (!cJSON_IsString(output) || !tab_text(output->valuestring, 1024, true)))) return false;
+            bytes += (input ? strlen(input->valuestring) : 0) + (output ? strlen(output->valuestring) : 0);
+        }
         bytes += strlen(text);
+        if (bytes > 9000) return false;
     }
     return true;
 }
 
 static bool valid_tab_model(const cJSON *model) {
     static const char *const fields[] = {"heading", "text", "actions", "input", "refresh", "selectors", "chat", NULL};
-    static const char *const input_fields[] = {"id", "label", "placeholder", "disabled", NULL};
+    static const char *const input_fields[] = {"id", "label", "placeholder", "disabled", "stop", NULL};
     char error[CED_ERROR];
     if (!ced_ext_json_fields(model, fields, error)) return false;
     const cJSON *actions = cJSON_GetObjectItemCaseSensitive(model, "actions");
@@ -349,11 +377,14 @@ static bool valid_tab_model(const cJSON *model) {
     if (!input) return true;
     const char *id = ced_ext_json_string(input, "id");
     const cJSON *disabled = cJSON_GetObjectItemCaseSensitive(input, "disabled");
+    const cJSON *stop_item = cJSON_GetObjectItemCaseSensitive(input, "stop");
+    const char *stop = ced_ext_json_string(input, "stop");
     return ced_ext_json_fields(input, input_fields, error) &&
         tab_text(id, 128, false) && *id && strcmp(id, "refresh") &&
         tab_text(ced_ext_json_string(input, "label"), 80, false) &&
         tab_text(ced_ext_json_string(input, "placeholder"), 160, false) &&
-        (!disabled || cJSON_IsBool(disabled));
+        (!disabled || cJSON_IsBool(disabled)) &&
+        (!stop_item || (chat && tab_text(stop, 128, false) && *stop && strcmp(stop, "refresh") && strcmp(stop, id)));
 }
 
 static void receive_tab(CedExtensionInstance *i, cJSON *result) {
@@ -369,9 +400,15 @@ static void receive_tab(CedExtensionInstance *i, cJSON *result) {
             report(i->manager, i->error);
             return;
         }
-        const char *old_input = ced_ext_json_string(cJSON_GetObjectItemCaseSensitive(state->model, "input"), "id");
-        const char *new_input = ced_ext_json_string(cJSON_GetObjectItemCaseSensitive(model, "input"), "id");
+        const cJSON *old_composer = cJSON_GetObjectItemCaseSensitive(state->model, "input");
+        const cJSON *new_composer = cJSON_GetObjectItemCaseSensitive(model, "input");
+        const char *old_input = ced_ext_json_string(old_composer, "id");
+        const char *new_input = ced_ext_json_string(new_composer, "id");
+        state->chat_animate = old_input && new_input && !strcmp(old_input, new_input) &&
+            (submitted || ced_ext_json_string(old_composer, "stop") || ced_ext_json_string(new_composer, "stop"));
         if (submitted || (old_input && (!new_input || strcmp(old_input, new_input)))) *state->input = 0;
+        if (!cJSON_GetObjectItemCaseSensitive(model, "chat") ||
+            (old_input && new_input && strcmp(old_input, new_input))) state->chat_open = false;
         cJSON_Delete(state->model);
         state->model = cJSON_DetachItemViaPointer(result, model);
         state->requested = true;

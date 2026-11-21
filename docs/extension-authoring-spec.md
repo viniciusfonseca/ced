@@ -301,7 +301,7 @@ The extension transitions through `waiting-for-initialize → initialized → ac
 
 ```typescript
 type InitializeParams = {
-  host: { name: "CED"; version: Version; tabProtocol?: 1; tabWidgets?: 1 | 2 | 3 };
+  host: { name: "CED"; version: Version; tabProtocol?: 1; tabWidgets?: 1 | 2 | 3 | 4 | 5 | 6 };
   extension: { id: string; version: Version };
   apiVersions: string[]; // exact values, initially ["1.0"]
   context: Context; // establishes context; no prior-context check

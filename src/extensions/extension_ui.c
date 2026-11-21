@@ -1,4 +1,5 @@
 #include "extension_ui.h"
+#include "cui_internal.h"
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -59,19 +60,16 @@ static bool composer_selector(const cJSON *selector) {
 }
 
 static void tab_selectors(cui_ctx *ui, CedExtensionInstance *instance, size_t index,
-    const cJSON *selectors, bool has_composer, bool toolbar, const cJSON *model, bool *busy) {
+    const cJSON *selectors, bool has_composer, bool *busy) {
     const cJSON *entry;
     bool any = false;
     cJSON_ArrayForEach(entry, selectors)
-        if (entry != model && (has_composer && composer_selector(entry)) == toolbar) any = true;
+        if (!has_composer || !composer_selector(entry)) any = true;
     if (!any) return;
-    /* The composer reserves a 32 px button and 10 px inset on each side. */
-    cui_row(ui, .width = toolbar && model ? CUI_PCT(48) : CUI_FILL, .max_width = toolbar && model ? 220 : 0,
-            .gap = 6, .pad_left = toolbar && !model ? 48 : 0, .pad_right = toolbar ? 48 : 0,
-            .pad_bottom = toolbar ? 8 : 0) {
+    cui_row(ui, .width = CUI_FILL, .gap = 6) {
         const cJSON *selector;
         cJSON_ArrayForEach(selector, selectors) {
-            if (selector == model || (has_composer && composer_selector(selector)) != toolbar) continue;
+            if (has_composer && composer_selector(selector)) continue;
             const char *label = ced_ext_json_string(selector, "label");
             const char *id = ced_ext_json_string(selector, "id");
             const char *selected = ced_ext_json_string(selector, "selected");
@@ -87,9 +85,8 @@ static void tab_selectors(cui_ctx *ui, CedExtensionInstance *instance, size_t in
             bool disabled = *busy || choice_count == 0 || cui_is_disabled(ui) ||
                 cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(selector, "disabled"));
             bool changed = cui_select_ex(ui, id, labels, choice_count, &current, &(cui_select_opts){
-                .label = toolbar ? NULL : label, .placeholder = toolbar ? label : "Unavailable",
+                .label = label, .placeholder = "Unavailable",
                 .width = CUI_FILL, .disabled = disabled, .searchable = choice_count > 8});
-            if (toolbar) cui_tooltip(ui, label);
             if (changed && !disabled && current >= 0 && current < choice_count)
                 *busy = ced_extensions_tab_action(instance, index, id, values[current]);
         }
@@ -109,17 +106,94 @@ static void tab_buttons(cui_ctx *ui, CedExtensionInstance *instance, size_t inde
     }
 }
 
-static void tab_chat(cui_ctx *ui, const cJSON *chat, const char *text) {
+static bool tab_activity(cui_ctx *ui, const cJSON *message, const char *role) {
+    bool reasoning = !strcmp(role, "reasoning");
+    if (!reasoning && strcmp(role, "tool")) return false;
+    const char *id = ced_ext_json_string(message, "id");
+    const char *text = ced_ext_json_string(message, "text");
+    const char *status = ced_ext_json_string(message, "status");
+    bool running = status && !strcmp(status, "running");
+    cui_push_id(ui, "chat-activity");
+    if (reasoning) {
+        cui_reasoning(ui, id, .thinking = running, .title = running ? "Thinking" : "Reasoning") {
+            cui_markdown(ui, "markdown", text, .compact = true, .streaming = running, .color = CUI_COLOR_TEXT_SECONDARY);
+        }
+    } else {
+        cui_task_status task = CUI_TASK_PENDING;
+        if (running) task = CUI_TASK_RUNNING;
+        else if (!strcmp(status, "done")) task = CUI_TASK_DONE;
+        else if (!strcmp(status, "failed")) task = CUI_TASK_FAILED;
+        cui_tool_call(ui, id, text, .status = task, .input = ced_ext_json_string(message, "input"),
+            .output = ced_ext_json_string(message, "output"));
+    }
+    cui_pop_id(ui);
+    return true;
+}
+
+typedef struct {
+    int length, visible;
+    uint32_t hash;
+    float characters;
+    bool initialized;
+} ChatTyping;
+
+static const char *chat_typed_text(cui_ctx *ui, const char *id, const char *text, bool animate) {
+    ChatTyping *typing = cui_state(ui, cui_make_id(ui, id), sizeof *typing);
+    int length = (int)strlen(text);
+    if ((!typing->initialized && !animate) || cui_theme_get(ui)->motion <= 0 ||
+        (typing->initialized && (length < typing->length ||
+            cui__hash(text, (size_t)typing->length, 0) != typing->hash))) {
+        typing->visible = length;
+        typing->characters = 0;
+    }
+    typing->initialized = true;
+    typing->length = length;
+    typing->hash = cui__hash(text, (size_t)length, 0);
+    if (typing->visible < length) {
+        // Match the CUI typewriter's catch-up behavior while keeping Markdown in the bubble.
+        float boost = fmaxf(1, (length - typing->visible) / 120.0f);
+        typing->characters += cui_delta_time(ui) * 140 * boost;
+        while (typing->characters >= 1 && typing->visible < length) {
+            typing->visible = cui__utf8_next(text, length, typing->visible);
+            typing->characters--;
+        }
+        if (typing->visible < length) {
+            cui_request_redraw(ui);
+            return cui__frame_printf(ui, "%.*s|", typing->visible, text);
+        }
+        typing->characters = 0;
+    }
+    return text;
+}
+
+static void tab_chat(cui_ctx *ui, const cJSON *chat, const char *text, bool animate) {
     const char *author = ced_ext_json_string(chat, "author");
     const char *previous_role = NULL;
     const cJSON *message;
     cJSON_ArrayForEach(message, cJSON_GetObjectItemCaseSensitive(chat, "messages")) {
         const char *role = ced_ext_json_string(message, "role");
+        if (tab_activity(ui, message, role)) {
+            previous_role = NULL;
+            continue;
+        }
         const char *next_role = ced_ext_json_string(message->next, "role");
         bool mine = !strcmp(role, "user");
-        cui_chat_message(ui, ced_ext_json_string(message, "text"), .mine = mine, .author = author,
+        const char *body = ced_ext_json_string(message, "text");
+        const char *id = mine ? NULL : ced_ext_json_string(message, "id");
+        if (id) {
+            cui_push_id(ui, "chat-typewriter");
+            body = chat_typed_text(ui, id, body, animate);
+            cui_pop_id(ui);
+        }
+        int row = ui->node_count;
+        cui_chat_message(ui, body, .mine = mine, .author = author,
             .grouped = previous_role && !strcmp(role, previous_role),
             .last_in_group = !next_role || strcmp(role, next_role), .markdown = !mine);
+        if (id) {
+            // The CUI bubble otherwise fades back in for each newly revealed prefix.
+            ui->nodes[row].opacity = 1;
+            ui->nodes[row].ty = 0;
+        }
         previous_role = role;
     }
     if (!*text) return;
@@ -129,8 +203,59 @@ static void tab_chat(cui_ctx *ui, const cJSON *chat, const char *text) {
     else cui_agent_status(ui, text, .status = !strcmp(status, "failed") ? CUI_TASK_FAILED : CUI_TASK_RUNNING);
 }
 
+static float chat_scroll_bottom(const cui_scroll_state *scroll) {
+    return fmaxf(0, scroll->content_h - scroll->view_h);
+}
+
+static void chat_scroll_layout(cui_ctx *ui, cui_node *node, void *data) {
+    const CedExtensionTabState *tab = data;
+    const cui_scroll_state *scroll = cui_state(ui, node->id, sizeof *scroll);
+    if (fabsf(chat_scroll_bottom(scroll) - tab->chat_bottom) > 0.5f) cui_request_redraw(ui);
+}
+
+static void tab_chat_scroll(cui_ctx *ui, CedExtensionTabState *tab, const cJSON *chat, const char *text) {
+    const cui_id id = cui_make_id(ui, "chat");
+    cui_scroll_state *scroll = cui_state(ui, id, sizeof *scroll);
+    float bottom = chat_scroll_bottom(scroll);
+    if (!tab->chat_open) {
+        tab->chat_open = true;
+        tab->chat_following = true;
+        tab->chat_bottom = bottom;
+        scroll->y = scroll->ty = bottom;
+    }
+    cui_box(ui, .dir = CUI_STACK, .width = CUI_FILL, .height = CUI_FILL,
+            .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_END) {
+        cui_scroll(ui, .id = "chat", .height = CUI_FILL, .width = CUI_FILL, .gap = 4) {
+            cui_node *node = &ui->nodes[cui__current(ui)];
+            node->paint = chat_scroll_layout;
+            node->paint_data = tab;
+            // Read the target after CUI handles the wheel and scrollbar.
+            if (scroll->ty + 0.5f >= bottom) tab->chat_following = true;
+            else if (scroll->ty + 0.5f < fminf(tab->chat_bottom, bottom) || scroll->drag_y)
+                tab->chat_following = false;
+            tab->chat_bottom = bottom;
+            if (tab->chat_following && scroll->ty < bottom) {
+                cui_scroll_to(ui, "chat", bottom);
+                cui_request_redraw(ui);
+            }
+            tab_chat(ui, chat, text, tab->chat_animate);
+        }
+        if (!tab->chat_following) {
+            cui_row(ui, .width = CUI_FIT, .pad_bottom = 10) {
+                if (cui__icon_button_id(ui, cui_make_id(ui, "chat-jump"), CUI_ICON_ARROW_DOWN,
+                        &(cui_button_opts){.size = CUI_SIZE_SM, .variant = CUI_BUTTON_SECONDARY,
+                                           .tooltip = "Jump to latest"})) {
+                    tab->chat_following = true;
+                    cui_scroll_to(ui, "chat", bottom);
+                    cui_request_redraw(ui);
+                }
+            }
+        }
+    }
+}
+
 /* The native picker has a short menu. Larger catalogs are searchable from it. */
-enum { COMPOSER_QUICK_MODELS = 8, COMPOSER_LABEL_BYTES = 128 };
+enum { COMPOSER_QUICK_CHOICES = 8, COMPOSER_LABEL_BYTES = 128 };
 
 static void fit_model_label(cui_ctx *ui, cui_model *model, char *label, size_t capacity, float available) {
     const char *name = model->name;
@@ -148,80 +273,137 @@ static void fit_model_label(cui_ctx *ui, cui_model *model, char *label, size_t c
     model->detail = name;
 }
 
+typedef struct {
+    const char *id, *label;
+    const char *values[CED_EXTENSION_TAB_CHOICES];
+    cui_command catalog[CED_EXTENSION_TAB_CHOICES];
+    cui_model quick[COMPOSER_QUICK_CHOICES];
+    int mapped[COMPOSER_QUICK_CHOICES];
+    int count, current, quick_count, picked;
+    bool disabled, overflow;
+    char compact[COMPOSER_LABEL_BYTES + 4];
+} ComposerPicker;
+
+static void composer_picker(ComposerPicker *picker, const cJSON *selector, bool disabled, const char *browse_label) {
+    if (!selector) return;
+    picker->id = ced_ext_json_string(selector, "id");
+    picker->label = ced_ext_json_string(selector, "label");
+    const char *selected = ced_ext_json_string(selector, "selected");
+    picker->current = -1;
+    const cJSON *option;
+    cJSON_ArrayForEach(option, cJSON_GetObjectItemCaseSensitive(selector, "options")) {
+        int n = picker->count++;
+        picker->values[n] = ced_ext_json_string(option, "id");
+        picker->catalog[n].title = ced_ext_json_string(option, "label");
+        picker->catalog[n].group = picker->label;
+        if (!strcmp(selected, picker->values[n])) picker->current = n;
+    }
+    picker->disabled = disabled || !picker->count || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(selector, "disabled"));
+    picker->overflow = picker->count + (picker->current < 0) > COMPOSER_QUICK_CHOICES;
+    if (picker->current < 0 || picker->overflow || picker->disabled) {
+        picker->mapped[0] = picker->current;
+        picker->quick[0].name = picker->current < 0 ? picker->label : picker->catalog[picker->current].title;
+        picker->quick_count = 1;
+    }
+    if (picker->disabled) return;
+    if (picker->overflow) {
+        picker->mapped[1] = -1;
+        picker->quick[1].name = browse_label;
+        picker->quick_count = 2;
+    } else {
+        for (int n = 0; n < picker->count; n++) {
+            if (n == picker->current) picker->picked = picker->quick_count;
+            picker->mapped[picker->quick_count] = n;
+            picker->quick[picker->quick_count++].name = picker->catalog[n].title;
+        }
+    }
+}
+
+static int composer_picker_choice(cui_ctx *ui, const ComposerPicker *picker, const char *browse_id, bool changed) {
+    if (!picker->id) return -1;
+    bool *browse = cui_state(ui, cui_make_id(ui, browse_id), sizeof *browse);
+    if (picker->disabled || !picker->overflow) *browse = false;
+    int choice = -1;
+    if (changed && !picker->disabled) {
+        choice = picker->mapped[picker->picked];
+        if (picker->overflow && picker->picked == 1) *browse = true;
+    }
+    if (picker->overflow) {
+        cui_push_id(ui, browse_id);
+        int result = cui_command_palette(ui, browse, picker->catalog, picker->count);
+        cui_pop_id(ui);
+        if (result >= 0 && !picker->disabled) choice = result;
+    }
+    return choice;
+}
+
+static bool draw_composer_picker(cui_ctx *ui, const char *id, ComposerPicker *picker) {
+    cui_push_disabled(ui, picker->disabled);
+    bool changed = cui_model_picker(ui, id, picker->quick, picker->quick_count, &picker->picked, .ghost = true);
+    cui_tooltip(ui, picker->label);
+    cui_pop_disabled(ui);
+    return changed;
+}
+
 static void tab_composer(cui_ctx *ui, CedExtensionInstance *instance, size_t index,
     const cJSON *input, const cJSON *selectors, bool *busy) {
     CedExtensionTabState *state = &instance->tabs[index];
-    bool disabled = *busy || state->submitted || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(input, "disabled"));
-    const cJSON *model;
-    cJSON_ArrayForEach(model, selectors) {
-        if (composer_selector(model)) break;
+    const char *stop = ced_ext_json_string(input, "stop");
+    bool disabled = *busy || state->submitted || stop || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(input, "disabled"));
+    const cJSON *primary = NULL, *secondary = NULL, *selector;
+    cJSON_ArrayForEach(selector, selectors) {
+        if (!composer_selector(selector)) continue;
+        if (!primary) primary = selector;
+        else secondary = selector;
     }
-    const cJSON *options = cJSON_GetObjectItemCaseSensitive(model, "options");
-    const char *selected = ced_ext_json_string(model, "selected");
-    const char *values[CED_EXTENSION_TAB_CHOICES];
-    cui_command catalog[CED_EXTENSION_TAB_CHOICES] = {0};
-    int count = 0, current = -1;
-    const cJSON *option;
-    cJSON_ArrayForEach(option, options) {
-        values[count] = ced_ext_json_string(option, "id");
-        catalog[count].title = ced_ext_json_string(option, "label");
-        catalog[count].group = "Models";
-        if (!strcmp(selected, values[count])) current = count;
-        count++;
-    }
-    bool model_disabled = disabled || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(model, "disabled"));
-    bool overflow = count > COMPOSER_QUICK_MODELS;
-    cui_model quick[COMPOSER_QUICK_MODELS] = {0};
-    int mapped[COMPOSER_QUICK_MODELS];
-    int quick_count = 0, picked = 0;
-    if (current >= 0) {
-        if (overflow || model_disabled) {
-            mapped[quick_count] = current;
-            quick[quick_count++].name = catalog[current].title;
-            if (!model_disabled) {
-                mapped[quick_count] = -1;
-                quick[quick_count++].name = "Browse all models…";
-            }
-        } else {
-            for (int n = 0; n < count; n++) {
-                mapped[n] = n;
-                quick[n].name = catalog[n].title;
-            }
-            quick_count = count;
-            picked = current;
-        }
-    }
-    char compact[COMPOSER_LABEL_BYTES + 4];
+    ComposerPicker model = {0}, effort = {0};
+    composer_picker(&model, primary, disabled, "Browse all models…");
+    composer_picker(&effort, secondary, disabled, "Browse all options…");
     float width = cui_get_rect(ui, cui_make_id(ui, "tab-input")).w;
-    if (quick_count && width > 0) {
-        float effort_width = cJSON_GetArraySize(selectors) > 1 ? fminf(width * .48f, 220) : 48;
-        fit_model_label(ui, &quick[picked], compact, sizeof compact, width - effort_width - 92);
+    if (width > 0 && model.quick_count) {
+        // Reserve space for the attach and send buttons and the pickers' chevrons and padding.
+        float available = width - (effort.quick_count ? 166 : 123);
+        float effort_width = effort.quick_count ? fminf(160, available * .4f) : 0;
+        fit_model_label(ui, &model.quick[model.picked], model.compact, sizeof model.compact, available - effort_width);
+        if (effort.quick_count)
+            fit_model_label(ui, &effort.quick[effort.picked], effort.compact, sizeof effort.compact, effort_width);
     }
 
     int event = 0;
-    cui_push_disabled(ui, disabled);
-    cui_box(ui, .dir = CUI_STACK, .width = CUI_FILL, .align = CUI_ALIGN_END, .justify = CUI_JUSTIFY_END) {
+    bool model_changed = false, effort_changed = false;
+    cui_push_disabled(ui, *busy || state->submitted || (disabled && !stop));
+    cui_box(ui, .dir = CUI_STACK, .width = CUI_FILL, .align = CUI_ALIGN_START, .justify = CUI_JUSTIFY_END) {
         event = cui_chat_composer(ui, "tab-input", state->input, sizeof state->input,
-            .placeholder = ced_ext_json_string(input, "placeholder"), .width = CUI_FILL, .max_lines = 3,
-            .models = quick, .model_count = quick_count, .model = &picked);
-        tab_selectors(ui, instance, index, selectors, true, true, quick_count ? model : NULL, busy);
+            .placeholder = ced_ext_json_string(input, "placeholder"), .width = CUI_FILL, .max_lines = 3, .busy = stop != NULL);
+        if (model.quick_count) {
+            // The attach button occupies 32 px plus the composer's 10 px inset and 6 px gap.
+            cui_row(ui, .width = CUI_FIT, .pad_left = 48, .pad_bottom = 11, .gap = 6) {
+                cui_push_id(ui, "tab-input");
+                model_changed = draw_composer_picker(ui, "model", &model);
+                if (effort.quick_count) {
+                    cui_push_id(ui, "secondary-picker");
+                    effort_changed = draw_composer_picker(ui, effort.id, &effort);
+                    cui_pop_id(ui);
+                }
+                cui_pop_id(ui);
+            }
+        }
     }
     cui_pop_disabled(ui);
 
-    bool *browse = cui_state(ui, cui_make_id(ui, "browse-models"), sizeof *browse);
-    if (model_disabled || !overflow) *browse = false;
-    int choice = -1;
-    if (!model_disabled && (event & CUI_COMPOSER_MODEL) && picked >= 0 && picked < quick_count) {
-        choice = mapped[picked];
-        if (choice < 0) *browse = true;
-    }
-    if (overflow && quick_count) {
-        int result = cui_command_palette(ui, browse, catalog, count);
-        if (result >= 0) choice = result;
+    int model_choice = composer_picker_choice(ui, &model, "browse-models", model_changed);
+    int effort_choice = composer_picker_choice(ui, &effort, "browse-effort", effort_changed);
+    if (stop && !*busy && (event & CUI_COMPOSER_STOP)) {
+        *busy = ced_extensions_tab_action(instance, index, stop, "");
+        return;
     }
     if (disabled || *busy) return;
-    if (choice >= 0 && choice < count && choice != current) {
-        *busy = ced_extensions_tab_action(instance, index, ced_ext_json_string(model, "id"), values[choice]);
+    if (effort_choice >= 0 && effort_choice != effort.current) {
+        *busy = ced_extensions_tab_action(instance, index, effort.id, effort.values[effort_choice]);
+        return;
+    }
+    if (model_choice >= 0 && model_choice != model.current) {
+        *busy = ced_extensions_tab_action(instance, index, model.id, model.values[model_choice]);
         return;
     }
     if ((event & CUI_COMPOSER_SEND) && *state->input) {
@@ -264,10 +446,11 @@ void ced_extension_tab_body(cui_ctx *ui, CedExtensions *m, const char *selected)
                         tab_buttons(ui, instance, index, actions, &busy);
                     }
                 } else if (*heading) cui_text(ui, heading, .font = CUI_FONT_MEDIUM, .width = CUI_FILL);
-                tab_selectors(ui, instance, index, selectors, chat && input, false, NULL, &busy);
-                cui_scroll(ui, .id = chat ? "chat" : "contents", .height = CUI_FILL, .width = CUI_FILL, .gap = 4) {
-                    if (chat) tab_chat(ui, chat, text);
-                    else {
+                tab_selectors(ui, instance, index, selectors, chat && input, &busy);
+                if (chat) tab_chat_scroll(ui, state, chat, text);
+                else {
+                    state->chat_open = false;
+                    cui_scroll(ui, .id = "contents", .height = CUI_FILL, .width = CUI_FILL, .gap = 4) {
                         tab_buttons(ui, instance, index, actions, &busy);
                         if (*text) cui_text(ui, text, .width = CUI_FILL);
                     }

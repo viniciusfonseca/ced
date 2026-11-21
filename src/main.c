@@ -27,8 +27,10 @@
 
 #ifdef __APPLE__
 void ced_macos_set_icon(void);
-void *ced_macos_shortcuts(cui_app *app);
-void ced_macos_remove_shortcuts(void *handle);
+void ced_macos_titlebar(cui_app *app);
+float ced_macos_layout_titlebar(cui_app *app, cui_rect toolbar);
+void *ced_macos_window_events(cui_app *app, cui_id drag_region);
+void ced_macos_remove_window_events(void *handle);
 #endif
 
 typedef struct {
@@ -1469,13 +1471,25 @@ static void frame(cui_ctx *ui, Editor *e) {
         }
     }
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .bg = CUI_COLOR_BACKGROUND) {
+#ifdef __APPLE__
+        cui_rect toolbar = cui_get_rect(ui, cui_make_id(ui, "main-toolbar"));
+        if (toolbar.h == 0) cui_request_redraw(ui);
+        float inset = ced_macos_layout_titlebar(e->app, toolbar);
+#endif
         cui_toolbar(ui, "main-toolbar", .no_border = false) {
+#ifdef __APPLE__
+            if (inset > 0) cui_gap(ui, inset);
+#endif
             cui_toolbar_button(ui, CUI_ICON_PANEL_LEFT, .tooltip = "Toggle Sidebar", .toggle = &e->sidebar);
             if (cui_toolbar_button(ui, CUI_ICON_PLUS, .label = "New")) dispatch(e, "ced.file.new");
             open_folder_menu(ui, e);
             if (cui_toolbar_button(ui, CUI_ICON_SAVE, .label = "Save", .disabled = e->selected < 0)) dispatch(e, "ced.file.save");
             if (cui_toolbar_button(ui, CUI_ICON_TERMINAL, .label = "Terminal")) dispatch(e, "ced.terminal.toggle");
+#ifdef __APPLE__
+            cui_box(ui, .id = "titlebar-drag", .width = CUI_FILL, .height = CUI_PX(cui_theme_get(ui)->control_sm)) {}
+#else
             cui_toolbar_spacer(ui);
+#endif
             cui_text(ui, "CED", .font = CUI_FONT_MEDIUM, .size = 12);
             cui_theme_toggle(ui);
         }
@@ -1606,11 +1620,16 @@ static int ced_main(int argc, char **argv) {
 #endif
 #ifdef __APPLE__
     ced_macos_set_icon();
-    void *shortcut_monitor = ced_macos_shortcuts(e.app);
+    ced_macos_titlebar(e.app);
+    cui_ctx *ui = cui_app_ui(e.app);
+    cui_push_id(ui, "main-toolbar");
+    cui_id drag_region = cui_make_id(ui, "titlebar-drag");
+    cui_pop_id(ui);
+    void *window_monitor = ced_macos_window_events(e.app, drag_region);
 #endif
     while (cui_app_frame(e.app)) frame(cui_app_ui(e.app), &e);
 #ifdef __APPLE__
-    ced_macos_remove_shortcuts(shortcut_monitor);
+    ced_macos_remove_window_events(window_monitor);
 #endif
     if (!write_recovery(&e)) {
         fprintf(stderr, "Could not write recovery file: %s\n", e.recovery);

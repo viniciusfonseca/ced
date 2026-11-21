@@ -27,6 +27,8 @@ typedef struct {
     cJSON *model;
     char input[8193];
     double next_refresh;
+    float chat_bottom;
+    bool chat_open, chat_following, chat_animate;
     bool requested, submitted;
 } CedExtensionTabState;
 

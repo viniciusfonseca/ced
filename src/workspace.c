@@ -142,37 +142,95 @@ static int compare_entry_paths(const void *left, const void *right) {
     return strcmp((*a)->path, (*b)->path);
 }
 
-static void mark_ignored(CedWorkspace *ws) {
-    if (!ws->count) return;
+static CedEntry *find_entry(CedEntry **entries, size_t count, const char *path) {
+    CedEntry key = {.path = (char *)path}, *key_ptr = &key;
+    CedEntry **entry = bsearch(&key_ptr, entries, count, sizeof *entries, compare_entry_paths);
+    return entry ? *entry : NULL;
+}
+
+static int check_ignored(const CedWorkspace *ws, const bool *skip, char **output, size_t *length) {
+    /* A seekable input avoids pipe deadlocks and argv limits for large trees. */
     FILE *input = tmpfile();
-    if (!input) return;
-    CedEntry **entries = malloc((size_t)ws->count * sizeof *entries);
-    if (!entries) { fclose(input); return; }
+    if (!input) return -1;
     bool ready = true;
     for (int i = 0; i < ws->count; i++) {
-        entries[i] = &ws->entries[i];
-        size_t length = strlen(entries[i]->path) + 1;
-        if (fwrite(entries[i]->path, 1, length, input) != length) { ready = false; break; }
-    }
-    if (fflush(input) || fseek(input, 0, SEEK_SET)) ready = false;
-    /* A seekable input avoids pipe deadlocks and argv limits for large trees.
-     * Git handles nested rules, negation, tracked files and unusual filenames. */
-    const char *args[] = {"git", "-C", ws->root, "check-ignore", "--stdin", "-z", NULL};
-    char *output = NULL; size_t length = 0;
-    int status = ready ? command_run(args, &output, &length, fileno(input)) : -1;
-    fclose(input);
-    if (!status) {
-        qsort(entries, (size_t)ws->count, sizeof *entries, compare_entry_paths);
-        for (size_t offset = 0; offset < length;) {
-            char *path = output + offset, *end = memchr(path, 0, length - offset);
-            if (!end) break;
-            CedEntry key = {.path = path}, *key_ptr = &key;
-            CedEntry **entry = bsearch(&key_ptr, entries, (size_t)ws->count, sizeof *entries, compare_entry_paths);
-            if (entry) (*entry)->ignored = true;
-            offset = (size_t)(end - output) + 1;
+        if (skip && skip[i]) continue;
+        const char *path = ws->entries[i].path;
+        size_t size = strlen(path) + 1;
+        /* A leading colon in a filename must not be treated as Git pathspec magic. */
+        if (fwrite("./", 1, 2, input) != 2 || fwrite(path, 1, size, input) != size) {
+            ready = false;
+            break;
         }
     }
-    free(output); free(entries);
+    if (fflush(input) || fseek(input, 0, SEEK_SET)) ready = false;
+    const char *args[] = {"git", "-C", ws->root, "check-ignore", "--stdin", "-z", NULL};
+    int status = ready ? command_run(args, output, length, fileno(input)) : -1;
+    fclose(input);
+    return status;
+}
+
+static bool skip_submodule_paths(const CedWorkspace *ws, CedEntry **entries, bool *skip) {
+    const char *args[] = {"git", "-C", ws->root, "ls-files", "--stage", "-z", NULL};
+    char *output = NULL;
+    size_t length = 0;
+    int status = command_run(args, &output, &length, -1);
+    bool found = false;
+    for (size_t offset = 0; !status && offset < length;) {
+        char *record = output + offset, *end = memchr(record, 0, length - offset);
+        if (!end) break;
+        size_t size = (size_t)(end - record);
+        if (size > 7 && !memcmp(record, "160000 ", 7)) {
+            char *tab = memchr(record, '\t', size);
+            CedEntry *entry = tab ? find_entry(entries, (size_t)ws->count, tab + 1) : NULL;
+            if (entry && entry->directory) {
+                skip[entry - ws->entries] = true;
+                found = true;
+            }
+        }
+        offset += size + 1;
+    }
+    free(output);
+    /* Entries are in depth-first order, with parents before their children. */
+    if (found) for (int i = 0; i < ws->count; i++) {
+        int parent = ws->entries[i].parent;
+        if (parent >= 0 && skip[parent]) skip[i] = true;
+    }
+    return found;
+}
+
+static void mark_ignored(CedWorkspace *ws) {
+    if (!ws->count) return;
+    CedEntry **entries = malloc((size_t)ws->count * sizeof *entries);
+    if (!entries) return;
+    for (int i = 0; i < ws->count; i++) entries[i] = &ws->entries[i];
+    qsort(entries, (size_t)ws->count, sizeof *entries, compare_entry_paths);
+
+    char *output = NULL;
+    size_t length = 0;
+    int status = check_ignored(ws, NULL, &output, &length);
+    /* Git aborts the entire batch if a path lies inside a registered submodule. */
+    if (status == 128) {
+        bool *skip = calloc((size_t)ws->count, sizeof *skip);
+        if (skip && skip_submodule_paths(ws, entries, skip)) {
+            free(output);
+            output = NULL;
+            length = 0;
+            status = check_ignored(ws, skip, &output, &length);
+        }
+        free(skip);
+    }
+    for (size_t offset = 0; !status && offset < length;) {
+        char *path = output + offset, *end = memchr(path, 0, length - offset);
+        if (!end) break;
+        if (end - path > 2 && path[0] == '.' && path[1] == '/') {
+            CedEntry *entry = find_entry(entries, (size_t)ws->count, path + 2);
+            if (entry) entry->ignored = true;
+        }
+        offset = (size_t)(end - output) + 1;
+    }
+    free(output);
+    free(entries);
 }
 
 bool ced_workspace_open(CedWorkspace *ws, const char *path, char *error) {
