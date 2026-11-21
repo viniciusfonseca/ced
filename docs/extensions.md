@@ -49,6 +49,7 @@ When `host.tabWidgets` is at least `1`, a model can also set `selectors` and `ch
 - With `host.tabWidgets` at least `4`, `chat.messages` also accepts `{role: "reasoning", id, text, status?}` and `{role: "tool", id, text, status, input?, output?}` in transcript order. Activity IDs must be unique in the model and stable across refreshes. Reasoning text renders as Markdown and can set `status: "running"` while streaming. Tool rows use `text` as the title and a status of `"pending"`, `"running"`, `"done"`, or `"failed"`. Tool titles are limited to 256 bytes. Optional input and output previews are limited to 1,024 bytes each. Previews count toward the combined transcript text budget.
 - With `host.tabWidgets` at least `5`, a chat's `input.stop` can provide an action ID for the composer. The composer shows Stop while this action is available and dispatches it with an empty value. A draft can be edited while Stop is shown and submitted after Send returns. The transcript follows new messages while scrolled to the bottom and offers a jump button while reading earlier messages.
 - With `host.tabWidgets` at least `6`, agent messages in the current turn may include an `id` for the typewriter animation. Keep the ID stable as text streams and unique in the transcript. History can omit the ID to display immediately.
+- With `host.tabWidgets` at least `7`, `chat.back` can provide an action ID for a left chevron before the chat title. Clicking it dispatches the action with an empty value.
 
 ## Installation and trust
 

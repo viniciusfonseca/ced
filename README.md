@@ -200,7 +200,7 @@ The current integration provides completion through a shortcut or palette comman
 
 ## Integrated terminal
 
-Click **Terminal** in the top bar or press Mod J. The panel offers **Bottom** and **Right** positions; moving it preserves the process and working directory. Drag the divider to resize it. The command palette also provides **Move Terminal Right** and **Move Terminal to Bottom**.
+Click the auxiliary panel icon next to the theme toggle in the top bar or press Mod J. The icon reflects the panel's **Bottom** or **Right** position. Moving the panel preserves the process and working directory. Drag the divider to resize it. The command palette also provides **Move Terminal Right** and **Move Terminal to Bottom**.
 
 The terminal starts the shell specified by `SHELL` (or `/bin/sh`) in the project folder. The session preserves `cd`, variables, and processes between commands. It supports ANSI colors, the alternate screen, function keys, and Ctrl+C to interrupt the foreground process. Drag to select and use Mod C to copy; Mod V pastes. On Linux, Ctrl Shift C/V also copies/pastes. The mouse wheel and Shift PageUp/PageDown navigate up to 2,000 lines of scrollback.
 

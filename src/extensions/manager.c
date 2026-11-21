@@ -156,7 +156,7 @@ static void initialize(CedExtensionInstance *i) {
     cJSON *p = cJSON_CreateObject(), *host = cJSON_AddObjectToObject(p, "host");
     cJSON_AddStringToObject(host, "name", "CED"); cJSON_AddStringToObject(host, "version", CED_EXTENSION_APP_VERSION);
     cJSON_AddNumberToObject(host, "tabProtocol", 1);
-    cJSON_AddNumberToObject(host, "tabWidgets", 6);
+    cJSON_AddNumberToObject(host, "tabWidgets", 7);
     cJSON *extension = cJSON_AddObjectToObject(p, "extension");
     cJSON_AddStringToObject(extension, "id", i->record.manifest.id);
     cJSON_AddStringToObject(extension, "version", i->record.manifest.version);
@@ -305,7 +305,7 @@ static bool valid_tab_selectors(const cJSON *selectors) {
 }
 
 static bool valid_tab_chat(const cJSON *chat) {
-    static const char *const fields[] = {"author", "messages", "status", NULL};
+    static const char *const fields[] = {"author", "messages", "status", "back", NULL};
     static const char *const message_fields[] = {"role", "text", NULL};
     static const char *const agent_fields[] = {"role", "text", "id", NULL};
     static const char *const reasoning_fields[] = {"role", "text", "id", "status", NULL};
@@ -314,9 +314,12 @@ static bool valid_tab_chat(const cJSON *chat) {
     const cJSON *messages = cJSON_GetObjectItemCaseSensitive(chat, "messages");
     const cJSON *status_item = cJSON_GetObjectItemCaseSensitive(chat, "status");
     const char *status = ced_ext_json_string(chat, "status");
+    const cJSON *back_item = cJSON_GetObjectItemCaseSensitive(chat, "back");
+    const char *back = ced_ext_json_string(chat, "back");
     if (!ced_ext_json_fields(chat, fields, error) ||
         !tab_text(ced_ext_json_string(chat, "author"), 80, false) ||
         !cJSON_IsArray(messages) || cJSON_GetArraySize(messages) > 64 ||
+        (back_item && (!tab_text(back, 128, false) || !*back || !strcmp(back, "refresh"))) ||
         (status_item && (!status || (strcmp(status, "pending") && strcmp(status, "running") &&
                                      strcmp(status, "failed"))))) return false;
     size_t bytes = 0;

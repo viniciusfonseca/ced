@@ -442,7 +442,14 @@ void ced_extension_tab_body(cui_ctx *ui, CedExtensions *m, const char *selected)
                 const char *text = ced_ext_json_string(model, "text");
                 if (chat) {
                     cui_row(ui, .width = CUI_FILL, .gap = 4, .align = CUI_ALIGN_CENTER, .wrap = true) {
-                        if (*heading) cui_text(ui, heading, .font = CUI_FONT_MEDIUM, .nowrap = true, .width = CUI_FILL);
+                        const char *back = ced_ext_json_string(chat, "back");
+                        cui_row(ui, .width = CUI_FILL, .gap = 4, .align = CUI_ALIGN_CENTER) {
+                            if (back && cui__icon_button_id(ui, cui_make_id(ui, "chat-back"), CUI_ICON_CHEVRON_LEFT,
+                                    &(cui_button_opts){.size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST,
+                                        .tooltip = "Back to sessions", .disabled = busy}))
+                                busy = ced_extensions_tab_action(instance, index, back, "");
+                            if (*heading) cui_text(ui, heading, .font = CUI_FONT_MEDIUM, .nowrap = true, .width = CUI_FILL);
+                        }
                         tab_buttons(ui, instance, index, actions, &busy);
                     }
                 } else if (*heading) cui_text(ui, heading, .font = CUI_FONT_MEDIUM, .width = CUI_FILL);

@@ -56,6 +56,32 @@ bool ced_menu_item_ex(cui_ctx *ui, const char *label, const cui_menu_item_opts *
     return clicked;
 }
 
+static void paint_aux_panel_icon(cui_ctx *ui, cui_node *node, void *data) {
+    const bool right = *(const bool *)data;
+    const float size = 12, divider = 8, stroke = 1.2f;
+    const cui_rect rect = {node->rect.x + (node->rect.w - size) * 0.5f,
+                           node->rect.y + (node->rect.h - size) * 0.5f, size, size};
+    const cui_color ink = CUI_C(ui, FOREGROUND);
+    cui_draw_rect_border(ui, rect, CUI_CORNERS(1.8f), (cui_color){0}, ink, stroke);
+    if (right)
+        cui_draw_line(ui, (cui_vec2){rect.x + divider, rect.y}, (cui_vec2){rect.x + divider, rect.y + size}, stroke, ink);
+    else
+        cui_draw_line(ui, (cui_vec2){rect.x, rect.y + divider}, (cui_vec2){rect.x + size, rect.y + divider}, stroke, ink);
+}
+
+bool ced_aux_panel_button(cui_ctx *ui, bool right, bool visible) {
+    int button = ui->node_count;
+    bool clicked = cui__icon_button_id(ui, cui_make_id(ui, "auxiliary-panel"), "",
+        &(cui_button_opts){.size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST, .selected = visible,
+            .tooltip = visible ? "Hide Auxiliary Panel" : "Show Auxiliary Panel"});
+    // The pinned CUI icon font only contains the left panel glyph.
+    bool *position = CUI_PAINT_DATA(ui, bool);
+    *position = right;
+    ui->nodes[button].paint = paint_aux_panel_icon;
+    ui->nodes[button].paint_data = position;
+    return clicked;
+}
+
 int ced_command_palette(cui_ctx *ui, bool *open, const cui_command *commands, int count) {
     int first = ui->node_count;
     int selected = cui_command_palette(ui, open, commands, count);

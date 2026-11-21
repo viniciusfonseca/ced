@@ -172,12 +172,12 @@ int main(int argc,char **argv) {
         "\"actions\":[{\"id\":\"session:1\",\"label\":\"Review editor settings\"},{\"id\":\"new:codex\",\"label\":\"New Session\"}]}");
     instance->tabs[1].model = cJSON_Parse(
         "{\"heading\":\"Review editor settings · Codex\",\"text\":\"\","
-        "\"actions\":[{\"id\":\"back\",\"label\":\"Sessions\"}],"
+        "\"actions\":[],"
         "\"selectors\":["
         "{\"id\":\"config:model\",\"label\":\"Model\",\"placement\":\"composer\",\"selected\":\"model-1\",\"options\":[{\"id\":\"model-1\",\"label\":\"GPT-5.4\"},{\"id\":\"model-2\",\"label\":\"GPT-5.4 Mini\"}]},"
         "{\"id\":\"config:effort\",\"label\":\"Effort\",\"placement\":\"composer\",\"selected\":\"high\",\"options\":["
         "{\"id\":\"low\",\"label\":\"Low\"},{\"id\":\"medium\",\"label\":\"Medium\"},{\"id\":\"high\",\"label\":\"High\"}]}],"
-        "\"chat\":{\"author\":\"Codex\",\"messages\":["
+        "\"chat\":{\"author\":\"Codex\",\"back\":\"back\",\"messages\":["
         "{\"role\":\"user\",\"text\":\"Where are the editor settings stored?\"},"
         "{\"role\":\"reasoning\",\"id\":\"1:1\",\"text\":\"**Check how preferences are loaded**\\n\\n"
         "- Inspect `preferences.json`.\\n- Confirm the *default path*.\"},"
@@ -193,6 +193,16 @@ int main(int argc,char **argv) {
     assert(ced_extension_tab_find(m, "example.uppercase-selection.term", NULL, NULL));
     render(ui,sw,m,argv[2],"extension-tabs.png");
     cui_push_id(ui, "example.uppercase-selection.term");
+    cui_rect back = cui_get_rect(ui, cui_make_id(ui, "chat-back"));
+    const char *heading = ced_ext_json_string(instance->tabs[1].model, "heading");
+    size_t heading_length = strlen(heading);
+    cui_rect title = {0};
+    for (int n = 0; n < ui->node_count; n++) {
+        const cui_node *node = &ui->nodes[n];
+        if (node->text && node->text_len == (int)heading_length && !memcmp(node->text, heading, heading_length))
+            title = node->rect;
+    }
+    assert(back.w > 0 && title.x >= back.x + back.w);
     cui_push_id(ui, "chat-activity");
     cui_id reasoning_id = cui_make_id(ui, "1:1");
     cui_id tool_id = cui_make_id(ui, "1:2");
@@ -308,6 +318,14 @@ int main(int argc,char **argv) {
     for (int n = 0; n < 8; n++) draw_frame(ui, m);
     test_chat_typewriter(ui, sw, m, argv[2]);
     test_chat_controls(ui, sw, m, argv[2]);
+    draw_frame(ui, m);
+    *m->error = 0;
+    cui_input_mouse_move(ui, back.x + back.w / 2, back.y + back.h / 2);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+    draw_frame(ui, m);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+    draw_frame(ui, m);
+    assert(!strcmp(m->error, "Restart the failed extension in Manage Extensions."));
     for (size_t n = 0; n < 2; n++) cJSON_Delete(instance->tabs[n].model);
     cui_destroy(ui); cui_sw_destroy(sw); ced_extension_record_free(&m->review); ced_extension_record_free(&m->instances[0].record); free(m);
     puts("OK: install review, manager, workspace trust and sidebar/terminal tabs rendered without a display"); return 0;

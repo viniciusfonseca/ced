@@ -1101,33 +1101,38 @@ static void terminal_panel(cui_ctx *ui, Editor *e) {
         e->terminal_view.autofocus = true;
     }
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .bg = CUI_COLOR_SURFACE_MUTED, .clip = true) {
-        cui_row(ui, .pad_x = 8, .pad_y = 4, .gap = 6) {
-            cui_text(ui, "Terminal", .font = CUI_FONT_MEDIUM, .size = 12, .width = CUI_FILL);
-            static const char *positions[] = {"Bottom", "Right"};
-            int position = e->terminal_right ? 1 : 0;
-            if (cui_segmented(ui, "terminal-position", positions, 2, &position, .size = CUI_SIZE_SM)) set_terminal_position(e, position == 1);
-            if (shell && cui_icon_button(ui, CUI_ICON_REFRESH_CW, .size = CUI_SIZE_SM, .tooltip = "Restart Terminal")) {
-                ced_terminal_stop(e->terminal); e->terminal = NULL;
-            }
-            if (cui_icon_button(ui, CUI_ICON_X, .size = CUI_SIZE_SM, .tooltip = "Hide Terminal")) dispatch(e,"ced.terminal.toggle");
-        }
+        cui_row(ui, .width = CUI_FILL, .pad_x = 8, .pad_y = 4, .gap = 6, .align = CUI_ALIGN_CENTER, .wrap = true) {
+            cui_column(ui, .width = CUI_FILL, .min_width = 120) {
+                cui_scroll(ui, .id = "terminal-tabs", .horizontal = true, .width = CUI_FILL, .height = CUI_PX(32)) {
+                    cui_row(ui, .width = CUI_FIT, .gap = 0) {
+                        cui_theme *theme = cui_theme_get(ui);
+                        float radius = theme->radius_control;
+                        theme->radius_control = 0;
+                        if (cui_button(ui, "Shell", .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST, .selected = shell)) {
 #ifdef CED_ENABLE_EXTENSIONS
-        if (ced_extension_has_tabs(e->extensions, true)) {
-            cui_scroll(ui, .id = "terminal-tabs", .horizontal = true, .width = CUI_FILL, .height = CUI_PX(32)) {
-                cui_row(ui, .width = CUI_FILL, .gap = 0, .pad_x = 4) {
-                    cui_theme *theme = cui_theme_get(ui);
-                    float radius = theme->radius_control;
-                    theme->radius_control = 0;
-                    if (cui_button(ui, "Shell", .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST, .selected = shell)) {
-                        *e->terminal_tab = 0;
-                        e->terminal_view.autofocus = true;
+                            *e->terminal_tab = 0;
+#endif
+                            e->terminal_view.autofocus = true;
+                        }
+#ifdef CED_ENABLE_EXTENSIONS
+                        ced_extension_tab_buttons(ui, e->extensions, true, e->terminal_tab);
+                        shell = !*e->terminal_tab;
+#endif
+                        theme->radius_control = radius;
                     }
-                    ced_extension_tab_buttons(ui, e->extensions, true, e->terminal_tab);
-                    theme->radius_control = radius;
                 }
             }
+            cui_row(ui, .width = CUI_FIT, .gap = 6, .align = CUI_ALIGN_CENTER) {
+                static const char *positions[] = {"Bottom", "Right"};
+                int position = e->terminal_right ? 1 : 0;
+                if (cui_segmented(ui, "terminal-position", positions, 2, &position, .size = CUI_SIZE_SM)) set_terminal_position(e, position == 1);
+                if (shell && cui_icon_button(ui, CUI_ICON_REFRESH_CW, .size = CUI_SIZE_SM, .tooltip = "Restart Terminal")) {
+                    ced_terminal_stop(e->terminal); e->terminal = NULL;
+                }
+                if (cui_icon_button(ui, CUI_ICON_X, .size = CUI_SIZE_SM, .tooltip = "Hide Terminal")) dispatch(e,"ced.terminal.toggle");
+            }
         }
-        shell = !*e->terminal_tab;
+#ifdef CED_ENABLE_EXTENSIONS
         if (!shell) {
             e->terminal_view.focused = false;
             ced_extension_tab_body(ui, e->extensions, e->terminal_tab);
@@ -1481,16 +1486,15 @@ static void frame(cui_ctx *ui, Editor *e) {
             if (inset > 0) cui_gap(ui, inset);
 #endif
             cui_toolbar_button(ui, CUI_ICON_PANEL_LEFT, .tooltip = "Toggle Sidebar", .toggle = &e->sidebar);
-            if (cui_toolbar_button(ui, CUI_ICON_PLUS, .label = "New")) dispatch(e, "ced.file.new");
             open_folder_menu(ui, e);
-            if (cui_toolbar_button(ui, CUI_ICON_SAVE, .label = "Save", .disabled = e->selected < 0)) dispatch(e, "ced.file.save");
-            if (cui_toolbar_button(ui, CUI_ICON_TERMINAL, .label = "Terminal")) dispatch(e, "ced.terminal.toggle");
 #ifdef __APPLE__
             cui_box(ui, .id = "titlebar-drag", .width = CUI_FILL, .height = CUI_PX(cui_theme_get(ui)->control_sm)) {}
 #else
             cui_toolbar_spacer(ui);
 #endif
-            cui_text(ui, "CED", .font = CUI_FONT_MEDIUM, .size = 12);
+            cui_row(ui, .width = CUI_FIT, .pad_x = 6) {
+                if (ced_aux_panel_button(ui, e->terminal_right, e->terminal_visible)) dispatch(e, "ced.terminal.toggle");
+            }
             cui_theme_toggle(ui);
         }
         cui_box(ui, .width = CUI_FILL, .height = CUI_FILL) {

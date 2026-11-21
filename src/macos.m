@@ -29,17 +29,25 @@ float ced_macos_layout_titlebar(cui_app *app, cui_rect toolbar) {
     // AppKit lays out the traffic lights before applying the toolbar's center.
     if (toolbar.h > 0) [window.contentView.superview layoutSubtreeIfNeeded];
     float right = 0;
+    CGFloat shift = 0;
+    bool leading = true;
     for (NSWindowButton kind = NSWindowCloseButton; kind <= NSWindowZoomButton; kind++) {
         NSButton *button = [window standardWindowButton:kind];
         if (!button || button.hidden) continue;
-        if (toolbar.h > 0 && button.superview) {
-            NSPoint center = [button.superview convertPoint:NSMakePoint(0, toolbar.y + toolbar.h * 0.5)
-                                                  fromView:window.contentView];
-            NSRect frame = button.frame;
-            NSPoint origin = NSMakePoint(NSMinX(frame), center.y - NSHeight(frame) * 0.5);
-            if (origin.y != NSMinY(frame)) [button setFrameOrigin:origin];
-        }
         NSRect rect = [window.contentView convertRect:button.bounds fromView:button];
+        if (toolbar.h > 0 && button.superview) {
+            if (leading) {
+                // Shift the group so its left inset equals the first button's vertical inset.
+                shift = toolbar.x + (toolbar.h - NSHeight(rect)) * 0.5 - NSMinX(rect);
+                leading = false;
+            }
+            NSPoint target = NSMakePoint(NSMidX(rect) + shift, toolbar.y + toolbar.h * 0.5);
+            NSPoint center = [button.superview convertPoint:target fromView:window.contentView];
+            NSRect frame = button.frame;
+            NSPoint origin = NSMakePoint(center.x - NSWidth(frame) * 0.5, center.y - NSHeight(frame) * 0.5);
+            if (!NSEqualPoints(origin, frame.origin)) [button setFrameOrigin:origin];
+            rect = [window.contentView convertRect:button.bounds fromView:button];
+        }
         if (NSMaxX(rect) > right) right = (float)NSMaxX(rect);
     }
     return right;
