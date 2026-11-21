@@ -1123,13 +1123,15 @@ static void terminal_panel(cui_ctx *ui, Editor *e) {
                 }
             }
             cui_row(ui, .width = CUI_FIT, .gap = 6, .align = CUI_ALIGN_CENTER) {
-                static const char *positions[] = {"Bottom", "Right"};
-                int position = e->terminal_right ? 1 : 0;
-                if (cui_segmented(ui, "terminal-position", positions, 2, &position, .size = CUI_SIZE_SM)) set_terminal_position(e, position == 1);
+                bool right = e->terminal_right;
+                if (ced_aux_panel_button(ui, "move-auxiliary-panel", right, false,
+                        right ? "Move Auxiliary Panel to Bottom" : "Move Auxiliary Panel Right")) {
+                    set_terminal_position(e, !right);
+                    cui_request_redraw(ui);
+                }
                 if (shell && cui_icon_button(ui, CUI_ICON_REFRESH_CW, .size = CUI_SIZE_SM, .tooltip = "Restart Terminal")) {
                     ced_terminal_stop(e->terminal); e->terminal = NULL;
                 }
-                if (cui_icon_button(ui, CUI_ICON_X, .size = CUI_SIZE_SM, .tooltip = "Hide Terminal")) dispatch(e,"ced.terminal.toggle");
             }
         }
 #ifdef CED_ENABLE_EXTENSIONS
@@ -1492,8 +1494,14 @@ static void frame(cui_ctx *ui, Editor *e) {
 #else
             cui_toolbar_spacer(ui);
 #endif
+            if (cui_toolbar_button(ui, CUI_ICON_COMMAND, .tooltip = "Command Palette", .shortcut = "Cmd/Ctrl Shift P")) {
+                ced_assist_reset(&e->assist);
+                e->palette = true;
+            }
             cui_row(ui, .width = CUI_FIT, .pad_x = 6) {
-                if (ced_aux_panel_button(ui, e->terminal_right, e->terminal_visible)) dispatch(e, "ced.terminal.toggle");
+                if (ced_aux_panel_button(ui, "auxiliary-panel", e->terminal_right, e->terminal_visible,
+                        e->terminal_visible ? "Hide Auxiliary Panel" : "Show Auxiliary Panel"))
+                    dispatch(e, "ced.terminal.toggle");
             }
             cui_theme_toggle(ui);
         }

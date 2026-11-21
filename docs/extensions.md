@@ -51,6 +51,7 @@ When `host.tabWidgets` is at least `1`, a model can also set `selectors` and `ch
 - With `host.tabWidgets` at least `6`, agent messages in the current turn may include an `id` for the typewriter animation. Keep the ID stable as text streams and unique in the transcript. History can omit the ID to display immediately.
 - With `host.tabWidgets` at least `7`, `chat.back` can provide an action ID for a left chevron before the chat title. Clicking it dispatches the action with an empty value.
 - With `host.tabWidgets` at least `8`, a tab without `chat` can provide `groups: [{label, create, items: [{id, label, delete}]}]`. Each group shows its label, square rows with a delete button each, and a New Session button at the end. Clicking a row dispatches its `id`, and the buttons dispatch the `delete` and `create` action IDs, all with empty values. A model supports at most 32 groups and 32 items total. Group labels are limited to 1,024 bytes and item labels to 256 bytes.
+- With `host.tabWidgets` at least `9`, a model can include up to three selectors. Composer selectors appear from left to right in model order. A chat can provide `approval: {title, actions: [{id, label}]}` to present a request above the composer. The title is limited to 320 bytes and the request can contain 1 to 13 actions with labels up to 128 bytes. Clicking an action dispatches its ID with an empty value.
 
 ## Installation and trust
 

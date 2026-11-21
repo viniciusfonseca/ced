@@ -69,11 +69,11 @@ static void paint_aux_panel_icon(cui_ctx *ui, cui_node *node, void *data) {
         cui_draw_line(ui, (cui_vec2){rect.x, rect.y + divider}, (cui_vec2){rect.x + size, rect.y + divider}, stroke, ink);
 }
 
-bool ced_aux_panel_button(cui_ctx *ui, bool right, bool visible) {
+bool ced_aux_panel_button(cui_ctx *ui, const char *id, bool right, bool selected, const char *tooltip) {
     int button = ui->node_count;
-    bool clicked = cui__icon_button_id(ui, cui_make_id(ui, "auxiliary-panel"), "",
-        &(cui_button_opts){.size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST, .selected = visible,
-            .tooltip = visible ? "Hide Auxiliary Panel" : "Show Auxiliary Panel"});
+    bool clicked = cui__icon_button_id(ui, cui_make_id(ui, id), "",
+        &(cui_button_opts){.size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST, .selected = selected,
+            .tooltip = tooltip});
     // The pinned CUI icon font only contains the left panel glyph.
     bool *position = CUI_PAINT_DATA(ui, bool);
     *position = right;

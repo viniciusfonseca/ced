@@ -156,7 +156,7 @@ static void initialize(CedExtensionInstance *i) {
     cJSON *p = cJSON_CreateObject(), *host = cJSON_AddObjectToObject(p, "host");
     cJSON_AddStringToObject(host, "name", "CED"); cJSON_AddStringToObject(host, "version", CED_EXTENSION_APP_VERSION);
     cJSON_AddNumberToObject(host, "tabProtocol", 1);
-    cJSON_AddNumberToObject(host, "tabWidgets", 8);
+    cJSON_AddNumberToObject(host, "tabWidgets", 9);
     cJSON *extension = cJSON_AddObjectToObject(p, "extension");
     cJSON_AddStringToObject(extension, "id", i->record.manifest.id);
     cJSON_AddStringToObject(extension, "version", i->record.manifest.version);
@@ -277,7 +277,7 @@ static bool valid_tab_choices(const cJSON *choices, int limit, size_t label_limi
 static bool valid_tab_selectors(const cJSON *selectors) {
     static const char *const fields[] = {"id", "label", "selected", "options", "disabled", "placement", NULL};
     char error[CED_ERROR];
-    if (!cJSON_IsArray(selectors) || cJSON_GetArraySize(selectors) > 2) return false;
+    if (!cJSON_IsArray(selectors) || cJSON_GetArraySize(selectors) > 3) return false;
     const cJSON *entry;
     cJSON_ArrayForEach(entry, selectors) {
         const char *id = ced_ext_json_string(entry, "id");
@@ -304,8 +304,21 @@ static bool valid_tab_selectors(const cJSON *selectors) {
     return true;
 }
 
+static bool valid_tab_approval(const cJSON *approval) {
+    static const char *const fields[] = {"title", "actions", NULL};
+    char error[CED_ERROR];
+    const cJSON *actions = cJSON_GetObjectItemCaseSensitive(approval, "actions");
+    if (!ced_ext_json_fields(approval, fields, error) ||
+        !tab_text(ced_ext_json_string(approval, "title"), 320, false) ||
+        !valid_tab_choices(actions, 13, 128) || !cJSON_GetArraySize(actions)) return false;
+    const cJSON *action;
+    cJSON_ArrayForEach(action, actions)
+        if (!strcmp(ced_ext_json_string(action, "id"), "refresh") || !*ced_ext_json_string(action, "label")) return false;
+    return true;
+}
+
 static bool valid_tab_chat(const cJSON *chat) {
-    static const char *const fields[] = {"author", "messages", "status", "back", NULL};
+    static const char *const fields[] = {"author", "messages", "status", "back", "approval", NULL};
     static const char *const message_fields[] = {"role", "text", NULL};
     static const char *const agent_fields[] = {"role", "text", "id", NULL};
     static const char *const reasoning_fields[] = {"role", "text", "id", "status", NULL};
@@ -316,10 +329,12 @@ static bool valid_tab_chat(const cJSON *chat) {
     const char *status = ced_ext_json_string(chat, "status");
     const cJSON *back_item = cJSON_GetObjectItemCaseSensitive(chat, "back");
     const char *back = ced_ext_json_string(chat, "back");
+    const cJSON *approval = cJSON_GetObjectItemCaseSensitive(chat, "approval");
     if (!ced_ext_json_fields(chat, fields, error) ||
         !tab_text(ced_ext_json_string(chat, "author"), 80, false) ||
         !cJSON_IsArray(messages) || cJSON_GetArraySize(messages) > 64 ||
         (back_item && (!tab_text(back, 128, false) || !*back || !strcmp(back, "refresh"))) ||
+        (approval && !valid_tab_approval(approval)) ||
         (status_item && (!status || (strcmp(status, "pending") && strcmp(status, "running") &&
                                      strcmp(status, "failed"))))) return false;
     size_t bytes = 0;

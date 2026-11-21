@@ -305,6 +305,11 @@ static void fit_model_label(cui_ctx *ui, cui_model *model, char *label, size_t c
     size_t length = strlen(name);
     if (!length || cui_measure_text(ui, CUI_FONT_MEDIUM, size, name, (int)length).width <= available) return;
     available -= cui_measure_text(ui, CUI_FONT_MEDIUM, size, "…", -1).width;
+    if (available < 0) {
+        model->name = "";
+        model->detail = name;
+        return;
+    }
     size_t end = length;
     do {
         do { end--; } while (end && !ced_utf8_boundary(name, length, end));
@@ -391,40 +396,44 @@ static void tab_composer(cui_ctx *ui, CedExtensionInstance *instance, size_t ind
     CedExtensionTabState *state = &instance->tabs[index];
     const char *stop = ced_ext_json_string(input, "stop");
     bool disabled = *busy || state->submitted || stop || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(input, "disabled"));
-    const cJSON *primary = NULL, *secondary = NULL, *selector;
+    const char *const scopes[] = {NULL, "secondary-picker", "approval-picker"};
+    const char *const browse[] = {"browse-models", "browse-effort", "browse-approval"};
+    const char *const labels[] = {"Browse all models…", "Browse all options…", "Browse all approval modes…"};
+    ComposerPicker pickers[3] = {0};
+    const cJSON *selector;
+    int count = 0;
     cJSON_ArrayForEach(selector, selectors) {
-        if (!composer_selector(selector)) continue;
-        if (!primary) primary = selector;
-        else secondary = selector;
+        if (composer_selector(selector)) {
+            composer_picker(&pickers[count], selector, disabled, labels[count]);
+            count++;
+        }
     }
-    ComposerPicker model = {0}, effort = {0};
-    composer_picker(&model, primary, disabled, "Browse all models…");
-    composer_picker(&effort, secondary, disabled, "Browse all options…");
     float width = cui_get_rect(ui, cui_make_id(ui, "tab-input")).w;
-    if (width > 0 && model.quick_count) {
-        // Reserve space for the attach and send buttons and the pickers' chevrons and padding.
-        float available = width - (effort.quick_count ? 166 : 123);
-        float effort_width = effort.quick_count ? fminf(160, available * .4f) : 0;
-        fit_model_label(ui, &model.quick[model.picked], model.compact, sizeof model.compact, available - effort_width);
-        if (effort.quick_count)
-            fit_model_label(ui, &effort.quick[effort.picked], effort.compact, sizeof effort.compact, effort_width);
+    if (width > 0 && count) {
+        // Reserve space for Attach, Send, the chevrons, padding, and gaps.
+        float available = fmaxf(0, width - (80 + 43 * count));
+        float secondary = count > 1 ? fminf(160, available / (count + 0.5f)) : 0;
+        for (int n = 0; n < count; n++) {
+            ComposerPicker *picker = &pickers[n];
+            float label_width = n ? secondary : available - secondary * (count - 1);
+            fit_model_label(ui, &picker->quick[picker->picked], picker->compact, sizeof picker->compact, label_width);
+        }
     }
 
     int event = 0;
-    bool model_changed = false, effort_changed = false;
+    bool changed[3] = {0};
     cui_push_disabled(ui, *busy || state->submitted || (disabled && !stop));
     cui_box(ui, .dir = CUI_STACK, .width = CUI_FILL, .align = CUI_ALIGN_START, .justify = CUI_JUSTIFY_END) {
         event = cui_chat_composer(ui, "tab-input", state->input, sizeof state->input,
             .placeholder = ced_ext_json_string(input, "placeholder"), .width = CUI_FILL, .max_lines = 3, .busy = stop != NULL);
-        if (model.quick_count) {
+        if (count) {
             // The attach button occupies 32 px plus the composer's 10 px inset and 6 px gap.
             cui_row(ui, .width = CUI_FIT, .pad_left = 48, .pad_bottom = 11, .gap = 6) {
                 cui_push_id(ui, "tab-input");
-                model_changed = draw_composer_picker(ui, "model", &model);
-                if (effort.quick_count) {
-                    cui_push_id(ui, "secondary-picker");
-                    effort_changed = draw_composer_picker(ui, effort.id, &effort);
-                    cui_pop_id(ui);
+                for (int n = 0; n < count; n++) {
+                    if (scopes[n]) cui_push_id(ui, scopes[n]);
+                    changed[n] = draw_composer_picker(ui, n ? pickers[n].id : "model", &pickers[n]);
+                    if (scopes[n]) cui_pop_id(ui);
                 }
                 cui_pop_id(ui);
             }
@@ -432,20 +441,20 @@ static void tab_composer(cui_ctx *ui, CedExtensionInstance *instance, size_t ind
     }
     cui_pop_disabled(ui);
 
-    int model_choice = composer_picker_choice(ui, &model, "browse-models", model_changed);
-    int effort_choice = composer_picker_choice(ui, &effort, "browse-effort", effort_changed);
+    int choices[3];
+    for (int n = 0; n < count; n++)
+        choices[n] = composer_picker_choice(ui, &pickers[n], browse[n], changed[n]);
     if (stop && !*busy && (event & CUI_COMPOSER_STOP)) {
         *busy = ced_extensions_tab_action(instance, index, stop, "");
         return;
     }
     if (disabled || *busy) return;
-    if (effort_choice >= 0 && effort_choice != effort.current) {
-        *busy = ced_extensions_tab_action(instance, index, effort.id, effort.values[effort_choice]);
-        return;
-    }
-    if (model_choice >= 0 && model_choice != model.current) {
-        *busy = ced_extensions_tab_action(instance, index, model.id, model.values[model_choice]);
-        return;
+    for (int n = 0; n < count; n++) {
+        ComposerPicker *picker = &pickers[n];
+        if (choices[n] >= 0 && choices[n] != picker->current) {
+            *busy = ced_extensions_tab_action(instance, index, picker->id, picker->values[choices[n]]);
+            return;
+        }
     }
     if ((event & CUI_COMPOSER_SEND) && *state->input) {
         *busy = ced_extensions_tab_action(instance, index, ced_ext_json_string(input, "id"), state->input);
@@ -504,6 +513,17 @@ void ced_extension_tab_body(cui_ctx *ui, CedExtensions *m, const char *selected)
                         if (groups) tab_groups(ui, instance, index, groups, &busy);
                         tab_buttons(ui, instance, index, actions, &busy);
                     }
+                }
+                const cJSON *approval = cJSON_GetObjectItemCaseSensitive(chat, "approval");
+                if (approval) {
+                    cui_push_id(ui, "chat-approval");
+                    cui_column(ui, .width = CUI_FILL, .pad = 6, .gap = 4, .bg = CUI_COLOR_SURFACE_MUTED) {
+                        cui_text(ui, ced_ext_json_string(approval, "title"), .width = CUI_FILL, .font = CUI_FONT_MEDIUM);
+                        cui_row(ui, .width = CUI_FILL, .gap = 4, .wrap = true) {
+                            tab_buttons(ui, instance, index, cJSON_GetObjectItemCaseSensitive(approval, "actions"), &busy);
+                        }
+                    }
+                    cui_pop_id(ui);
                 }
                 if (input) {
                     const char *input_id = ced_ext_json_string(input, "id");

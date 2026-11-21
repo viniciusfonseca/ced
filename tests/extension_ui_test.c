@@ -178,7 +178,9 @@ int main(int argc,char **argv) {
         "\"selectors\":["
         "{\"id\":\"config:model\",\"label\":\"Model\",\"placement\":\"composer\",\"selected\":\"model-1\",\"options\":[{\"id\":\"model-1\",\"label\":\"GPT-5.4\"},{\"id\":\"model-2\",\"label\":\"GPT-5.4 Mini\"}]},"
         "{\"id\":\"config:effort\",\"label\":\"Effort\",\"placement\":\"composer\",\"selected\":\"high\",\"options\":["
-        "{\"id\":\"low\",\"label\":\"Low\"},{\"id\":\"medium\",\"label\":\"Medium\"},{\"id\":\"high\",\"label\":\"High\"}]}],"
+        "{\"id\":\"low\",\"label\":\"Low\"},{\"id\":\"medium\",\"label\":\"Medium\"},{\"id\":\"high\",\"label\":\"High\"}]},"
+        "{\"id\":\"config:mode\",\"label\":\"Approval Mode\",\"placement\":\"composer\",\"selected\":\"manual\",\"options\":["
+        "{\"id\":\"manual\",\"label\":\"Manual\"},{\"id\":\"auto\",\"label\":\"Automatic\"}]}],"
         "\"chat\":{\"author\":\"Codex\",\"back\":\"back\",\"messages\":["
         "{\"role\":\"user\",\"text\":\"Where are the editor settings stored?\"},"
         "{\"role\":\"reasoning\",\"id\":\"1:1\",\"text\":\"**Check how preferences are loaded**\\n\\n"
@@ -246,6 +248,9 @@ int main(int argc,char **argv) {
     cui_pop_id(ui);
     cui_pop_id(ui);
     cui_pop_id(ui);
+    cui_push_id(ui, "approval-picker");
+    cui_rect approval_picker = cui_get_rect(ui, cui_make_id(ui, "config:mode"));
+    cui_pop_id(ui);
     cui_pop_id(ui);
     cui_pop_id(ui);
     cui_pop_id(ui);
@@ -255,6 +260,8 @@ int main(int argc,char **argv) {
     assert(effort_picker.w > 0 && effort_picker.x == model_picker.x + model_picker.w + 6);
     assert(effort_picker.y + effort_picker.h <= composer.y + composer.h);
     assert(effort_picker.h == model_picker.h && effort_picker.y == model_picker.y);
+    assert(approval_picker.w > 0 && approval_picker.x == effort_picker.x + effort_picker.w + 6);
+    assert(approval_picker.h == effort_picker.h && approval_picker.y == effort_picker.y);
     cui_input_mouse_move(ui, effort_picker.x + effort_picker.w / 2, effort_picker.y + effort_picker.h / 2);
     cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
     draw_frame(ui, m);
@@ -343,6 +350,30 @@ int main(int argc,char **argv) {
     draw_frame(ui, m);
     *m->error = 0;
     cui_input_mouse_move(ui, back.x + back.w / 2, back.y + back.h / 2);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+    draw_frame(ui, m);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+    draw_frame(ui, m);
+    assert(!strcmp(m->error, "Restart the failed extension in Manage Extensions."));
+    cJSON *chat = cJSON_GetObjectItemCaseSensitive(instance->tabs[1].model, "chat");
+    cJSON *input = cJSON_GetObjectItemCaseSensitive(instance->tabs[1].model, "input");
+    cJSON *approval = cJSON_Parse("{\"title\":\"Approval required · Read settings\","
+        "\"actions\":[{\"id\":\"approve\",\"label\":\"Allow once\"},{\"id\":\"deny\",\"label\":\"Deny\"}]}");
+    assert(approval && cJSON_AddItemToObject(chat, "approval", approval) && cJSON_AddStringToObject(input, "stop", "stop"));
+    render(ui, sw, m, argv[2], "extension-chat-approval.png");
+    cui_push_id(ui, "example.uppercase-selection.term");
+    cui_push_id(ui, "chat-approval");
+    cui_push_id(ui, "approve");
+    cui_rect allow = cui_get_rect(ui, cui_make_id(ui, "Allow once"));
+    cui_pop_id(ui);
+    cui_pop_id(ui);
+    cui_push_id(ui, "send");
+    composer = cui_get_rect(ui, cui_make_id(ui, "tab-input"));
+    cui_pop_id(ui);
+    cui_pop_id(ui);
+    assert(allow.w > 0 && allow.y + allow.h <= composer.y);
+    *m->error = 0;
+    cui_input_mouse_move(ui, allow.x + allow.w / 2, allow.y + allow.h / 2);
     cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
     draw_frame(ui, m);
     cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
