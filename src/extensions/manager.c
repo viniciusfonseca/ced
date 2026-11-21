@@ -156,7 +156,7 @@ static void initialize(CedExtensionInstance *i) {
     cJSON *p = cJSON_CreateObject(), *host = cJSON_AddObjectToObject(p, "host");
     cJSON_AddStringToObject(host, "name", "CED"); cJSON_AddStringToObject(host, "version", CED_EXTENSION_APP_VERSION);
     cJSON_AddNumberToObject(host, "tabProtocol", 1);
-    cJSON_AddNumberToObject(host, "tabWidgets", 7);
+    cJSON_AddNumberToObject(host, "tabWidgets", 8);
     cJSON *extension = cJSON_AddObjectToObject(p, "extension");
     cJSON_AddStringToObject(extension, "id", i->record.manifest.id);
     cJSON_AddStringToObject(extension, "version", i->record.manifest.version);
@@ -360,8 +360,40 @@ static bool valid_tab_chat(const cJSON *chat) {
     return true;
 }
 
+static bool tab_action_id(const char *id) {
+    return tab_text(id, 128, false) && *id && strcmp(id, "refresh");
+}
+
+static bool valid_tab_groups(const cJSON *groups) {
+    static const char *const group_fields[] = {"label", "create", "items", NULL};
+    static const char *const item_fields[] = {"id", "label", "delete", NULL};
+    char error[CED_ERROR];
+    const cJSON *group, *item;
+    int count = 0;
+    if (!cJSON_IsArray(groups) || cJSON_GetArraySize(groups) > 32) return false;
+    cJSON_ArrayForEach(group, groups) {
+        const char *create = ced_ext_json_string(group, "create");
+        const cJSON *items = cJSON_GetObjectItemCaseSensitive(group, "items");
+        if (!ced_ext_json_fields(group, group_fields, error) ||
+            !tab_text(ced_ext_json_string(group, "label"), 1024, false) ||
+            !tab_action_id(create) || !cJSON_IsArray(items)) return false;
+        for (const cJSON *previous = groups->child; previous != group; previous = previous->next)
+            if (!strcmp(create, ced_ext_json_string(previous, "create"))) return false;
+        cJSON_ArrayForEach(item, items) {
+            const char *id = ced_ext_json_string(item, "id");
+            const char *remove = ced_ext_json_string(item, "delete");
+            if (++count > 32 || !ced_ext_json_fields(item, item_fields, error) ||
+                !tab_text(ced_ext_json_string(item, "label"), 256, false) ||
+                !tab_action_id(id) || !tab_action_id(remove) || !strcmp(id, remove)) return false;
+            for (const cJSON *previous = items->child; previous != item; previous = previous->next)
+                if (!strcmp(id, ced_ext_json_string(previous, "id"))) return false;
+        }
+    }
+    return true;
+}
+
 static bool valid_tab_model(const cJSON *model) {
-    static const char *const fields[] = {"heading", "text", "actions", "input", "refresh", "selectors", "chat", NULL};
+    static const char *const fields[] = {"heading", "text", "actions", "input", "refresh", "selectors", "chat", "groups", NULL};
     static const char *const input_fields[] = {"id", "label", "placeholder", "disabled", "stop", NULL};
     char error[CED_ERROR];
     if (!ced_ext_json_fields(model, fields, error)) return false;
@@ -370,10 +402,12 @@ static bool valid_tab_model(const cJSON *model) {
     const cJSON *refresh = cJSON_GetObjectItemCaseSensitive(model, "refresh");
     const cJSON *selectors = cJSON_GetObjectItemCaseSensitive(model, "selectors");
     const cJSON *chat = cJSON_GetObjectItemCaseSensitive(model, "chat");
+    const cJSON *groups = cJSON_GetObjectItemCaseSensitive(model, "groups");
     if (!tab_text(ced_ext_json_string(model, "heading"), 256, false) ||
         !tab_text(ced_ext_json_string(model, "text"), 24000, true) ||
         !valid_tab_choices(actions, 32, 256) || (refresh && !cJSON_IsBool(refresh)) ||
-        (selectors && !valid_tab_selectors(selectors)) || (chat && !valid_tab_chat(chat))) return false;
+        (selectors && !valid_tab_selectors(selectors)) || (chat && !valid_tab_chat(chat)) ||
+        (groups && (chat || !valid_tab_groups(groups)))) return false;
     const cJSON *action;
     cJSON_ArrayForEach(action, actions)
         if (!strcmp(ced_ext_json_string(action, "id"), "refresh")) return false;

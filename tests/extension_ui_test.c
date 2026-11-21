@@ -169,7 +169,9 @@ int main(int argc,char **argv) {
         "{\"heading\":\"Agents\",\"text\":\"\","
         "\"selectors\":[{\"id\":\"harness\",\"label\":\"Harness\",\"selected\":\"codex\","
         "\"options\":[{\"id\":\"codex\",\"label\":\"Codex\"},{\"id\":\"claude\",\"label\":\"Claude Code\"},{\"id\":\"devin\",\"label\":\"Devin\"}]}],"
-        "\"actions\":[{\"id\":\"session:1\",\"label\":\"Review editor settings\"},{\"id\":\"new:codex\",\"label\":\"New Session\"}]}");
+        "\"actions\":[],\"groups\":[{\"label\":\"/projects/editor\",\"create\":\"new-directory:editor\",\"items\":["
+        "{\"id\":\"session:1\",\"label\":\"Review editor settings\",\"delete\":\"delete:session:1\"},"
+        "{\"id\":\"session:2\",\"label\":\"Write tests\",\"delete\":\"delete:session:2\"}]}]}");
     instance->tabs[1].model = cJSON_Parse(
         "{\"heading\":\"Review editor settings · Codex\",\"text\":\"\","
         "\"actions\":[],"
@@ -192,6 +194,26 @@ int main(int argc,char **argv) {
     assert(ced_extension_tab_find(m, "example.uppercase-selection.side", NULL, NULL));
     assert(ced_extension_tab_find(m, "example.uppercase-selection.term", NULL, NULL));
     render(ui,sw,m,argv[2],"extension-tabs.png");
+    cui_push_id(ui, "example.uppercase-selection.side");
+    cui_rect contents = cui_get_rect(ui, cui_make_id(ui, "contents"));
+    cui_push_id(ui, "new-directory:editor");
+    cui_rect create = cui_get_rect(ui, cui_make_id(ui, "New Session"));
+    cui_push_id(ui, "session:1");
+    cui_id first_id = cui_make_id(ui, "Review editor settings");
+    cui_rect first = cui_get_rect(ui, first_id);
+    cui_rect remove = cui_get_rect(ui, cui__hash_str(CUI_ICON_TRASH_2, cui_make_id(ui, "Delete session")));
+    cui_pop_id(ui);
+    cui_push_id(ui, "session:2");
+    cui_rect second = cui_get_rect(ui, cui_make_id(ui, "Write tests"));
+    cui_pop_id(ui);
+    cui_pop_id(ui);
+    cui_pop_id(ui);
+    assert(first.x == contents.x && first.w > 0 && remove.w > 0);
+    assert(first.x + first.w == remove.x && remove.x + remove.w == contents.x + contents.w);
+    assert(first.y + first.h == second.y && second.y + second.h == create.y && create.w == contents.w);
+    for (int n = 0; n < ui->node_count; n++) {
+        if (ui->nodes[n].id == first_id) assert(ui->nodes[n].radius.tl == 0 && ui->nodes[n].radius.br == 0);
+    }
     cui_push_id(ui, "example.uppercase-selection.term");
     cui_rect back = cui_get_rect(ui, cui_make_id(ui, "chat-back"));
     const char *heading = ced_ext_json_string(instance->tabs[1].model, "heading");

@@ -50,6 +50,7 @@ When `host.tabWidgets` is at least `1`, a model can also set `selectors` and `ch
 - With `host.tabWidgets` at least `5`, a chat's `input.stop` can provide an action ID for the composer. The composer shows Stop while this action is available and dispatches it with an empty value. A draft can be edited while Stop is shown and submitted after Send returns. The transcript follows new messages while scrolled to the bottom and offers a jump button while reading earlier messages.
 - With `host.tabWidgets` at least `6`, agent messages in the current turn may include an `id` for the typewriter animation. Keep the ID stable as text streams and unique in the transcript. History can omit the ID to display immediately.
 - With `host.tabWidgets` at least `7`, `chat.back` can provide an action ID for a left chevron before the chat title. Clicking it dispatches the action with an empty value.
+- With `host.tabWidgets` at least `8`, a tab without `chat` can provide `groups: [{label, create, items: [{id, label, delete}]}]`. Each group shows its label, square rows with a delete button each, and a New Session button at the end. Clicking a row dispatches its `id`, and the buttons dispatch the `delete` and `create` action IDs, all with empty values. A model supports at most 32 groups and 32 items total. Group labels are limited to 1,024 bytes and item labels to 256 bytes.
 
 ## Installation and trust
 

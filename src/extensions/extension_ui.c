@@ -106,6 +106,47 @@ static void tab_buttons(cui_ctx *ui, CedExtensionInstance *instance, size_t inde
     }
 }
 
+static bool tab_list_button(cui_ctx *ui, const char *label, const char *icon, bool busy) {
+    int node = ui->node_count;
+    bool clicked = cui_button(ui, label, .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST,
+        .width = CUI_FILL, .icon = icon, .tooltip = icon ? NULL : label, .disabled = busy);
+    ui->nodes[node].justify = CUI_JUSTIFY_START;
+    ui->nodes[node].flags |= CUI_NF_CLIP;
+    return clicked;
+}
+
+static void tab_groups(cui_ctx *ui, CedExtensionInstance *instance, size_t index,
+    const cJSON *groups, bool *busy) {
+    cui_theme *theme = cui_theme_get(ui);
+    float radius = theme->radius_control;
+    theme->radius_control = 0;
+    const cJSON *group, *item;
+    cJSON_ArrayForEach(group, groups) {
+        const char *create = ced_ext_json_string(group, "create");
+        cui_push_id(ui, create);
+        cui_column(ui, .width = CUI_FILL, .gap = 0, .pad_y = 4) {
+            cui_text(ui, ced_ext_json_string(group, "label"), .width = CUI_FILL, .size = 12,
+                .color = CUI_COLOR_TEXT_SECONDARY);
+            cJSON_ArrayForEach(item, cJSON_GetObjectItemCaseSensitive(group, "items")) {
+                const char *id = ced_ext_json_string(item, "id");
+                cui_push_id(ui, id);
+                cui_row(ui, .width = CUI_FILL, .gap = 0, .clip = true) {
+                    if (tab_list_button(ui, ced_ext_json_string(item, "label"), NULL, *busy))
+                        *busy = ced_extensions_tab_action(instance, index, id, "");
+                    if (cui_icon_button(ui, CUI_ICON_TRASH_2, .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST,
+                            .tooltip = "Delete session", .disabled = *busy))
+                        *busy = ced_extensions_tab_action(instance, index, ced_ext_json_string(item, "delete"), "");
+                }
+                cui_pop_id(ui);
+            }
+            if (tab_list_button(ui, "New Session", CUI_ICON_PLUS, *busy))
+                *busy = ced_extensions_tab_action(instance, index, create, "");
+        }
+        cui_pop_id(ui);
+    }
+    theme->radius_control = radius;
+}
+
 static bool tab_activity(cui_ctx *ui, const cJSON *message, const char *role) {
     bool reasoning = !strcmp(role, "reasoning");
     if (!reasoning && strcmp(role, "tool")) return false;
@@ -439,6 +480,7 @@ void ced_extension_tab_body(cui_ctx *ui, CedExtensions *m, const char *selected)
                 const cJSON *actions = cJSON_GetObjectItemCaseSensitive(model, "actions");
                 const cJSON *input = cJSON_GetObjectItemCaseSensitive(model, "input");
                 const cJSON *selectors = cJSON_GetObjectItemCaseSensitive(model, "selectors");
+                const cJSON *groups = cJSON_GetObjectItemCaseSensitive(model, "groups");
                 const char *text = ced_ext_json_string(model, "text");
                 if (chat) {
                     cui_row(ui, .width = CUI_FILL, .gap = 4, .align = CUI_ALIGN_CENTER, .wrap = true) {
@@ -458,8 +500,9 @@ void ced_extension_tab_body(cui_ctx *ui, CedExtensions *m, const char *selected)
                 else {
                     state->chat_open = false;
                     cui_scroll(ui, .id = "contents", .height = CUI_FILL, .width = CUI_FILL, .gap = 4) {
-                        tab_buttons(ui, instance, index, actions, &busy);
                         if (*text) cui_text(ui, text, .width = CUI_FILL);
+                        if (groups) tab_groups(ui, instance, index, groups, &busy);
+                        tab_buttons(ui, instance, index, actions, &busy);
                     }
                 }
                 if (input) {
