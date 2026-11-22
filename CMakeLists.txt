@@ -25,6 +25,12 @@ set(CUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(CUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(CED_CUI_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/CUI")
 add_subdirectory(third_party/CUI EXCLUDE_FROM_ALL)
+# Keep the pinned toolkit unchanged and extend its editor/diff language table.
+set_property(SOURCE "${CED_CUI_SOURCE_DIR}/src/cui_code.c" TARGET_DIRECTORY cui
+    APPEND PROPERTY COMPILE_DEFINITIONS
+    cui__lang_for=cui__builtin_lang_for cui__tokenize_lang=cui__builtin_tokenize_lang)
+target_sources(cui PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/editor_syntax.c")
+target_include_directories(cui PRIVATE "${CED_CUI_SOURCE_DIR}/src")
 find_package(Threads REQUIRED)
 find_package(Perl REQUIRED)
 
@@ -61,7 +67,7 @@ add_custom_target(ced_vterm_encodings DEPENDS ${CED_VTERM_ENCODINGS})
 add_dependencies(ced_vterm ced_vterm_encodings)
 target_include_directories(ced_vterm PRIVATE "${CED_VTERM_GENERATED}")
 
-add_library(ced_core src/workspace.c src/preferences.c src/lsp.c src/terminal.c src/process_memory.c src/documents.c src/commands.c)
+add_library(ced_core src/workspace.c src/output.c src/preferences.c src/jvm_project.c src/lsp.c src/terminal.c src/process_memory.c src/documents.c src/commands.c)
 if(WIN32)
     target_sources(ced_core PRIVATE src/windows_compat.c src/windows_process.c src/windows_files.c)
     target_compile_definitions(ced_core PUBLIC _WIN32_WINNT=0x0A00 WINVER=0x0A00)
@@ -90,7 +96,7 @@ target_sources(ced PRIVATE src/editor_bridge.c)
 if(CED_ENABLE_EXTENSIONS)
     add_library(ced_extensions STATIC src/rpc_transport.c src/extensions/json.c
         src/extensions/manifest.c src/extensions/sha256.c src/extensions/catalog.c src/extensions/process.c
-        src/extensions/manager.c src/extensions/broker.c)
+        src/extensions/manager.c src/extensions/broker.c src/extensions/lsp_launch.c)
     target_link_libraries(ced_extensions PUBLIC ced_core)
     target_compile_options(ced_extensions PRIVATE -Wall -Wextra -Wpedantic)
     target_link_libraries(ced PRIVATE ced_extensions)

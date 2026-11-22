@@ -1,4 +1,5 @@
 #include "lsp.h"
+#include "output.h"
 #include "cJSON.h"
 
 #include <ctype.h>
@@ -36,7 +37,14 @@ struct CedLsp {
 #endif
     int fd;
     pid_t pid;
-    bool ready, running, shutting_down;
+    bool ready, running, shutting_down, incremental, project_warning;
+    CedLspLanguage language;
+    char label[64], root[CED_PATH];
+    cJSON *settings;
+#ifndef _WIN32
+    char maven_directory[48];
+    int stderr_fd, log_fd;
+#endif
     int next_id, next_version, request_id, request_version, shutdown_id;
     double initialize_started, request_started;
     char status[160];
@@ -154,19 +162,29 @@ bool ced_lsp_path(const char *uri, char *out, size_t cap) {
     return true;
 }
 
-bool ced_lsp_language(const char *path) {
-    const char *language = ced_language(path);
-    return !strcmp(language, "c") || !strcmp(language, "cpp");
+CedLspLanguage ced_lsp_language_kind(const char *path) {
+    const char *language=ced_language(path);
+    if (!strcmp(language,"c") || !strcmp(language,"cpp")) return CED_LSP_C;
+    if (!strcmp(language,"java")) return CED_LSP_JAVA;
+    if (!strcmp(language,"kotlin")) return CED_LSP_KOTLIN;
+    return CED_LSP_NONE;
 }
+
+bool ced_lsp_language(const char *path) { return ced_lsp_language_kind(path)!=CED_LSP_NONE; }
 
 static Document *document(CedLsp *lsp, const char *path) {
     for (int i = 0; i < lsp->document_count; i++) if (!strcmp(lsp->documents[i]->path, path)) return lsp->documents[i];
     return NULL;
 }
 
+static void status_text(CedLsp *lsp, const char *status) {
+    snprintf(lsp->status,sizeof lsp->status,"%s: %s",lsp->label,status);
+}
+
 static void stopped(CedLsp *lsp, const char *status) {
-    lsp->ready = false; lsp->running = false;
-    snprintf(lsp->status, sizeof lsp->status, "%s", status);
+    lsp->ready=false; lsp->running=false;
+    status_text(lsp,status);
+    if (!lsp->shutting_down) ced_output_text(lsp->label,status);
 }
 
 /* All I/O is nonblocking. Partial writes stay queued; stdout is framed by
@@ -255,11 +273,16 @@ static void hover_text(cJSON *contents, char *out, size_t cap) {
 static void response(CedLsp *lsp, cJSON *message) {
     int id = number(item(message, "id"));
     if (id == 1 && !lsp->shutting_down) {
-        if (item(message, "error")) { stopped(lsp, "clangd: initialization failed"); return; }
+        if (item(message, "error")) {
+            ced_output_text(lsp->label,string(item(item(message,"error"),"message")));
+            stopped(lsp,"initialization failed"); return;
+        }
         cJSON *encoding = item(item(item(message, "result"), "capabilities"), "positionEncoding");
-        if (cJSON_IsString(encoding) && strcmp(string(encoding), "utf-16")) { stopped(lsp, "clangd: unsupported position encoding"); return; }
+        if (cJSON_IsString(encoding) && strcmp(string(encoding), "utf-16")) { stopped(lsp, "unsupported position encoding"); return; }
+        cJSON *sync=item(item(item(message,"result"),"capabilities"),"textDocumentSync");
+        lsp->incremental=number(cJSON_IsObject(sync) ? item(sync,"change") : sync)==2;
         lsp->ready = send_message(lsp, "initialized", cJSON_CreateObject(), 0);
-        snprintf(lsp->status, sizeof lsp->status, "clangd: %s", lsp->ready ? "ready" : "failed");
+        status_text(lsp,lsp->ready ? (lsp->language==CED_LSP_JAVA ? "indexing" : "ready") : "failed");
         return;
     }
     if (id == lsp->shutdown_id && lsp->shutting_down) { send_message(lsp, "exit", NULL, 0); return; }
@@ -318,22 +341,65 @@ static void response(CedLsp *lsp, cJSON *message) {
     r->ready = true;
 }
 
+static cJSON *workspace_folders(const char *root) {
+    cJSON *folders=cJSON_CreateArray(), *folder=cJSON_CreateObject();
+    char *uri=ced_lsp_uri(root);
+    if (uri) cJSON_AddStringToObject(folder,"uri",uri);
+    free(uri);
+    cJSON_AddStringToObject(folder,"name",ced_basename(root));
+    add_element(folders,folder);
+    return folders;
+}
+
+static const cJSON *configuration_section(const cJSON *settings, const char *section) {
+    for (const char *end; *section; section=end+1) {
+        end=strchr(section,'.');
+        if (!end) return item(settings,section);
+        const cJSON *value=NULL;
+        for (const cJSON *entry=settings ? settings->child : NULL;entry;entry=entry->next)
+            if (entry->string && strlen(entry->string)==(size_t)(end-section) &&
+                !strncmp(entry->string,section,(size_t)(end-section))) { value=entry; break; }
+        settings=value;
+    }
+    return settings;
+}
+
 static void handle(CedLsp *lsp, const char *body, size_t length) {
     cJSON *message = cJSON_ParseWithLength(body, length);
-    if (!message) { stopped(lsp, "clangd: invalid JSON"); return; }
+    if (!message) { stopped(lsp, "invalid JSON"); return; }
     const char *method = string(item(message, "method"));
-    if (!strcmp(method, "textDocument/publishDiagnostics")) diagnostic_message(lsp, item(message, "params"));
-    else if (*method && item(message, "id")) {
+    const cJSON *params=item(message,"params");
+    if (!strcmp(method,"window/logMessage") || !strcmp(method,"window/showMessage") ||
+        !strcmp(method,"window/showMessageRequest") || !strcmp(method,"intellij/importLog"))
+        ced_output_text(lsp->label,string(item(params,"message")));
+    if (!strcmp(method,"textDocument/publishDiagnostics")) diagnostic_message(lsp,item(message,"params"));
+    else if (lsp->language==CED_LSP_JAVA && !strcmp(method,"language/status")) {
+        const char *type=string(item(params,"type"));
+        if (!strcmp(type,"ProjectStatus")) {
+            lsp->project_warning=strcmp(string(item(params,"message")),"OK")!=0;
+        } else if (!strcmp(type,"ServiceReady")) status_text(lsp,lsp->project_warning ? "check project import" : "ready");
+        else if (!strcmp(type,"Starting") || !strcmp(type,"Started")) status_text(lsp,"indexing");
+        else if (!strcmp(type,"Error")) status_text(lsp,"project import failed");
+    } else if (lsp->language==CED_LSP_KOTLIN && !strcmp(method,"intellij/importLog")) {
+        if (cJSON_IsTrue(item(params,"failed"))) status_text(lsp,"project import failed");
+        else if (cJSON_IsTrue(item(params,"succeeded"))) status_text(lsp,"ready");
+        else if (cJSON_IsTrue(item(params,"started"))) status_text(lsp,"importing");
+    } else if (*method && item(message, "id")) {
         /* Reply to server requests instead of leaving the server waiting. */
         cJSON *reply = cJSON_CreateObject();
         cJSON_AddStringToObject(reply, "jsonrpc", "2.0");
         add_item(reply, "id", cJSON_Duplicate(item(message, "id"), false));
         if (!strcmp(method, "workspace/configuration")) {
             cJSON *values = cJSON_CreateArray();
-            int count = cJSON_GetArraySize(item(item(message, "params"), "items"));
-            for (int i = 0; i < count; i++) add_element(values, cJSON_CreateNull());
+            const cJSON *entry;
+            cJSON_ArrayForEach(entry,item(item(message,"params"),"items")) {
+                const cJSON *value=configuration_section(lsp->settings,string(item(entry,"section")));
+                add_element(values,value ? cJSON_Duplicate(value,true) : cJSON_CreateNull());
+            }
             add_item(reply, "result", values);
-        } else if (!strcmp(method, "client/registerCapability") || !strcmp(method, "window/workDoneProgress/create")) cJSON_AddNullToObject(reply, "result");
+        } else if (!strcmp(method,"workspace/workspaceFolders")) add_item(reply,"result",workspace_folders(lsp->root));
+        else if (!strcmp(method, "client/registerCapability") || !strcmp(method, "client/unregisterCapability") ||
+            !strcmp(method,"window/showMessageRequest") || !strcmp(method, "window/workDoneProgress/create")) cJSON_AddNullToObject(reply, "result");
         else {
             cJSON *error = cJSON_CreateObject();
             cJSON_AddNumberToObject(error, "code", -32601);
@@ -345,12 +411,40 @@ static void handle(CedLsp *lsp, const char *body, size_t length) {
     cJSON_Delete(message);
 }
 
-void ced_lsp_poll(CedLsp *lsp) {
-    if (!lsp || !lsp->running) return;
-    if (!lsp->ready && !lsp->shutting_down && now() - lsp->initialize_started > 10) {
-        stopped(lsp, "clangd: initialization timed out"); return;
+static void drain_stderr(CedLsp *lsp) {
+    char bytes[8192];
+    for (int i=0;i<4;i++) {
+#ifdef _WIN32
+        ssize_t n=ced_windows_read_stderr(&lsp->process,bytes,sizeof bytes);
+#else
+        if (lsp->stderr_fd<0) return;
+        ssize_t n=read(lsp->stderr_fd,bytes,sizeof bytes);
+        if (n<0 && errno==EINTR) continue;
+        if (!n) { close(lsp->stderr_fd); lsp->stderr_fd=-1; }
+#endif
+        if (n<=0) break;
+        ced_output_write(lsp->label,bytes,(size_t)n);
+#ifndef _WIN32
+        if (lsp->log_fd>=0) {
+            for (ssize_t offset=0;offset<n;) {
+                ssize_t written=write(lsp->log_fd,bytes+offset,(size_t)(n-offset));
+                if (written<0 && errno==EINTR) continue;
+                if (written<=0) break;
+                offset+=written;
+            }
+        }
+#endif
     }
-    if (lsp->request_id && now() - lsp->request_started > 10) {
+}
+
+void ced_lsp_poll(CedLsp *lsp) {
+    if (!lsp) return;
+    drain_stderr(lsp);
+    if (!lsp->running) return;
+    if (!lsp->ready && !lsp->shutting_down && now() - lsp->initialize_started > (lsp->language==CED_LSP_C ? 10 : 180)) {
+        stopped(lsp, "initialization timed out"); return;
+    }
+    if (lsp->request_id && now() - lsp->request_started > (lsp->language==CED_LSP_C ? 10 : 45)) {
         lsp->request_id = 0;
         snprintf(lsp->result.error, sizeof lsp->result.error, "Language server request timed out.");
         lsp->result.ready = true;
@@ -369,7 +463,7 @@ void ced_lsp_poll(CedLsp *lsp) {
         ssize_t n = send(lsp->fd, lsp->output, lsp->output_length, flags);
 #endif
         if (n > 0) { memmove(lsp->output, lsp->output + n, lsp->output_length - (size_t)n); lsp->output_length -= (size_t)n; }
-        else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { stopped(lsp, "clangd: disconnected"); return; }
+        else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { drain_stderr(lsp); stopped(lsp, "disconnected"); return; }
     }
     if (!lsp->output_length) { free(lsp->output); lsp->output = NULL; }
     char bytes[65536];
@@ -379,29 +473,29 @@ void ced_lsp_poll(CedLsp *lsp) {
     ssize_t n = recv(lsp->fd, bytes, sizeof bytes, 0);
 #endif
     if (n > 0) {
-        if ((size_t)n > MESSAGE_CAP - lsp->input_length) { stopped(lsp, "clangd: message too large"); return; }
+        if ((size_t)n > MESSAGE_CAP - lsp->input_length) { stopped(lsp, "message too large"); return; }
         size_t needed = lsp->input_length + (size_t)n + 1;
         if (needed > lsp->input_capacity) {
             size_t capacity = lsp->input_capacity ? lsp->input_capacity * 2 : 65536;
             if (capacity < needed) capacity = needed;
             if (capacity > MESSAGE_CAP + 1) capacity = MESSAGE_CAP + 1;
             char *input = realloc(lsp->input, capacity);
-            if (!input) { stopped(lsp, "clangd: out of memory"); return; }
+            if (!input) { stopped(lsp, "out of memory"); return; }
             lsp->input = input;
             lsp->input_capacity = capacity;
         }
         char *input = lsp->input;
         memcpy(input + lsp->input_length, bytes, (size_t)n); lsp->input_length += (size_t)n; input[lsp->input_length] = 0;
-    } else if (!n || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) { stopped(lsp, "clangd: stopped"); return; }
+    } else if (!n || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) { drain_stderr(lsp); stopped(lsp, "stopped"); return; }
     for (int i = 0; i < 32 && lsp->input_length; i++) {
         char *separator = strstr(lsp->input, "\r\n\r\n");
-        if (!separator) { if (lsp->input_length > 8192) stopped(lsp, "clangd: invalid header"); break; }
+        if (!separator) { if (lsp->input_length > 8192) stopped(lsp, "invalid header"); break; }
         size_t header_length = (size_t)(separator - lsp->input) + 4;
         char *length_field = strstr(lsp->input, "Content-Length:");
-        if (!length_field || length_field >= separator) { stopped(lsp, "clangd: missing Content-Length"); break; }
+        if (!length_field || length_field >= separator) { stopped(lsp, "missing Content-Length"); break; }
         char *end; errno = 0;
         unsigned long length = strtoul(length_field + 15, &end, 10);
-        if (errno || end == length_field + 15 || end > separator || !length || length > MESSAGE_CAP - header_length) { stopped(lsp, "clangd: invalid Content-Length"); break; }
+        if (errno || end == length_field + 15 || end > separator || !length || length > MESSAGE_CAP - header_length) { stopped(lsp, "invalid Content-Length"); break; }
         if (header_length + length > lsp->input_length) break;
         handle(lsp, lsp->input + header_length, length);
         size_t consumed = header_length + length;
@@ -414,52 +508,157 @@ void ced_lsp_poll(CedLsp *lsp) {
 }
 
 CedLsp *ced_lsp_start(const char *root, const char *executable, char *error, size_t cap) {
-    CedLsp *lsp = calloc(1, sizeof *lsp);
-    if (!lsp) { snprintf(error, cap, "Out of memory."); return NULL; }
-    lsp->fd = -1; lsp->next_id = 1;
-#ifdef _WIN32
     if (!executable || !*executable) executable="clangd";
     const char *args[]={executable,"--background-index","--log=error","--header-insertion=never",NULL};
-    if (!ced_windows_spawn(&lsp->process,args,root,false,false,NULL)) {
-        free(lsp); snprintf(error,cap,"Could not start clangd. Install clangd and add it to PATH."); return NULL;
+    CedLspServer server={.root=root,.label="clangd",.language=CED_LSP_C,.argv=args};
+    return ced_lsp_start_server(&server,error,cap);
+}
+
+#ifndef _WIN32
+static bool kotlin_maven_project(CedLsp *lsp, cJSON *options, const char *settings) {
+    char directory[]="/tmp/ced-maven-XXXXXX";
+    if (!mkdtemp(directory)) return false;
+    strcpy(lsp->maven_directory,directory);
+    char alias[64], pom[CED_PATH];
+    if (!ced_join(alias,sizeof alias,directory,"settings.xml") || symlink(settings,alias) ||
+        !ced_join(pom,sizeof pom,lsp->root,"pom.xml")) return false;
+    char *uri=ced_lsp_uri(pom);
+    char args[80]; snprintf(args,sizeof args,"--settings=%s",alias);
+    cJSON *projects=cJSON_AddArrayToObject(options,"projects");
+    cJSON *project=cJSON_CreateObject();
+    bool ok=uri && projects && project && cJSON_AddStringToObject(project,"type","maven") &&
+        cJSON_AddStringToObject(project,"path",uri);
+    if (ok) {
+        cJSON *env=cJSON_AddObjectToObject(project,"env");
+        ok=env && cJSON_AddStringToObject(env,"MAVEN_ARGS",args) && cJSON_AddItemToArray(projects,project);
     }
-    lsp->running=true; lsp->initialize_started=now();
+    if (!ok) cJSON_Delete(project);
+    free(uri);
+    return ok;
+}
+
+/* The launcher needs tool locations and build/cache directories. Keep the
+ * command extension's reduced environment independent of the native LSP. */
+static char *const *server_environment(CedLspLanguage language, char **env) {
+    if (language==CED_LSP_C) return environ;
+    static const char *const allowed[]={
+        "HOME","TMPDIR","LANG","LC_ALL","LC_CTYPE","PATH","JAVA_HOME","GRADLE_USER_HOME",
+        "XDG_CACHE_HOME","M2_HOME","MAVEN_HOME","CED_JDTLS","CED_KOTLIN_LSP",NULL
+    };
+    size_t count=0;
+    for (size_t n=0;allowed[n];n++) {
+        size_t length=strlen(allowed[n]);
+        for (char **entry=environ;*entry;entry++)
+            if (!strncmp(*entry,allowed[n],length) && (*entry)[length]=='=') {
+                env[count++]=*entry;
+                break;
+            }
+    }
+    env[count]=NULL;
+    return env;
+}
+#endif
+
+CedLsp *ced_lsp_start_server(const CedLspServer *server, char *error, size_t cap) {
+    CedLsp *lsp=calloc(1,sizeof *lsp);
+    if (!lsp) { snprintf(error,cap,"Out of memory."); return NULL; }
+    lsp->fd=-1; lsp->next_id=1; lsp->language=server->language;
+#ifndef _WIN32
+    lsp->stderr_fd=lsp->log_fd=-1;
+#endif
+    snprintf(lsp->label,sizeof lsp->label,"%s",server->label);
+    snprintf(lsp->root,sizeof lsp->root,"%s",server->root);
+    lsp->settings=server->settings_json ? cJSON_Parse(server->settings_json) : NULL;
+#ifdef _WIN32
+    int result=ced_windows_spawn(&lsp->process,server->argv,server->root,false,false,true,NULL) ? 0 : ENOENT;
 #else
     int sockets[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets)) { free(lsp); snprintf(error, cap, "Could not create LSP connection."); return NULL; }
-    fcntl(sockets[0], F_SETFD, FD_CLOEXEC); fcntl(sockets[1], F_SETFD, FD_CLOEXEC);
+    if (socketpair(AF_UNIX,SOCK_STREAM,0,sockets)) {
+        snprintf(error,cap,"Could not create LSP connection."); ced_lsp_stop(lsp); return NULL;
+    }
+    int errors[2];
+    if (pipe(errors)) {
+        close(sockets[0]); close(sockets[1]); ced_lsp_stop(lsp);
+        snprintf(error,cap,"Could not capture language server output."); return NULL;
+    }
+    if (fcntl(errors[0],F_SETFL,O_NONBLOCK)<0 || fcntl(errors[0],F_SETFD,FD_CLOEXEC)<0 ||
+        fcntl(errors[1],F_SETFD,FD_CLOEXEC)<0) {
+        close(errors[0]); close(errors[1]); close(sockets[0]); close(sockets[1]); ced_lsp_stop(lsp);
+        snprintf(error,cap,"Could not configure language server output."); return NULL;
+    }
+    fcntl(sockets[0],F_SETFD,FD_CLOEXEC); fcntl(sockets[1],F_SETFD,FD_CLOEXEC);
 #ifdef SO_NOSIGPIPE
-    int enabled = 1; setsockopt(sockets[0], SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof enabled);
+    int enabled=1; setsockopt(sockets[0],SOL_SOCKET,SO_NOSIGPIPE,&enabled,sizeof enabled);
 #endif
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_adddup2(&actions, sockets[1], STDIN_FILENO);
-    posix_spawn_file_actions_adddup2(&actions, sockets[1], STDOUT_FILENO);
-    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
-    posix_spawn_file_actions_addclose(&actions, sockets[0]);
-    posix_spawn_file_actions_addclose(&actions, sockets[1]);
-    if (!executable || !*executable) executable = "clangd";
-    const char *args[] = {executable, "--background-index", "--log=error", "--header-insertion=never", NULL};
-    int result = posix_spawnp(&lsp->pid, executable, &actions, NULL, (char *const *)args, environ);
-    posix_spawn_file_actions_destroy(&actions); close(sockets[1]);
-    if (result) { close(sockets[0]); free(lsp); snprintf(error, cap, "clangd unavailable: %s", strerror(result)); return NULL; }
-    lsp->fd = sockets[0]; lsp->running = true; lsp->initialize_started = now();
-    fcntl(lsp->fd, F_SETFL, O_NONBLOCK);
+    posix_spawn_file_actions_adddup2(&actions,sockets[1],STDIN_FILENO);
+    posix_spawn_file_actions_adddup2(&actions,sockets[1],STDOUT_FILENO);
+    const char *log=getenv("CED_LSP_LOG");
+    if (log && log[0]=='/') lsp->log_fd=open(log,O_WRONLY|O_APPEND|O_CREAT|O_CLOEXEC|O_NONBLOCK,0600);
+    posix_spawn_file_actions_adddup2(&actions,errors[1],STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&actions,errors[0]);
+    posix_spawn_file_actions_addclose(&actions,errors[1]);
+    posix_spawn_file_actions_addclose(&actions,sockets[0]);
+    posix_spawn_file_actions_addclose(&actions,sockets[1]);
+    posix_spawnattr_t attributes;
+    posix_spawnattr_init(&attributes);
+    posix_spawnattr_setpgroup(&attributes,0);
+    short flags=POSIX_SPAWN_SETPGROUP;
+#ifdef __APPLE__
+    flags|=POSIX_SPAWN_CLOEXEC_DEFAULT;
 #endif
-    snprintf(lsp->status, sizeof lsp->status, "clangd: starting");
-    cJSON *params = cJSON_CreateObject();
-    cJSON_AddNumberToObject(params, "processId", getpid());
-    char *uri = ced_lsp_uri(root);
-    if (uri) cJSON_AddStringToObject(params, "rootUri", uri);
+    posix_spawnattr_setflags(&attributes,flags);
+    char *environment[16];
+    int result=posix_spawnp(&lsp->pid,server->argv[0],&actions,&attributes,(char *const *)server->argv,
+        server_environment(server->language,environment));
+    posix_spawnattr_destroy(&attributes);
+    posix_spawn_file_actions_destroy(&actions); close(sockets[1]); close(errors[1]);
+    if (result) { close(sockets[0]); close(errors[0]); }
+    else { lsp->fd=sockets[0]; lsp->stderr_fd=errors[0]; fcntl(lsp->fd,F_SETFL,O_NONBLOCK); }
+#endif
+    if (result) {
+        snprintf(error,cap,"%s unavailable: %s",server->label,strerror(result));
+        ced_lsp_stop(lsp); return NULL;
+    }
+    lsp->running=true; lsp->initialize_started=now();
+    status_text(lsp,"starting");
+    ced_output_text(lsp->label,"Starting language server");
+    cJSON *params=cJSON_CreateObject();
+    cJSON_AddNumberToObject(params,"processId",getpid());
+    char *uri=ced_lsp_uri(server->root);
+    if (uri) cJSON_AddStringToObject(params,"rootUri",uri);
     free(uri);
-    cJSON *capabilities = cJSON_Parse("{\"general\":{\"positionEncodings\":[\"utf-16\"]},\"textDocument\":{\"synchronization\":{\"didSave\":true},\"completion\":{\"completionItem\":{\"snippetSupport\":false,\"insertReplaceSupport\":true}},\"hover\":{\"contentFormat\":[\"markdown\",\"plaintext\"]},\"publishDiagnostics\":{\"versionSupport\":true}}}");
-    add_item(params, "capabilities", capabilities);
-    if (!send_message(lsp, "initialize", params, 1)) { ced_lsp_stop(lsp); snprintf(error, cap, "Could not initialize clangd."); return NULL; }
+    add_item(params,"workspaceFolders",workspace_folders(server->root));
+    cJSON *client=cJSON_AddObjectToObject(params,"clientInfo");
+    cJSON_AddStringToObject(client,"name","CED");
+    cJSON *capabilities=cJSON_Parse("{\"workspace\":{\"configuration\":true,\"workspaceFolders\":true},\"general\":{\"positionEncodings\":[\"utf-16\"]},\"textDocument\":{\"synchronization\":{\"didSave\":true},\"completion\":{\"completionItem\":{\"snippetSupport\":false,\"insertReplaceSupport\":true}},\"hover\":{\"contentFormat\":[\"markdown\",\"plaintext\"]},\"publishDiagnostics\":{\"versionSupport\":true}}}");
+    add_item(params,"capabilities",capabilities);
+    if (server->language!=CED_LSP_C) {
+        cJSON *options=cJSON_AddObjectToObject(params,"initializationOptions");
+        if (lsp->settings) add_item(options,"settings",cJSON_Duplicate(lsp->settings,true));
+        char *root_uri=ced_lsp_uri(server->root);
+        cJSON *folders=cJSON_AddArrayToObject(options,"workspaceFolders");
+        if (root_uri) add_element(folders,cJSON_CreateString(root_uri));
+        free(root_uri);
+#ifndef _WIN32
+        /* Maven's launcher splits MAVEN_ARGS on whitespace. The private alias
+         * carries the real path without copying its contents into CED or logs. */
+        if (server->language==CED_LSP_KOTLIN && server->maven_settings && *server->maven_settings &&
+            !kotlin_maven_project(lsp,options,server->maven_settings)) {
+            cJSON_Delete(params); ced_lsp_stop(lsp);
+            snprintf(error,cap,"Could not prepare the Kotlin Maven settings path."); return NULL;
+        }
+#endif
+    }
+    if (!send_message(lsp,"initialize",params,1)) {
+        ced_lsp_stop(lsp); snprintf(error,cap,"Could not initialize %s.",server->label); return NULL;
+    }
     return lsp;
 }
 
 bool ced_lsp_sync(CedLsp *lsp, const char *path, const char *text) {
-    if (!ced_lsp_ready(lsp) || !ced_lsp_language(path) || !*path) return false;
+    if (!ced_lsp_ready(lsp) || ced_lsp_language_kind(path)!=lsp->language || !*path) return false;
     Document *doc = document(lsp, path);
     if (doc && !strcmp(doc->text, text)) return true;
     if (!doc && lsp->document_count == DOCUMENT_CAP) return false;
@@ -472,11 +671,19 @@ bool ced_lsp_sync(CedLsp *lsp, const char *path, const char *text) {
     int version = ++lsp->next_version;
     cJSON_AddNumberToObject(td, "version", version);
     if (!doc) {
-        cJSON_AddStringToObject(td, "languageId", !strcmp(ced_language(path), "cpp") ? "cpp" : "c");
+        cJSON_AddStringToObject(td, "languageId", ced_language(path));
         cJSON_AddStringToObject(td, "text", text);
     } else {
         cJSON *changes = cJSON_CreateArray(), *change = cJSON_CreateObject();
-        cJSON_AddStringToObject(change, "text", text); add_element(changes, change);
+        cJSON_AddStringToObject(change,"text",text);
+        if (lsp->incremental) {
+            CedLspPosition end=ced_lsp_position(doc->text,(int)strlen(doc->text));
+            cJSON *range=cJSON_AddObjectToObject(change,"range");
+            cJSON *first=cJSON_AddObjectToObject(range,"start"), *last=cJSON_AddObjectToObject(range,"end");
+            cJSON_AddNumberToObject(first,"line",0); cJSON_AddNumberToObject(first,"character",0);
+            cJSON_AddNumberToObject(last,"line",end.line); cJSON_AddNumberToObject(last,"character",end.character);
+        }
+        add_element(changes,change);
         add_item(params, "contentChanges", changes);
     }
     if (!send_message(lsp, doc ? "textDocument/didChange" : "textDocument/didOpen", params, 0)) { free(copy); free(created); return false; }
@@ -524,7 +731,7 @@ bool ced_lsp_request(CedLsp *lsp, CedLspRequest kind, const char *path, const ch
 bool ced_lsp_ready(const CedLsp *lsp) { return lsp && lsp->ready && lsp->running; }
 bool ced_lsp_running(const CedLsp *lsp) { return lsp && lsp->running; }
 bool ced_lsp_pending(const CedLsp *lsp) { return lsp && lsp->request_id != 0; }
-const char *ced_lsp_status(const CedLsp *lsp) { return lsp ? lsp->status : "clangd: unavailable"; }
+const char *ced_lsp_status(const CedLsp *lsp) { return lsp ? lsp->status : "Language server unavailable"; }
 CedLspResult *ced_lsp_result(CedLsp *lsp) { return lsp ? &lsp->result : NULL; }
 const CedDiagnostic *ced_lsp_diagnostics(CedLsp *lsp, const char *path, int *count) {
     Document *doc = lsp ? document(lsp, path) : NULL;
@@ -542,24 +749,34 @@ void ced_lsp_stop(CedLsp *lsp) {
             struct timespec pause = {.tv_nsec = 10000000}; nanosleep(&pause, NULL);
         }
     }
+    drain_stderr(lsp);
 #ifdef _WIN32
     ced_windows_process_close(&lsp->process);
 #else
     if (lsp->fd >= 0) close(lsp->fd);
     int status;
     if (lsp->pid > 0 && waitpid(lsp->pid, &status, WNOHANG) == 0) {
-        kill(lsp->pid, SIGTERM);
+        kill(-lsp->pid, SIGTERM);
         bool exited = false;
         for (int i = 0; i < 20; i++) {
             if (waitpid(lsp->pid, &status, WNOHANG) != 0) { exited = true; break; }
             struct timespec pause = {.tv_nsec = 10000000}; nanosleep(&pause, NULL);
         }
-        if (!exited) { kill(lsp->pid, SIGKILL); while (waitpid(lsp->pid, &status, 0) < 0 && errno == EINTR) {} }
+        if (!exited) { kill(-lsp->pid, SIGKILL); while (waitpid(lsp->pid, &status, 0) < 0 && errno == EINTR) {} }
+    }
+    if (lsp->pid > 0) kill(-lsp->pid, SIGKILL);
+    drain_stderr(lsp);
+    if (lsp->stderr_fd>=0) close(lsp->stderr_fd);
+    if (lsp->log_fd>=0) close(lsp->log_fd);
+    if (*lsp->maven_directory) {
+        char alias[64];
+        if (ced_join(alias,sizeof alias,lsp->maven_directory,"settings.xml")) unlink(alias);
+        rmdir(lsp->maven_directory);
     }
 #endif
     for (int i = 0; i < lsp->document_count; i++) {
         free(lsp->documents[i]->text);
         free(lsp->documents[i]);
     }
-    free(lsp->input); free(lsp->output); free(lsp);
+    cJSON_Delete(lsp->settings); free(lsp->input); free(lsp->output); free(lsp);
 }

@@ -168,6 +168,20 @@ static bool configuration(const cJSON *array, CedExtensionManifest *manifest, ch
     return manifest->configuration != NULL;
 }
 
+static bool language_servers(const cJSON *array, CedExtensionManifest *manifest) {
+    if (!array) return true;
+    if (!manifest->executable || !cJSON_IsArray(array) || !array->child || cJSON_GetArraySize(array)>2) return false;
+    const cJSON *value;
+    cJSON_ArrayForEach(value,array) {
+        const char *name=cJSON_GetStringValue(value);
+        unsigned language=!name ? 0 : !strcmp(name,"java") ? CED_EXT_LSP_JAVA :
+            !strcmp(name,"kotlin") ? CED_EXT_LSP_KOTLIN : 0;
+        if (!language || (manifest->language_servers & language)) return false;
+        manifest->language_servers|=language;
+    }
+    return true;
+}
+
 bool ced_extension_manifest_parse(const char *bytes, size_t length, CedExtensionManifest *out, char *error) {
     *error = 0; memset(out, 0, sizeof *out);
     if (length > CED_EXTENSION_MANIFEST_LIMIT) goto invalid;
@@ -176,7 +190,7 @@ bool ced_extension_manifest_parse(const char *bytes, size_t length, CedExtension
     static const char *const fields[] = {"manifestVersion", "id", "name", "version", "description", "license",
         "ced", "kind", "entrypoints", "activationEvents", "capabilities", "untrustedWorkspaces", "contributes", "requirements", "metadata", NULL};
     static const char *const ced_fields[] = {"minVersion", "apiMajor", NULL};
-    static const char *const contributes_fields[] = {"commands", "configuration", "tabs", NULL};
+    static const char *const contributes_fields[] = {"commands", "configuration", "tabs", "languageServers", NULL};
     const cJSON *ced = cJSON_GetObjectItemCaseSensitive(root, "ced"), *contributes = cJSON_GetObjectItemCaseSensitive(root, "contributes");
     uint64_t number;
     const char *kind = ced_ext_json_string(root, "kind");
@@ -213,7 +227,8 @@ bool ced_extension_manifest_parse(const char *bytes, size_t length, CedExtension
     if (contributes && !ced_ext_json_fields(contributes, contributes_fields, error)) goto parsed_invalid;
     if (!parse_commands(cJSON_GetObjectItemCaseSensitive(contributes, "commands"), out, error) ||
         !parse_tabs(cJSON_GetObjectItemCaseSensitive(contributes, "tabs"), out, error) ||
-        !configuration(cJSON_GetObjectItemCaseSensitive(contributes, "configuration"), out, error)) goto parsed_invalid;
+        !configuration(cJSON_GetObjectItemCaseSensitive(contributes, "configuration"), out, error) ||
+        !language_servers(cJSON_GetObjectItemCaseSensitive(contributes,"languageServers"),out)) goto parsed_invalid;
     const cJSON *entrypoints = cJSON_GetObjectItemCaseSensitive(root, "entrypoints");
     const cJSON *events = cJSON_GetObjectItemCaseSensitive(root, "activationEvents");
     const cJSON *capabilities = cJSON_GetObjectItemCaseSensitive(root, "capabilities");

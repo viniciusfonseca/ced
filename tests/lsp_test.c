@@ -1,4 +1,6 @@
 #include "lsp.h"
+#include "output.h"
+#include "documents.h"
 #include "cJSON.h"
 #include <assert.h>
 #include <stdio.h>
@@ -50,6 +52,34 @@ static void tick(CedLsp *lsp) {
     struct timespec pause = {.tv_nsec = 10000000}; nanosleep(&pause, NULL);
 }
 
+static void test_output(void) {
+    ced_output_clear();
+    char error[CED_ERROR], snapshot[CED_OUTPUT_CAP];
+    uint64_t revision=0;
+    const char *argv[]={"/bin/sh","-c","printf 'launcher diagnostic\\n' >&2; exit 7",NULL};
+    CedLspServer server={.root="/tmp",.label="Example LSP",.language=CED_LSP_C,.argv=argv};
+    CedLsp *lsp=ced_lsp_start_server(&server,error,sizeof error);
+    assert(lsp);
+    for (int i=0;i<100 && ced_lsp_running(lsp);i++) tick(lsp);
+    assert(!ced_lsp_running(lsp));
+    ced_lsp_stop(lsp);
+    ced_output_copy(snapshot,&revision);
+    assert(strstr(snapshot,"[Example LSP] launcher diagnostic\n"));
+    ced_output_text("Test","é🙂\r\nline\x1b\x01");
+    ced_output_copy(snapshot,&revision);
+    assert(strstr(snapshot,"[Test] é🙂\nline\n"));
+    char line[8192];
+    memset(line,'x',sizeof line);
+    for (int i=0;i<20;i++) ced_output_write("Flood",line,sizeof line);
+    ced_output_text("Test","latest");
+    ced_output_copy(snapshot,&revision);
+    assert(strlen(snapshot)<CED_OUTPUT_CAP && ced_utf8_valid(snapshot,strlen(snapshot)));
+    assert(!strstr(snapshot,"launcher diagnostic") && strstr(snapshot,"[Test] latest"));
+    ced_output_clear();
+    ced_output_copy(snapshot,&revision);
+    assert(!*snapshot);
+}
+
 static CedLspResult *result(CedLsp *lsp) {
     for (int i = 0; i < 800; i++) {
         tick(lsp);
@@ -61,6 +91,7 @@ static CedLspResult *result(CedLsp *lsp) {
 
 int main(int argc, char **argv) {
     test_json_ownership();
+    test_output();
     const char *unicode = "\té🙂x\nabc";
     CedLspPosition p = ced_lsp_position(unicode, 7);
     assert(p.line == 0 && p.character == 4);

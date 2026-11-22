@@ -82,6 +82,23 @@ bool ced_aux_panel_button(cui_ctx *ui, const char *id, bool right, bool selected
     return clicked;
 }
 
+bool ced_git_tab_button(cui_ctx *ui, int count, bool truncated, bool selected) {
+    int button = ui->node_count;
+    bool clicked = cui_button(ui, "##git-tab", .icon = CUI_ICON_GIT_BRANCH, .tooltip = "Git",
+        .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST, .selected = selected);
+    if (count > 0) {
+        char label[24];
+        snprintf(label, sizeof label, "%d%s", count, truncated ? "+" : "");
+        cui__open(ui, button);
+        cui_badge(ui, label, .size = CUI_SIZE_SM, .tone = CUI_TONE_ACCENT);
+        cui__close(ui);
+    } else {
+        ui->nodes[button].w = ui->nodes[button].h;
+        ui->nodes[button].pad[1] = ui->nodes[button].pad[3] = 0;
+    }
+    return clicked;
+}
+
 int ced_command_palette(cui_ctx *ui, bool *open, const cui_command *commands, int count) {
     int first = ui->node_count;
     int selected = cui_command_palette(ui, open, commands, count);

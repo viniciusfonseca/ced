@@ -6,6 +6,13 @@
 #define CED_LSP_DIAGNOSTICS 128
 #define CED_LSP_COMPLETIONS 80
 typedef struct CedLsp CedLsp;
+typedef enum { CED_LSP_C, CED_LSP_JAVA, CED_LSP_KOTLIN, CED_LSP_NONE } CedLspLanguage;
+typedef struct {
+    const char *root, *label;
+    CedLspLanguage language;
+    const char *const *argv;
+    const char *settings_json, *maven_settings;
+} CedLspServer;
 typedef struct { int line, character; } CedLspPosition; /* zero-based UTF-16 */
 typedef struct {
     int start, end, severity;
@@ -29,6 +36,7 @@ typedef struct {
 } CedLspResult;
 
 CedLsp *ced_lsp_start(const char *root, const char *executable, char *error, size_t cap);
+CedLsp *ced_lsp_start_server(const CedLspServer *server, char *error, size_t cap);
 void ced_lsp_stop(CedLsp *lsp);
 void ced_lsp_poll(CedLsp *lsp);
 bool ced_lsp_ready(const CedLsp *lsp);
@@ -41,6 +49,7 @@ void ced_lsp_saved(CedLsp *lsp, const char *path);
 bool ced_lsp_request(CedLsp *lsp, CedLspRequest kind, const char *path, const char *text, int offset);
 CedLspResult *ced_lsp_result(CedLsp *lsp);
 const CedDiagnostic *ced_lsp_diagnostics(CedLsp *lsp, const char *path, int *count);
+CedLspLanguage ced_lsp_language_kind(const char *path);
 bool ced_lsp_language(const char *path);
 char *ced_lsp_uri(const char *path);
 bool ced_lsp_path(const char *uri, char *out, size_t cap);

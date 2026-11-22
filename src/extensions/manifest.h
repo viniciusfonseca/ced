@@ -13,6 +13,7 @@
 #define CED_EXTENSION_API "1.0"
 #define CED_EXTENSION_APP_VERSION "0.2.0"
 enum { CED_EXT_READ = 1, CED_EXT_EDIT = 2 };
+enum { CED_EXT_LSP_JAVA = 1, CED_EXT_LSP_KOTLIN = 2 };
 
 typedef struct {
     char id[257], title[513], category[513];
@@ -25,7 +26,7 @@ typedef struct {
 } CedExtensionTab;
 typedef struct {
     char id[129], name[513], version[64], description[513], entrypoint[CED_PATH];
-    unsigned capabilities;
+    unsigned capabilities, language_servers;
     bool executable;
     CedExtensionCommand *commands;
     size_t command_count;

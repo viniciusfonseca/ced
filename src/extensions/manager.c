@@ -723,6 +723,17 @@ void ced_extensions_tick(CedExtensions *m) {
     if (m->reload && !j->running && stopped) { m->reload = false; ced_extensions_job(m, EXT_LOAD, NULL); }
 }
 
+const CedExtensionRecord *ced_extensions_language_provider(const CedExtensions *m, unsigned language) {
+    if (!m || !m->trusted) return NULL;
+    const CedExtensionRecord *provider=NULL;
+    for (size_t n=0;n<m->count;n++) {
+        const CedExtensionRecord *record=&m->instances[n].record;
+        if (record->enabled && record->valid && (record->manifest.language_servers & language) &&
+            (!provider || strcmp(record->manifest.id,provider->manifest.id)<0)) provider=record;
+    }
+    return provider;
+}
+
 void ced_extensions_workspace(CedExtensions *m, const char *workspace) {
     if (!m) return;
     for (size_t n = 0; n < m->count; n++) {

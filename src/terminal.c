@@ -87,7 +87,7 @@ CedTerminal *ced_terminal_start(const char *root, const char *shell, char *error
     vterm_screen_reset(t->screen, 1);
 #ifdef _WIN32
     const char *args[]={shell,NULL};
-    if (!ced_windows_spawn(&t->process,args,root,true,false,NULL)) {
+    if (!ced_windows_spawn(&t->process,args,root,true,false,false,NULL)) {
         snprintf(error,cap,"Could not start the Windows pseudoconsole (Windows 10 1809+ required).");
         ced_terminal_stop(t); return NULL;
     }

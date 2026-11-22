@@ -54,6 +54,14 @@ When `host.tabWidgets` is at least `1`, a model can also set `selectors` and `ch
 - With `host.tabWidgets` at least `9`, a model can include up to three selectors. Composer selectors appear from left to right in model order. A chat can provide `approval: {title, actions: [{id, label}]}` to present a request above the composer. The title is limited to 320 bytes and the request can contain 1 to 13 actions with labels up to 128 bytes. Clicking an action dispatches its ID with an empty value.
 - With `host.tabWidgets` at least `10`, a group item can include `busy: true` to show a native CUI spinner next to its title. The row still accepts clicks. Use the model’s `refresh` flag to keep the state current.
 
+## JVM language-server contributions
+
+An executable package may declare up to two distinct language IDs in `contributes.languageServers`. The implemented IDs are `java` (`.java`) and `kotlin` (`.kt` and `.kts`). For example, `"languageServers": ["java", "kotlin"]` enables the package to provide both. CED chooses the enabled provider by extension ID within the trusted workspace, verifies its installed package on a worker, and holds a shared package lease while the server runs.
+
+For a selected JVM source file, CED starts a separate language-server process from the reviewed platform entrypoint with arguments `--language-server <language-id> <absolute-project-root> [<gradle-jdk>]`. Standard input and output in this mode carry LSP. The ordinary no-argument extension command process still uses the CED API and its existing reduced environment. The server launcher receives user tool paths and standard home, locale and build-cache settings. Project settings can select build roots only within the trusted workspace. The optional JDK argument is used for Kotlin Gradle imports. For JDT LS, the Gradle JDK is sent in the server settings.
+
+CED detects Maven `pom.xml` and Gradle `settings.gradle[.kts]` or `build.gradle[.kts]` files. Workspace `.ced/settings.json` may set `maven.pomPath` or `gradle.projectPath`, and an absolute `gradle.javaHome` for the Gradle wrapper, with fallback to the same keys in `~/.ced/settings.json`. Maven projects also accept `maven.settingsPath`, which selects a user settings XML file for JDT LS and for Kotlin LSP with Maven 3.9 or newer. The value can be workspace-relative, absolute or start with `~/`. Opening a saved source file starts the detected project. **Import JVM Project** recomputes and reloads it. The status bar reports the server and build type. Syntax coloring is available directly in CED.
+
 ## Installation and trust
 
 Use the command palette's **Install Extension from Folder** and **Manage Extensions** actions. Review installation is explicit. Installation, hashing, profile writes, package validation and process I/O run on workers. Filesystem packages are copied without installation scripts; their manifests are parsed from the exact bytes included in the reviewed digest. A SHA-256 digest identifies contents; it does not authenticate a publisher.
@@ -96,6 +104,6 @@ There is no live cross-window profile watcher yet. Other windows pick up catalog
 
 ## Deferred phases
 
-API 1.0 is experimental until the stable-operation phase is accepted. Persistent extension state, effective configuration/overrides, subscriptions/events, contributed keybindings/menus, status/output/tree views, themes, diagnostics contributions and multiple extension language servers are not implemented. There is no marketplace, automatic update, embedded scripting runtime or public CUI ABI.
+API 1.0 is experimental until the stable-operation phase is accepted. Persistent extension state, effective configuration/overrides, subscriptions/events, contributed keybindings/menus, status/output/tree views, themes, and declarative diagnostics contributions are deferred. There is no marketplace, automatic update, embedded scripting runtime or public CUI ABI.
 
 Run `make test` for the native integration, failure, protocol, edit and UI suites. `make EXTENSIONS=OFF BUILD_DIR=build-no-extensions test` verifies the editor without the subsystem. Tests do not install anything in the real user profile.

@@ -86,6 +86,7 @@ unsigned ced_extensions_document_access(const CedExtensions *manager, const CedD
 void ced_extensions_document_changed(CedExtensions *manager, const CedDocument *document, unsigned previous_access);
 void ced_extensions_document_closed(CedExtensions *manager, uint64_t document_id);
 void ced_extensions_violation(CedExtensionInstance *instance, const char *reason);
+const CedExtensionRecord *ced_extensions_language_provider(const CedExtensions *manager, unsigned language);
 const char *ced_extensions_status(const CedExtensionInstance *instance);
 bool ced_extensions_tab_action(CedExtensionInstance *instance, size_t tab, const char *action, const char *value);
 /* Broker helpers, private to the extension subsystem. */

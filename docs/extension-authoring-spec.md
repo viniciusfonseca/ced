@@ -37,7 +37,8 @@ An agent MUST NOT invent APIs such as `ced.editor.replaceText`, `commands/execut
 | Snapshot reads and single-document edits | Defined here | Not implemented |
 | Configuration, state, events, menus, shortcuts | Defined here; architecture phase 2 | Not implemented |
 | Status items, output channels, tree views, themes, diagnostics providers | Deferred; no authoring schema yet | Unsupported |
-| Additional LSP servers, formatting, rename, code actions | Deferred; not extension API methods | Unsupported |
+| JVM LSP servers | Experimental host contribution on macOS and Linux | See the [host profile](extensions.md#jvm-language-server-contributions) |
+| Formatter contributions, rename, code actions | Deferred | Unsupported |
 | Multi-document transactions, webviews, arbitrary UI, save hooks | Outside this version | Unsupported |
 | Marketplace, inter-extension dependencies, Windows | Outside this version | Unsupported |
 
@@ -165,7 +166,7 @@ Unknown fields are errors at every manifest object level, except for arbitrary J
 | `capabilities` | Required for executable; unique string array, possibly empty | Only `documents.read` and `documents.edit` are defined. Edit requires read. |
 | `untrustedWorkspaces` | Required for executable; `false` | Executables cannot run in untrusted workspaces in this version. |
 | `requirements` | Optional; array | Each item is exactly `{ "name": string, "minVersion": string }`; informational external tool/runtime requirement, not an install instruction. |
-| `contributes` | Optional; object | `commands`, `keybindings`, `menus`, `configuration`, and [native tabs](extensions.md#native-tab-contributions). See the host profile for supported arrays. Missing arrays mean empty arrays. |
+| `contributes` | Optional; object | `commands`, `keybindings`, `menus`, `configuration`, [native tabs](extensions.md#native-tab-contributions), and [JVM language servers](extensions.md#jvm-language-server-contributions). See the host profile for supported arrays. Missing arrays mean empty arrays. |
 | `metadata` | Optional; object | Non-executable author metadata, still subject to file size/depth limits. |
 
 Display strings MUST be valid UTF-8, contain no NUL or terminal escape sequences, and fit 512 encoded bytes. Entrypoint paths MUST be nonempty and shorter than 4,096 UTF-8 bytes. Local command suffixes and configuration key suffixes use `[a-zA-Z0-9_-]+` components separated by `.`, following `<extension-id>.`; the full ID/key MUST fit 256 ASCII bytes. IDs/keys are case-sensitive.

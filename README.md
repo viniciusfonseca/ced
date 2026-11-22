@@ -13,7 +13,7 @@ A desktop text editor written in C99 with [CUI](https://github.com/yappologistic
 - **Git:** current branch, staged and local changes, side-by-side diffs, staging/unstaging individual files or all changes, confirmed discard of unstaged changes, commits with confirmation, push, and pull.
 - **Editor:** multiple reorderable tabs, unsaved-change indicators, syntax highlighting, line numbers, indentation, undo/redo, copy/paste, in-file search, and go-to-line navigation.
 - **Markdown:** rendered previews of the current buffer, including unsaved changes.
-- **LSP:** clangd integration for C/C++, with diagnostics, completion, symbol information, and go-to-definition.
+- **LSP:** clangd for C/C++ and extension-provided servers for Java and Kotlin, with diagnostics, completion, hover, and go-to-definition.
 - **Terminal:** an interactive PTY shell in a resizable panel to the right of or below the editor.
 - **Extensions (experimental):** reviewed local packages, workspace trust, lazy command activation in separate processes, and version-checked buffer edits with undo/redo.
 - Resizable sidebar, light/dark themes, and a command palette.
@@ -179,6 +179,14 @@ Push and pull use Git's configured remote, upstream branch, and credential helpe
 Open a `.md` or `.markdown` file and click **Preview**, or press Mod Shift V. Click **Edit** or use the same shortcut to return to the source. Each tab keeps its own preview mode.
 
 The preview renders the current buffer, including unsaved changes. It supports headings, emphasis, lists, task lists, tables, block quotes, links, and highlighted code blocks. Web links open in the default browser; simple relative file links open in the editor. Images are displayed as links, and section-anchor navigation is not implemented.
+
+## Output
+
+Click the **Show Output** icon next to the position control in the auxiliary panel, run **Show Output** from the palette, or click the language-server status. Output shows recent language-server logs and import messages, extension logs, editor notifications, and the output of Git operations. Use the down arrow to jump to the newest entry. The trash button clears the in-memory history.
+
+## Java and Kotlin
+
+CED highlights `.java`, `.kt` and `.kts` files. For language-server features, install and enable a compatible JVM language extension and trust the workspace. Open the project folder and a saved source file to start Maven or Gradle import. To choose a nested Maven project, set `"maven.pomPath": "module/pom.xml"` in the workspace's `.ced/settings.json`. For Gradle, use `"gradle.projectPath": "module"`. Run **Import JVM Project** from the palette to reload project settings and the build model. See the [extension host profile](docs/extensions.md#jvm-language-server-contributions).
 
 ## LSP for C and C++
 

@@ -47,7 +47,7 @@ static bool pipe_pair(HANDLE *parent, HANDLE *child, bool writing) {
 }
 
 bool ced_windows_spawn(CedWindowsProcess *p, const char *const args[], const char *cwd,
-                       bool terminal, bool merge_stderr, HANDLE stdin_file) {
+                       bool terminal, bool merge_stderr, bool capture_stderr, HANDLE stdin_file) {
     memset(p, 0, sizeof *p);
     HANDLE child_input = NULL, child_output = NULL, child_error = NULL;
     wchar_t *command = command_line(args), *directory = cwd ? ced_windows_wide(cwd) : NULL;
@@ -76,9 +76,13 @@ bool ced_windows_spawn(CedWindowsProcess *p, const char *const args[], const cha
                                        p->console, sizeof p->console, NULL, NULL);
     } else if (ok) {
         SECURITY_ATTRIBUTES security = {sizeof security, NULL, TRUE};
-        child_error = merge_stderr ? NULL : CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                                        &security, OPEN_EXISTING, 0, NULL);
-        if (child_error == INVALID_HANDLE_VALUE) { child_error = NULL; ok = false; }
+        if (!merge_stderr && capture_stderr) {
+            ok=CreatePipe(&p->errors,&child_error,&security,65536) &&
+                SetHandleInformation(p->errors,HANDLE_FLAG_INHERIT,0);
+        } else if (!merge_stderr) {
+            child_error=CreateFileW(L"NUL",GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,&security,OPEN_EXISTING,0,NULL);
+            if (child_error==INVALID_HANDLE_VALUE) { child_error=NULL; ok=false; }
+        }
         inherited[2] = child_error;
         startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
         startup.StartupInfo.hStdInput = child_input;
@@ -107,6 +111,13 @@ bool ced_windows_spawn(CedWindowsProcess *p, const char *const args[], const cha
     if (child_error) CloseHandle(child_error);
     if (!ok) ced_windows_process_close(p);
     return ok;
+}
+
+ssize_t ced_windows_read_stderr(CedWindowsProcess *p, char *bytes, size_t capacity) {
+    DWORD available, read=0;
+    if (p->errors && PeekNamedPipe(p->errors,NULL,0,NULL,&available,NULL) && available)
+        ReadFile(p->errors,bytes,(DWORD)(capacity<available ? capacity : available),&read,NULL);
+    return (ssize_t)read;
 }
 
 ssize_t ced_windows_read(CedWindowsProcess *p, char *bytes, size_t capacity) {
@@ -169,6 +180,7 @@ void ced_windows_process_close(CedWindowsProcess *p) {
         if (p->reading) GetOverlappedResult(p->output,&p->read,&transferred,TRUE);
         CloseHandle(p->output);
     }
+    if (p->errors) CloseHandle(p->errors);
     if (p->console) ClosePseudoConsole(p->console);
     if (p->read.hEvent) CloseHandle(p->read.hEvent);
     if (p->write.hEvent) CloseHandle(p->write.hEvent);
@@ -180,7 +192,7 @@ int ced_windows_command(const char *const args[], char **output, size_t *length,
     if (length) *length = 0;
     HANDLE input = input_fd >= 0 ? (HANDLE)_get_osfhandle(input_fd) : CreateFileW(L"NUL", GENERIC_READ,
                                              FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-    bool ok = p && input != INVALID_HANDLE_VALUE && ced_windows_spawn(p, args, NULL, false, true, input);
+    bool ok = p && input != INVALID_HANDLE_VALUE && ced_windows_spawn(p, args, NULL, false, true, false, input);
     if (input_fd < 0 && input != INVALID_HANDLE_VALUE) CloseHandle(input);
     if (!ok) { free(p); return -1; }
     size_t used = 0, capacity = 8192; const size_t limit = 8 * 1024 * 1024;

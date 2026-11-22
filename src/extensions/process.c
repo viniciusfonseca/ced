@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include "process_internal.h"
+#include "output.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -184,12 +185,15 @@ static int log_open(CedExtensionProcess *process, char path[CED_PATH]) {
     return open(path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
 }
 
-static void log_write(int *fd, const char *path, const char *bytes, size_t length, size_t *total, size_t *rate, double *window) {
+static void log_write(const char *source, int *fd, const char *path, const char *bytes, size_t length, size_t *total, size_t *rate, double *window) {
     double now = ced_ext_now();
     if (now - *window >= 1) { *window = now; *rate = 0; }
-    if (*fd < 0 || *rate >= 65536) return;
+    if (*rate >= 65536) return;
     if (length > 8192) length = 8192;
     if (length > 65536 - *rate) length = 65536 - *rate;
+    ced_output_write(source,bytes,length);
+    *rate += length;
+    if (*fd < 0) return;
     if (*total + length > 1024 * 1024) {
         close(*fd);
         char first[CED_PATH + 4], second[CED_PATH + 4];
@@ -210,7 +214,7 @@ static void log_write(int *fd, const char *path, const char *bytes, size_t lengt
         if (n <= 0) break;
         used += (size_t)n;
     }
-    *total += used; *rate += used;
+    *total += used;
 }
 
 static int spawn_extension(CedExtensionProcess *process, const char *entrypoint, int *socket_fd, int *stderr_fd, pid_t *pid) {
@@ -331,7 +335,7 @@ static void *process_worker(void *user) {
         memcpy(pending_log, process->pending_log, sizeof pending_log); process->pending_log[0] = 0;
         CedExtensionMessage *send_message = !output ? pop(&process->outgoing) : NULL;
         pthread_mutex_unlock(&process->mutex);
-        if (*pending_log) log_write(&log_fd, log_path, pending_log, strlen(pending_log), &log_total, &log_rate, &log_window);
+        if (*pending_log) log_write(process->id,&log_fd, log_path, pending_log, strlen(pending_log), &log_total, &log_rate, &log_window);
         if (stop && !stop_time) stop_time = ced_ext_now();
         double stopping = stop_time ? ced_ext_now() - stop_time : 0;
         if (stop_time && stopping >= 0.5 && !term_sent) { kill(-pid, SIGTERM); term_sent = true; }
@@ -364,7 +368,7 @@ static void *process_worker(void *user) {
         } else if (reader.length) receive_frames(process, &reader);
         if (descriptors[1].revents & (POLLIN | POLLHUP)) {
             char bytes[8192]; ssize_t n = read(stderr_fd, bytes, sizeof bytes);
-            if (n > 0) log_write(&log_fd, log_path, bytes, (size_t)n, &log_total, &log_rate, &log_window);
+            if (n > 0) log_write(process->id,&log_fd, log_path, bytes, (size_t)n, &log_total, &log_rate, &log_window);
         }
         if (descriptors[0].revents & (POLLERR | POLLNVAL)) set_error(process, "Extension transport failed");
         int status;

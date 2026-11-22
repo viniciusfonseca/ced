@@ -1,4 +1,5 @@
 #include "workspace.h"
+#include "output.h"
 
 #ifdef _WIN32
 #include "windows_directory.h"
@@ -55,7 +56,7 @@ const char *ced_language(const char *path) {
         {".c", "c"}, {".h", "c"}, {".cpp", "cpp"}, {".hpp", "cpp"},
         {".cc", "cpp"}, {".m", "c"}, {".js", "js"}, {".jsx", "js"},
         {".ts", "ts"}, {".tsx", "ts"}, {".py", "python"}, {".rs", "rust"},
-        {".go", "go"}, {".json", "json"}, {".sh", "shell"}, {".sql", "sql"},
+        {".go", "go"}, {".java", "java"}, {".kt", "kotlin"}, {".kts", "kotlin"}, {".json", "json"}, {".sh", "shell"}, {".sql", "sql"},
         {".css", "css"}, {".html", "html"}, {".xml", "html"}
     };
     for (size_t i = 0; i < sizeof pairs / sizeof pairs[0]; i++)
@@ -549,8 +550,10 @@ int ced_command(const char *const argv[], char **output, size_t *length) {
     return command_run(argv, output, length, -1);
 }
 
-static bool git_run(const char *const argv[], char **out, char *error) {
-    if (!ced_command(argv, out, NULL)) return true;
+static bool git_run(const char *const argv[], char **out, char *error, bool show_output) {
+    int status=ced_command(argv,out,NULL);
+    if (show_output && *out && **out) ced_output_text("Git",*out);
+    if (!status) return true;
     fail(error, "%s", *out && **out ? *out : "Could not run Git.");
     free(*out);
     *out = NULL;
@@ -566,7 +569,7 @@ bool ced_git_refresh(CedGit *git, const char *root, char *error) {
     CedGit next = {0};
     char *out = NULL;
     const char *root_args[] = {"git", "-C", root, "rev-parse", "--show-toplevel", NULL};
-    if (!git_run(root_args, &out, error)) { ced_git_free(git); return false; }
+    if (!git_run(root_args,&out,error,false)) { ced_git_free(git); return false; }
     out[strcspn(out, "\r\n")] = 0;
     snprintf(next.root, sizeof next.root, "%s", out);
     free(out);
@@ -625,7 +628,7 @@ bool ced_git_stage(CedGit *git, const char *path, bool unstage, char *error) {
     const char *args[] = {"git", "--literal-pathspecs", "-C", git->root,
                           unstage ? "restore" : "add", unstage ? "--staged" : "--all", "--", path, original, NULL};
     char *out = NULL;
-    bool ok = git_run(args, &out, error);
+    bool ok = git_run(args,&out,error,true);
     free(out);
     if (!ok && unstage) {
         /* An unborn branch has no HEAD to restore from. */
@@ -635,7 +638,7 @@ bool ced_git_stage(CedGit *git, const char *path, bool unstage, char *error) {
         if (result) {
             const char *remove[] = {"git", "--literal-pathspecs", "-C", git->root,
                                     "rm", "--cached", "-r", "--", path, NULL};
-            ok = git_run(remove, &out, error);
+            ok = git_run(remove,&out,error,true);
             free(out);
         }
     }
@@ -651,14 +654,14 @@ bool ced_git_stage_all(CedGit *git, bool unstage, char *error) {
         if (result) {
             /* Clear an unborn branch's index without touching working files. */
             const char *empty[] = {"git", "-C", git->root, "read-tree", "--empty", NULL};
-            bool ok = git_run(empty, &out, error);
+            bool ok = git_run(empty,&out,error,true);
             free(out);
             return ok;
         }
     }
     const char *args[] = {"git", "-C", git->root, unstage ? "restore" : "add",
                          unstage ? "--staged" : "--all", "--", ".", NULL};
-    bool ok = git_run(args, &out, error);
+    bool ok = git_run(args,&out,error,true);
     free(out);
     return ok;
 }
@@ -695,12 +698,12 @@ bool ced_git_discard(CedGit *git, const char *path, char *error) {
     char *out = NULL;
     if (change->index == '?' && change->worktree == '?') {
         const char *args[] = {"git","--literal-pathspecs","-C",current.root,"clean","-f","--",path,NULL};
-        ok = git_run(args,&out,error);
+        ok = git_run(args,&out,error,true);
         if (ok && (!lstat(absolute,&st) || errno != ENOENT)) ok = fail(error,"The untracked file could not be removed.");
     } else {
         /* The default source is the index, not HEAD: staged content survives. */
         const char *args[] = {"git","--literal-pathspecs","-C",current.root,"restore","--worktree","--",path,NULL};
-        ok = git_run(args,&out,error);
+        ok = git_run(args,&out,error,true);
     }
     free(out);
 done:
@@ -711,7 +714,7 @@ bool ced_git_sync(CedGit *git, bool pull, char *error) {
     const char *args[] = {"env", "GIT_TERMINAL_PROMPT=0", "git", "-C", git->root,
                          pull ? "pull" : "push", pull ? "--ff-only" : NULL, NULL};
     char *out = NULL;
-    bool ok = git_run(args, &out, error);
+    bool ok = git_run(args,&out,error,true);
     free(out);
     return ok;
 }
@@ -720,7 +723,7 @@ bool ced_git_commit(CedGit *git, const char *message, char *error) {
     if (!*message) return fail(error, "Enter a commit message.");
     const char *args[] = {"git", "-C", git->root, "-c", "core.editor=true", "commit", "-m", message, NULL};
     char *out = NULL;
-    bool ok = git_run(args, &out, error);
+    bool ok = git_run(args,&out,error,true);
     free(out);
     return ok;
 }

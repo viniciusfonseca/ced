@@ -1,4 +1,5 @@
 #include "extensions/manager.h"
+#include "output.h"
 #include "file_operations.h"
 #include <assert.h>
 #include <stdio.h>
@@ -40,6 +41,10 @@ int main(int argc,char **argv) {
         while(*instance->command || (strcmp(modes[n],"flood") && instance->process)) { tick(m); assert(ced_ext_now()<deadline); }
         if(!strcmp(modes[n],"flood")) {
             assert(instance->state==EXT_ACTIVE && instance->process);
+            char output[CED_OUTPUT_CAP];
+            uint64_t revision=0;
+            ced_output_copy(output,&revision);
+            assert(strstr(output,"[fixture.flood] xxxxxxxx"));
             char log[CED_PATH],relative[256];snprintf(relative,sizeof relative,"logs/extensions/%s/%s.log",instance->session,approved.manifest.id);
             assert(ced_join(log,sizeof log,profile,relative)); struct stat st;assert(!stat(log,&st));assert(st.st_size<=3*1024*1024);
         } else { assert(instance->state==EXT_FAILED && !instance->process && *instance->error); }

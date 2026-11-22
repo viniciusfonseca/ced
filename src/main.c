@@ -2,6 +2,8 @@
 #include "preferences.h"
 #include "editor_font.h"
 #include "lsp.h"
+#include "output.h"
+#include "jvm_project.h"
 #include "terminal_view.h"
 #include "editor_assist.h"
 #include "file_operations.h"
@@ -11,6 +13,7 @@
 #include "editor_bridge.h"
 #ifdef CED_ENABLE_EXTENSIONS
 #include "extensions/extension_ui.h"
+#include "extensions/lsp_launch.h"
 #endif
 #include <cui/cui.h>
 #include <cui/cui_app.h>
@@ -24,6 +27,7 @@
 #include <unistd.h>
 
 #define MAX_DOCS 32
+#define CED_OUTPUT_TAB "ced.output"
 
 #ifdef __APPLE__
 void ced_macos_set_icon(void);
@@ -64,6 +68,17 @@ typedef struct {
 } GitDiscard;
 
 typedef struct {
+    CedLsp *peer;
+    bool attempted;
+    char status[CED_ERROR];
+#ifdef CED_ENABLE_EXTENSIONS
+    CedExtensionLspLaunch *launch;
+    char root[CED_PATH], document[CED_PATH], provider[65];
+    int lease;
+#endif
+} LanguageSession;
+
+typedef struct {
     CedWorkspace workspace;
     CedGit git;
     GitSync git_sync;
@@ -93,14 +108,17 @@ typedef struct {
     cui_code_editor_result caret;
     cui_app *app;
     cui_texture logo;
-    CedLsp *lsp;
-    bool lsp_attempted, problems_open;
+    LanguageSession languages[CED_LSP_NONE];
+    bool problems_open;
     CedEditorAssist assist;
     int goto_offset;
     CedTerminal *terminal;
     CedTerminalView terminal_view;
     bool terminal_visible, terminal_right;
     char terminal_tab[CED_TERMINAL_TAB_CAPACITY];
+    char output_text[CED_OUTPUT_CAP];
+    uint64_t output_revision;
+    bool output_focused, output_latest;
     float terminal_bottom_split, terminal_right_split;
     FileAction file_action;
     CedCommands commands;
@@ -113,6 +131,34 @@ typedef struct {
     char sidebar_tab[257];
 #endif
 } Editor;
+static CedLsp *lsp_for_file(Editor *e, const char *path) {
+    CedLspLanguage language=ced_lsp_language_kind(path);
+    if (language==CED_LSP_NONE) return NULL;
+    LanguageSession *session=&e->languages[language];
+#ifdef CED_ENABLE_EXTENSIONS
+    if (language!=CED_LSP_C && !ced_jvm_contains(session->root,path)) return NULL;
+#endif
+    return session->peer;
+}
+
+static void reset_language(Editor *e, CedLspLanguage language) {
+    LanguageSession *session=&e->languages[language];
+#ifdef CED_ENABLE_EXTENSIONS
+    ced_extension_lsp_cancel(session->launch);
+#endif
+    ced_lsp_stop(session->peer);
+#ifdef CED_ENABLE_EXTENSIONS
+    if (language!=CED_LSP_C && session->peer) close(session->lease);
+#endif
+    *session=(LanguageSession){0};
+    for (int i=0;i<e->count;i++)
+        if (ced_lsp_language_kind(e->docs[i].file.path)==language) e->docs[i].lsp_synced=false;
+}
+
+static void reset_languages(Editor *e) {
+    for (int language=0;language<CED_LSP_NONE;language++) reset_language(e,(CedLspLanguage)language);
+}
+
 static void dispatch(Editor *e, const char *id);
 static void remove_tab(Editor *e, int index);
 
@@ -125,6 +171,7 @@ static bool extension_modal(const Editor *e) {
 }
 
 static void notify(Editor *e, const char *message) {
+    if (strcmp(e->message,message)) ced_output_text("CED",message);
     snprintf(e->message, sizeof e->message, "%s", message);
 }
 
@@ -265,9 +312,17 @@ static bool save_document(Editor *e, int index, bool save_as) {
 #ifdef CED_ENABLE_EXTENSIONS
     ced_extensions_document_changed(e->extensions, &tab->file, previous_access);
 #endif
-    if (strcmp(previous_path, tab->file.path)) ced_lsp_close(e->lsp, previous_path);
-    tab->lsp_synced = ced_lsp_sync(e->lsp, tab->file.path, tab->file.text);
-    ced_lsp_saved(e->lsp, tab->file.path);
+    if (strcmp(previous_path, tab->file.path)) ced_lsp_close(lsp_for_file(e,previous_path),previous_path);
+    CedLsp *server=lsp_for_file(e,tab->file.path);
+    tab->lsp_synced=ced_lsp_sync(server,tab->file.path,tab->file.text);
+    ced_lsp_saved(server,tab->file.path);
+#ifdef CED_ENABLE_EXTENSIONS
+    char project_settings[CED_PATH];
+    if (ced_join(project_settings,sizeof project_settings,e->workspace.root,".ced/settings.json") &&
+        !strcmp(project_settings,tab->file.path)) {
+        reset_language(e,CED_LSP_JAVA); reset_language(e,CED_LSP_KOTLIN);
+    }
+#endif
     tab_title(tab);
     notify(e, "Saved.");
     refresh(e);
@@ -293,7 +348,7 @@ static void perform_git_discard(Editor *e) {
 #ifdef CED_ENABLE_EXTENSIONS
             ced_extensions_document_closed(e->extensions,tab->file.id);
 #endif
-            ced_lsp_close(e->lsp,tab->file.path);
+            ced_lsp_close(lsp_for_file(e,tab->file.path),tab->file.path);
             ced_document_free(&tab->file); tab->file = restored;
             tab->id = ++e->next_id;
             ced_document_identify(&tab->file,(uint64_t)tab->id);
@@ -311,7 +366,7 @@ static void remove_tab(Editor *e, int index) {
 #ifdef CED_ENABLE_EXTENSIONS
     ced_extensions_document_closed(e->extensions, e->docs[index].file.id);
 #endif
-    ced_lsp_close(e->lsp, e->docs[index].file.path);
+    ced_lsp_close(lsp_for_file(e,e->docs[index].file.path),e->docs[index].file.path);
     ced_document_free(&e->docs[index].file);
     memmove(e->docs + index, e->docs + index + 1, sizeof *e->docs * (size_t)(e->count - index - 1));
     e->count--;
@@ -376,6 +431,9 @@ static void poll_preferences(cui_ctx *ui, Editor *e) {
     e->font_size=settings.font_size; e->terminal_right=settings.terminal_right;
     if (visibility_changed) e->terminal_visible=settings.terminal_visible;
     if (tab_changed) snprintf(e->terminal_tab,sizeof e->terminal_tab,"%s",settings.terminal_tab);
+    if (memcmp(&e->preferences.jvm,&settings.jvm,sizeof settings.jvm)) {
+        reset_language(e,CED_LSP_JAVA); reset_language(e,CED_LSP_KOTLIN);
+    }
     e->preferences=settings; e->preferences_loaded=true;
     if (!settings_changed) return;
     /* Refresh only clean settings buffers; never replace unsaved JSON edits. */
@@ -390,7 +448,7 @@ static void poll_preferences(cui_ctx *ui, Editor *e) {
 #ifdef CED_ENABLE_EXTENSIONS
         ced_extensions_document_closed(e->extensions,tab->file.id);
 #endif
-        ced_lsp_close(e->lsp,tab->file.path); ced_document_free(&tab->file); tab->file=next;
+        ced_lsp_close(lsp_for_file(e,tab->file.path),tab->file.path); ced_document_free(&tab->file); tab->file=next;
         tab->id=++e->next_id; ced_document_identify(&tab->file,(uint64_t)tab->id);
         size_t cursor=(size_t)tab->cursor;
         if (cursor>next.length) cursor=next.length;
@@ -481,7 +539,7 @@ static bool open_folder(Editor *e, const char *path) {
     ced_extensions_workspace(e->extensions, next.root);
     if (!ced_extension_tab_find(e->extensions, e->sidebar_tab, NULL, NULL)) *e->sidebar_tab = 0;
 #endif
-    ced_lsp_stop(e->lsp); e->lsp = NULL; e->lsp_attempted = false;
+    reset_languages(e);
     ced_assist_reset(&e->assist);
     ced_terminal_stop(e->terminal); e->terminal = NULL;
     e->terminal_view = (CedTerminalView){.autofocus = true};
@@ -548,26 +606,80 @@ static void open_folder_menu(cui_ctx *ui, Editor *e) {
     }
 }
 
+#ifdef CED_ENABLE_EXTENSIONS
+static void jvm_tick(Editor *e, CedLspLanguage language, EditorTab *tab) {
+    LanguageSession *session=&e->languages[language];
+    unsigned kind=language==CED_LSP_JAVA ? CED_EXT_LSP_JAVA : CED_EXT_LSP_KOTLIN;
+    const CedExtensionRecord *provider=ced_extensions_language_provider(e->extensions,kind);
+    if (*session->provider && (!provider || strcmp(session->provider,provider->hash)))
+        reset_language(e,language);
+    if (!provider) return;
+
+    if (tab && strcmp(session->document,tab->file.path)) {
+        CedJvmSettings settings;
+        char root[CED_PATH], maven_settings[CED_PATH]={0}, error[CED_ERROR];
+        CedJvmBuild build;
+        bool valid=ced_preferences_project(e->workspace.root,&e->preferences.jvm,&settings,error) &&
+            ced_jvm_project(e->workspace.root,tab->file.path,&settings,root,&build,error);
+        if (valid && build==CED_JVM_MAVEN)
+            valid=ced_jvm_maven_settings(e->workspace.root,settings.maven_settings,maven_settings,error);
+        if (valid && build==CED_JVM_GRADLE && *settings.gradle_java) {
+            char java[CED_PATH]; struct stat st;
+            valid=*settings.gradle_java=='/' && ced_join(java,sizeof java,settings.gradle_java,"bin/java") &&
+                !stat(java,&st) && S_ISREG(st.st_mode) && !access(java,X_OK);
+            if (!valid) snprintf(error,sizeof error,"gradle.javaHome must be an absolute JDK installation path.");
+        }
+        if (!valid || strcmp(session->root,root)) {
+            reset_language(e,language);
+            strcpy(session->provider,provider->hash);
+            if (valid) {
+                strcpy(session->root,root);
+                session->launch=ced_extension_lsp_launch(e->extensions->profile,provider,language,root,build,settings.gradle_java,maven_settings,error);
+            }
+            if (!session->launch) {
+                snprintf(session->status,sizeof session->status,"%s",error);
+                ced_output_text("Language",error);
+            }
+        }
+        strcpy(session->document,tab->file.path);
+    }
+    if (ced_extension_lsp_take(session->launch,&session->peer,&session->lease,session->status)) {
+        session->launch=NULL;
+        if (!session->peer) notify(e,session->status);
+    }
+}
+#endif
+
 static void lsp_tick(Editor *e) {
-    if (!e->lsp_attempted) {
-        for (int i = 0; i < e->count; i++) {
-            if (!e->docs[i].file.path[0] || !ced_lsp_language(e->docs[i].file.path)) continue;
-            char error[CED_ERROR];
-            e->lsp_attempted = true;
-            e->lsp = ced_lsp_start(e->workspace.root, getenv("CED_CLANGD"), error, sizeof error);
-            if (!e->lsp) notify(e, error);
+    LanguageSession *clang=&e->languages[CED_LSP_C];
+    if (!clang->attempted) {
+        for (int i=0;i<e->count;i++) {
+            if (ced_lsp_language_kind(e->docs[i].file.path)!=CED_LSP_C) continue;
+            clang->attempted=true;
+            clang->peer=ced_lsp_start(e->workspace.root,getenv("CED_CLANGD"),clang->status,sizeof clang->status);
+            if (!clang->peer) notify(e,clang->status);
             break;
         }
     }
-    ced_lsp_poll(e->lsp);
-    if (ced_lsp_ready(e->lsp)) {
-        for (int i = 0; i < e->count; i++) {
-            EditorTab *tab = &e->docs[i];
-            if (!tab->lsp_synced && tab->file.path[0] && ced_lsp_language(tab->file.path))
-                tab->lsp_synced = ced_lsp_sync(e->lsp, tab->file.path, tab->file.text);
-        }
+    EditorTab *active=e->selected<0 ? NULL : &e->docs[e->selected];
+#ifdef CED_ENABLE_EXTENSIONS
+    CedLspLanguage language=active ? ced_lsp_language_kind(active->file.path) : CED_LSP_NONE;
+    jvm_tick(e,CED_LSP_JAVA,language==CED_LSP_JAVA ? active : NULL);
+    jvm_tick(e,CED_LSP_KOTLIN,language==CED_LSP_KOTLIN ? active : NULL);
+#endif
+    for (int n=0;n<CED_LSP_NONE;n++) ced_lsp_poll(e->languages[n].peer);
+    for (int i=0;i<e->count;i++) {
+        EditorTab *tab=&e->docs[i];
+        CedLsp *server=lsp_for_file(e,tab->file.path);
+        if (ced_lsp_ready(server) && !tab->lsp_synced)
+            tab->lsp_synced=ced_lsp_sync(server,tab->file.path,tab->file.text);
     }
-    CedLspResult *r = ced_lsp_result(e->lsp);
+    CedLsp *server=active ? lsp_for_file(e,active->file.path) : NULL;
+    CedLspResult *r=ced_lsp_result(server);
+    for (int n=0;n<CED_LSP_NONE;n++) {
+        CedLspResult *background=ced_lsp_result(e->languages[n].peer);
+        if (background && background!=r) background->ready=false;
+    }
     if (!r || !r->ready) return;
     r->ready = false;
     if (e->selected < 0 || e->diff) return;
@@ -595,14 +707,19 @@ static void lsp_tick(Editor *e) {
 static void lsp_request(cui_ctx *ui, Editor *e, CedLspRequest kind) {
     if (e->selected < 0 || e->diff) return;
     EditorTab *tab = &e->docs[e->selected];
-    if (!tab->file.path[0] || !ced_lsp_language(tab->file.path)) { notify(e, "LSP requires a saved C or C++ file."); return; }
+    if (!tab->file.path[0] || !ced_lsp_language(tab->file.path)) { notify(e,"Open a saved source file with a language server."); return; }
+    CedLsp *server=lsp_for_file(e,tab->file.path);
+    if (!server) {
+        notify(e,"No language server for this file. Check the enabled extension, workspace trust and project settings.");
+        return;
+    }
     ced_assist_reset(&e->assist);
     if (kind == CED_LSP_COMPLETION) {
         e->assist.completion_tab = tab->id; e->assist.completion_cursor = tab->cursor;
     } else if (kind == CED_LSP_HOVER) ced_assist_hover_at_caret(ui, &e->assist, tab->id, tab->cursor);
     tab->focus = true;
-    if (!ced_lsp_request(e->lsp, kind, tab->file.path, tab->file.text, tab->cursor))
-        notify(e, ced_lsp_status(e->lsp));
+    if (!ced_lsp_request(server,kind,tab->file.path,tab->file.text,tab->cursor))
+        notify(e,ced_lsp_status(server));
 }
 
 static void apply_completion(cui_ctx *ui, Editor *e, int index) {
@@ -638,6 +755,7 @@ static void set_terminal_panel(Editor *e, bool visible, const char *tab) {
         else if (e->selected >= 0) e->docs[e->selected].focus = true;
     }
     if (tab_changed) snprintf(e->terminal_tab, sizeof e->terminal_tab, "%s", tab);
+    if (visible && !strcmp(tab,CED_OUTPUT_TAB)) e->output_latest=true;
     if (!ced_terminal_state_save(visible, e->terminal_tab)) notify(e, "Could not save editor settings.");
     else e->preferences_reload = true;
 }
@@ -697,7 +815,7 @@ static void perform_file_action(Editor *e) {
                 if (!ced_path_within(tab->file.path, a->path)) continue;
                 char renamed[CED_PATH];
                 snprintf(renamed, sizeof renamed, "%s%s", result, tab->file.path + strlen(a->path));
-                ced_lsp_close(e->lsp, tab->file.path);
+                ced_lsp_close(lsp_for_file(e,tab->file.path),tab->file.path);
                 snprintf(tab->file.path, sizeof tab->file.path, "%s", renamed);
 #ifdef CED_ENABLE_EXTENSIONS
                 ced_extensions_document_changed(e->extensions, &tab->file, previous_access[i]);
@@ -912,7 +1030,10 @@ static void sidebar(cui_ctx *ui, Editor *e) {
 #ifdef CED_ENABLE_EXTENSIONS
                     selected &= !*e->sidebar_tab;
 #endif
-                    if (cui_icon_button(ui, tabs[i].icon, .tooltip = tabs[i].label, .size = CUI_SIZE_SM, .selected = selected)) {
+                    bool clicked = i == 2
+                        ? ced_git_tab_button(ui, e->git.count, e->git.truncated, selected)
+                        : cui_icon_button(ui, tabs[i].icon, .tooltip = tabs[i].label, .size = CUI_SIZE_SM, .selected = selected);
+                    if (clicked) {
                         e->panel = i;
 #ifdef CED_ENABLE_EXTENSIONS
                         *e->sidebar_tab = 0;
@@ -1074,7 +1195,8 @@ static void editor_pane(cui_ctx *ui, Editor *e) {
                     e->goto_offset = -1;
                 }
                 int diagnostic_count = 0;
-                const CedDiagnostic *diagnostics = ced_lsp_diagnostics(e->lsp, tab->file.path, &diagnostic_count);
+                CedLsp *server=lsp_for_file(e,tab->file.path);
+                const CedDiagnostic *diagnostics = ced_lsp_diagnostics(server, tab->file.path, &diagnostic_count);
                 cui_text_mark marks[CED_LSP_DIAGNOSTICS];
                 for (int i = 0; i < diagnostic_count; i++) marks[i] = (cui_text_mark){diagnostics[i].start, diagnostics[i].end, diagnostics[i].severity == 1 ? 4 : 3};
                 qsort(marks, (size_t)diagnostic_count, sizeof *marks, compare_marks);
@@ -1088,18 +1210,18 @@ static void editor_pane(cui_ctx *ui, Editor *e) {
                 if (e->caret.refused) notify(e, "Edit exceeds the 2 MiB file limit.");
                 CedEditorGeometry geometry = ced_editor_geometry(ui, "source", tab->file.text, (float)e->font_size);
                 cui_pop_id(ui);
-                CedLspResult *pending = ced_lsp_result(e->lsp);
-                bool completing = e->assist.completion_open || (ced_lsp_pending(e->lsp) && pending &&
+                CedLspResult *pending = ced_lsp_result(server);
+                bool completing = e->assist.completion_open || (ced_lsp_pending(server) && pending &&
                     pending->kind == CED_LSP_COMPLETION && e->assist.completion_tab == tab->id);
                 if (e->caret.changed && completing && tab->cursor > 0) {
                     unsigned char ch = (unsigned char)tab->file.text[tab->cursor - 1];
                     complete |= (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch >= 128;
                 }
                 int hover = ced_assist_hover(ui, &e->assist, tab->id, geometry, e->caret.changed,
-                    assist_enabled && ced_lsp_ready(e->lsp) && !ced_lsp_pending(e->lsp) && !complete);
+                    assist_enabled && ced_lsp_ready(server) && !ced_lsp_pending(server) && !complete);
                 if (!assist_enabled) ced_assist_reset(&e->assist);
                 if (complete) lsp_request(ui, e, CED_LSP_COMPLETION);
-                else if (hover >= 0) ced_lsp_request(e->lsp, CED_LSP_HOVER, tab->file.path, tab->file.text, hover);
+                else if (hover >= 0) ced_lsp_request(server, CED_LSP_HOVER, tab->file.path, tab->file.text, hover);
                 if (!e->caret.changed) problems_panel(ui, e, tab, diagnostics, diagnostic_count);
             }
         } else {
@@ -1118,25 +1240,31 @@ static void set_terminal_position(Editor *e, bool right) {
     else e->preferences_reload=true;
 }
 
+static void output_panel(cui_ctx *ui, Editor *e) {
+    ced_output_copy(e->output_text,&e->output_revision);
+    if (e->output_latest) {
+        int end=(int)strlen(e->output_text);
+        cui_code_editor_select(ui,"output-text",end,end);
+        e->output_latest=false;
+    }
+    e->output_focused=cui_code_editor(ui,"output-text",e->output_text,sizeof e->output_text,
+        .lang="text",.height=-1,.size=12,.read_only=true,.no_line_numbers=true,
+        .placeholder="Output will appear here.").focused;
+}
+
 static void terminal_panel(cui_ctx *ui, Editor *e) {
-    bool shell = true;
+    char selected[CED_TERMINAL_TAB_CAPACITY]="";
+    bool loading=false;
+    if (!strcmp(e->terminal_tab,CED_OUTPUT_TAB)) strcpy(selected,CED_OUTPUT_TAB);
 #ifdef CED_ENABLE_EXTENSIONS
-    char selected[CED_TERMINAL_TAB_CAPACITY] = "";
-    const CedExtensionTab *tab = ced_extension_tab_find(e->extensions, e->terminal_tab, NULL, NULL);
-    if (tab && tab->terminal) snprintf(selected, sizeof selected, "%s", e->terminal_tab);
-    else if (*e->terminal_tab && e->extensions &&
-             (e->extensions->reload || (e->extensions->job.running && e->extensions->job.kind == EXT_LOAD))) {
-        cui_secondary(ui, "Loading extensions…");
-        return;
+    else {
+        const CedExtensionTab *tab=ced_extension_tab_find(e->extensions,e->terminal_tab,NULL,NULL);
+        loading=*e->terminal_tab && e->extensions &&
+            (e->extensions->reload || (e->extensions->job.running && e->extensions->job.kind==EXT_LOAD));
+        if ((tab && tab->terminal) || loading) strcpy(selected,e->terminal_tab);
     }
-    shell = !*selected;
 #endif
-    if (shell && !e->terminal) {
-        char error[CED_ERROR];
-        e->terminal = ced_terminal_start(e->workspace.root, getenv("SHELL"), error, sizeof error);
-        if (!e->terminal) { notify(e, error); e->terminal_visible = false; return; }
-        e->terminal_view.autofocus = true;
-    }
+    bool shell=!*selected, output=!strcmp(selected,CED_OUTPUT_TAB);
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .bg = CUI_COLOR_SURFACE_MUTED, .clip = true) {
         cui_row(ui, .width = CUI_FILL, .pad_x = 8, .pad_y = 4, .gap = 6, .align = CUI_ALIGN_CENTER, .wrap = true) {
             cui_column(ui, .width = CUI_FILL, .min_width = 120) {
@@ -1146,48 +1274,73 @@ static void terminal_panel(cui_ctx *ui, Editor *e) {
                         float radius = theme->radius_control;
                         theme->radius_control = 0;
                         if (cui_button(ui, "Shell", .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST, .selected = shell)) {
-#ifdef CED_ENABLE_EXTENSIONS
-                            selected[0] = 0;
-                            set_terminal_panel(e, true, selected);
-#endif
-                            e->terminal_view.autofocus = true;
+                            selected[0]=0;
+                            set_terminal_panel(e,true,selected);
+                            e->terminal_view.autofocus=true;
+                            loading=false;
                         }
 #ifdef CED_ENABLE_EXTENSIONS
-                        if (ced_extension_tab_buttons(ui, e->extensions, true, selected))
-                            set_terminal_panel(e, true, selected);
-                        shell = !*selected;
+                        if (ced_extension_tab_buttons(ui,e->extensions,true,selected)) {
+                            set_terminal_panel(e,true,selected);
+                            loading=false;
+                        }
 #endif
+                        shell=!*selected; output=!strcmp(selected,CED_OUTPUT_TAB);
                         theme->radius_control = radius;
                     }
                 }
             }
             cui_row(ui, .width = CUI_FIT, .gap = 6, .align = CUI_ALIGN_CENTER) {
+                if (output) {
+                    if (cui_icon_button(ui,CUI_ICON_ARROW_DOWN,.size=CUI_SIZE_SM,.tooltip="Jump to Latest Output"))
+                        e->output_latest=true;
+                    if (cui_icon_button(ui,CUI_ICON_TRASH_2,.size=CUI_SIZE_SM,.tooltip="Clear Output"))
+                        ced_output_clear();
+                }
+                if (shell && cui_icon_button(ui, CUI_ICON_REFRESH_CW, .size = CUI_SIZE_SM, .tooltip = "Restart Terminal")) {
+                    ced_terminal_stop(e->terminal); e->terminal = NULL;
+                }
+                if (cui_icon_button(ui, CUI_ICON_FILE_TEXT, .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST,
+                        .tooltip = "Show Output", .selected = output)) {
+                    set_terminal_panel(e, true, CED_OUTPUT_TAB);
+                    e->output_latest = true;
+                    shell = loading = false;
+                    output = true;
+                }
                 bool right = e->terminal_right;
                 if (ced_aux_panel_button(ui, "move-auxiliary-panel", right, false,
                         right ? "Move Auxiliary Panel to Bottom" : "Move Auxiliary Panel Right")) {
                     set_terminal_position(e, !right);
                     cui_request_redraw(ui);
                 }
-                if (shell && cui_icon_button(ui, CUI_ICON_REFRESH_CW, .size = CUI_SIZE_SM, .tooltip = "Restart Terminal")) {
-                    ced_terminal_stop(e->terminal); e->terminal = NULL;
-                }
             }
         }
+        if (!shell) e->terminal_view.focused=false;
+        if (!output) e->output_focused=false;
+        if (output) output_panel(ui,e);
 #ifdef CED_ENABLE_EXTENSIONS
-        if (!shell) {
-            e->terminal_view.focused = false;
-            ced_extension_tab_body(ui, e->extensions, selected);
-        }
+        else if (loading) cui_secondary(ui,"Loading extensions…");
+        else if (!shell) ced_extension_tab_body(ui,e->extensions,selected);
+#else
+        (void)loading;
 #endif
-        if (shell && e->terminal) {
-            if (!e->terminal->alive) cui_secondary(ui, "Shell exited.");
-            ced_terminal_view(ui, e->terminal, &e->terminal_view, (float)e->font_size);
+        if (shell) {
+            if (!e->terminal) {
+                char error[CED_ERROR];
+                e->terminal=ced_terminal_start(e->workspace.root,getenv("SHELL"),error,sizeof error);
+                if (!e->terminal) { notify(e,error); e->terminal_visible=false; }
+                else e->terminal_view.autofocus=true;
+            }
+            if (e->terminal) {
+                if (!e->terminal->alive) cui_secondary(ui,"Shell exited.");
+                ced_terminal_view(ui,e->terminal,&e->terminal_view,(float)e->font_size);
+            }
         }
     }
 }
 
 static void document_area(cui_ctx *ui, Editor *e) {
-    if (!e->terminal_visible) { e->terminal_view.focused = false; editor_pane(ui, e); return; }
+    if (!e->terminal_visible) { e->terminal_view.focused = e->output_focused = false; editor_pane(ui, e); return; }
     bool right = e->terminal_right;
     float *ratio = right ? &e->terminal_right_split : &e->terminal_bottom_split;
     cui_split(ui, right ? "terminal-right-split" : "terminal-bottom-split", ratio,
@@ -1309,7 +1462,7 @@ static CedCommandContext editor_context(void *user) {
 #endif
     const char *language = has_document ? ced_language(tab->file.path) : NULL;
     return (CedCommandContext){document, has_document ? tab->file.version : 0, e->selection_version,
-        anchor, cursor, has_document, has_document && !e->terminal_view.focused && !extension_modal(e), trusted, language ? language : "text"};
+        anchor, cursor, has_document, has_document && !e->terminal_view.focused && !e->output_focused && !extension_modal(e), trusted, language ? language : "text"};
 }
 
 #ifdef CED_ENABLE_EXTENSIONS
@@ -1365,17 +1518,38 @@ static const struct { const char *id, *title, *category, *shortcut; } builtin_co
     {"ced.preferences.open", "Open Preferences (JSON)", "Preferences", "Cmd/Ctrl ,"},
     {"ced.preferences.reload", "Reload Preferences", "Preferences", ""},
     {"ced.workspace.openRecent", "Open Recent Folder", "File", ""},
+    {"ced.output.show", "Show Output", "View", ""},
+#ifdef CED_ENABLE_EXTENSIONS
+    {"ced.language.importJvm", "Import JVM Project", "Language", ""},
+#endif
 };
 
 static bool builtin_execute(void *user, const char *id, const CedCommandContext *context, char *error) {
     (void)context;
     Editor *e = user; cui_ctx *ui = cui_app_ui(e->app);
+    if (!strcmp(id,"ced.output.show")) {
+        set_terminal_panel(e,true,CED_OUTPUT_TAB); return true;
+    }
     if (!strcmp(id,"ced.preferences.open")) {
         char path[CED_PATH];
         if (!ced_preferences_ensure(path,error)) return false;
         return open_document(e,path,0,0);
     }
     if (!strcmp(id,"ced.preferences.reload")) { e->preferences_reload=true; return true; }
+#ifdef CED_ENABLE_EXTENSIONS
+    if (!strcmp(id,"ced.language.importJvm")) {
+        CedLspLanguage language=e->selected>=0 ? ced_lsp_language_kind(e->docs[e->selected].file.path) : CED_LSP_NONE;
+        if (language!=CED_LSP_JAVA && language!=CED_LSP_KOTLIN) {
+            snprintf(error,CED_ERROR,"Open a saved Java or Kotlin file in the project first."); return false;
+        }
+        unsigned kind=language==CED_LSP_JAVA ? CED_EXT_LSP_JAVA : CED_EXT_LSP_KOTLIN;
+        if (!ced_extensions_language_provider(e->extensions,kind)) {
+            snprintf(error,CED_ERROR,"Enable a language extension and trust this workspace before importing."); return false;
+        }
+        reset_language(e,language); ced_assist_reset(&e->assist);
+        return true;
+    }
+#endif
     if (!strcmp(id, "ced.workspace.openRecent")) {
         e->open_menu_requested = true;
         cui_request_wakeup(ui, 0);
@@ -1395,7 +1569,7 @@ static bool builtin_execute(void *user, const char *id, const CedCommandContext 
         case 8: lsp_request(ui, e, CED_LSP_DEFINITION); break;
         case 9: lsp_request(ui, e, CED_LSP_HOVER); break;
         case 10:
-            ced_lsp_stop(e->lsp); e->lsp = NULL; e->lsp_attempted = false;
+            reset_languages(e);
             ced_assist_reset(&e->assist);
             for (int n = 0; n < e->count; n++) e->docs[n].lsp_synced = false;
             break;
@@ -1476,7 +1650,12 @@ static void frame(cui_ctx *ui, Editor *e) {
     }
     if (e->selected < 0 || e->diff || e->close_dialog || e->commit_dialog || e->git_discard.open || e->file_action.open || e->palette) ced_assist_reset(&e->assist);
     lsp_tick(e);
-    if (ced_lsp_running(e->lsp)) cui_request_wakeup(ui, 0.05f);
+    for (int n=0;n<CED_LSP_NONE;n++)
+        if (ced_lsp_running(e->languages[n].peer)
+#ifdef CED_ENABLE_EXTENSIONS
+            || e->languages[n].launch
+#endif
+        ) cui_request_wakeup(ui,.05f);
     if (e->terminal) {
         ced_terminal_poll(e->terminal);
         if (e->terminal->alive) cui_request_wakeup(ui, e->terminal_visible ? 0.03f : 0.1f);
@@ -1509,7 +1688,7 @@ static void frame(cui_ctx *ui, Editor *e) {
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_G)) { e->panel = 2; e->sidebar = true; refresh_git(e); }
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_P)) e->palette = true;
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_J)) dispatch(e, "ced.terminal.toggle");
-        if (!e->terminal_view.focused) {
+        if (!e->terminal_view.focused && !e->output_focused) {
             if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_V)) dispatch(e, "ced.markdown.toggle");
             if (cui_shortcut(ui, 0, CUI_KEY_F12)) dispatch(e, "ced.language.definition");
             if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_K)) dispatch(e, "ced.language.hover");
@@ -1556,10 +1735,19 @@ static void frame(cui_ctx *ui, Editor *e) {
             cui_status_bar_text(ui, e->git.available ? e->git.branch : "No Git", .icon = CUI_ICON_GIT_BRANCH);
             cui_status_bar_text(ui, e->message, .tone = CUI_TONE_NEUTRAL);
             cui_status_bar_spacer(ui);
-            if (e->lsp_attempted) cui_status_bar_text(ui, ced_lsp_status(e->lsp), .tone = CUI_TONE_NEUTRAL);
             if (!e->diff && e->selected >= 0) {
+                const char *path=e->docs[e->selected].file.path;
+                CedLspLanguage language=ced_lsp_language_kind(path);
+                CedLsp *server=lsp_for_file(e,path);
+                const char *status=server ? ced_lsp_status(server) :
+                    language!=CED_LSP_NONE ? e->languages[language].status : "";
+#ifdef CED_ENABLE_EXTENSIONS
+                if (!server && language!=CED_LSP_NONE && e->languages[language].launch) status="Starting language server…";
+#endif
+                if (*status && cui_status_bar_item(ui,status,.icon=CUI_ICON_LIST))
+                    set_terminal_panel(e,true,CED_OUTPUT_TAB);
                 int count;
-                ced_lsp_diagnostics(e->lsp, e->docs[e->selected].file.path, &count);
+                ced_lsp_diagnostics(server,path,&count);
                 char problems[40]; snprintf(problems, sizeof problems, "Problems: %d", count);
                 if (ced_lsp_language(e->docs[e->selected].file.path) && cui_status_bar_item(ui, problems, .icon = CUI_ICON_TRIANGLE_ALERT)) e->problems_open = !e->problems_open;
                 if (!e->docs[e->selected].markdown_preview) {
@@ -1604,7 +1792,7 @@ static void editor_free(Editor *e) {
     if (e->git_sync.running) pthread_join(e->git_sync.thread, NULL);
     pthread_mutex_destroy(&e->git_sync.mutex);
     ced_search_cancel(&e->search);
-    ced_lsp_stop(e->lsp);
+    reset_languages(e);
     ced_terminal_stop(e->terminal);
     pthread_mutex_destroy(&e->search.mutex);
     for (int i = 0; i < e->count; i++) ced_document_free(&e->docs[i].file);

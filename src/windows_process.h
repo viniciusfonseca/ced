@@ -5,7 +5,7 @@
 #include <stddef.h>
 
 typedef struct {
-    HANDLE process, job, input, output;
+    HANDLE process, job, input, output, errors;
     HPCON console;
     OVERLAPPED read, write;
     bool reading, writing;
@@ -14,7 +14,8 @@ typedef struct {
 } CedWindowsProcess;
 
 bool ced_windows_spawn(CedWindowsProcess *process, const char *const args[], const char *cwd,
-                       bool terminal, bool merge_stderr, HANDLE stdin_file);
+                       bool terminal, bool merge_stderr, bool capture_stderr, HANDLE stdin_file);
+ssize_t ced_windows_read_stderr(CedWindowsProcess *process, char *bytes, size_t capacity);
 ssize_t ced_windows_read(CedWindowsProcess *process, char *bytes, size_t capacity);
 ssize_t ced_windows_write(CedWindowsProcess *process, const char *bytes, size_t length);
 bool ced_windows_exited(CedWindowsProcess *process, int *status);

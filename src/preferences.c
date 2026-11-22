@@ -128,7 +128,11 @@ static cJSON *parse(const char *text, size_t length, CedPreferences *settings, c
     next.terminal_visible=cJSON_IsTrue(visible);
     if (!text_field(root,"editor.fontFamily",next.font_family,sizeof next.font_family,error) ||
         !text_field(root,"editor.fontPath",next.font_path,sizeof next.font_path,error) ||
-        !text_field(root,"terminal.tab",next.terminal_tab,sizeof next.terminal_tab,error)) goto failed;
+        !text_field(root,"terminal.tab",next.terminal_tab,sizeof next.terminal_tab,error) ||
+        !text_field(root,"maven.pomPath",next.jvm.pom,sizeof next.jvm.pom,error) ||
+        !text_field(root,"maven.settingsPath",next.jvm.maven_settings,sizeof next.jvm.maven_settings,error) ||
+        !text_field(root,"gradle.projectPath",next.jvm.gradle,sizeof next.jvm.gradle,error) ||
+        !text_field(root,"gradle.javaHome",next.jvm.gradle_java,sizeof next.jvm.gradle_java,error)) goto failed;
     bool absolute_font = *next.font_path=='/';
 #ifdef _WIN32
     absolute_font |= strlen(next.font_path)>2 && isalpha((unsigned char)next.font_path[0]) && next.font_path[1]==':' &&
@@ -148,6 +152,19 @@ bool ced_preferences_validate(const char *text, size_t length, CedPreferences *s
     cJSON *root=parse(text,length,settings,error); if (!root) return false; cJSON_Delete(root); return true;
 }
 
+static cJSON *read_preferences(int fd, CedPreferences *settings, char *error) {
+    struct stat st;
+    if (fd<0 || fstat(fd,&st) || !S_ISREG(st.st_mode) || st.st_size<=0 || st.st_size>CED_PREFERENCES_LIMIT) {
+        if (fd>=0) close(fd); failure(error,"Could not read settings.json (regular file, maximum 64 KiB)."); return NULL;
+    }
+    size_t length=(size_t)st.st_size,used=0; char *text=malloc(length+1);
+    if (!text) { close(fd); failure(error,"Out of memory."); return NULL; }
+    while (used<length) { ssize_t n=read(fd,text+used,length-used); if (n<0 && errno==EINTR) continue; if (n<=0) break; used+=(size_t)n; }
+    close(fd); text[used]=0;
+    cJSON *root=used==length ? parse(text,length,settings,error) : NULL; free(text);
+    if (!root && !*error) failure(error,"Could not read settings.json."); return root;
+}
+
 static cJSON *load(CedPreferences *settings, char *error) {
     ced_preferences_defaults(settings); *error=0;
     char directory[CED_PATH],path[CED_PATH]; if (!settings_paths(directory,path,error)) return NULL;
@@ -162,16 +179,33 @@ static cJSON *load(CedPreferences *settings, char *error) {
         }
         return root;
     }
-    struct stat st;
-    if (fd<0 || fstat(fd,&st) || !S_ISREG(st.st_mode) || st.st_size<=0 || st.st_size>CED_PREFERENCES_LIMIT) {
-        if (fd>=0) close(fd); failure(error,"Could not read settings.json (regular file, maximum 64 KiB)."); return NULL;
-    }
-    size_t length=(size_t)st.st_size,used=0; char *text=malloc(length+1);
-    if (!text) { close(fd); failure(error,"Out of memory."); return NULL; }
-    while (used<length) { ssize_t n=read(fd,text+used,length-used); if (n<0 && errno==EINTR) continue; if (n<=0) break; used+=(size_t)n; }
-    close(fd); text[used]=0;
-    cJSON *root=used==length ? parse(text,length,settings,error) : NULL; free(text);
-    if (!root && !*error) failure(error,"Could not read settings.json."); return root;
+    return read_preferences(fd,settings,error);
+}
+
+bool ced_preferences_project(const char *workspace, const CedJvmSettings *defaults, CedJvmSettings *project, char *error) {
+    *project=*defaults; *error=0;
+#ifdef _WIN32
+    (void)workspace;
+    return true;
+#else
+    char directory[CED_PATH];
+    if (!ced_join(directory,sizeof directory,workspace,".ced")) return failure(error,"Workspace settings path is too long.");
+    int dir=open(directory,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if (dir<0) return errno==ENOENT || failure(error,"Could not open workspace .ced directory.");
+    int fd=openat(dir,"settings.json",O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC);
+    int open_error=errno;
+    close(dir);
+    if (fd<0 && open_error==ENOENT) return true;
+    CedPreferences parsed;
+    cJSON *root=read_preferences(fd,&parsed,error);
+    if (!root) return false;
+    if (cJSON_GetObjectItemCaseSensitive(root,"maven.pomPath")) strcpy(project->pom,parsed.jvm.pom);
+    if (cJSON_GetObjectItemCaseSensitive(root,"maven.settingsPath")) strcpy(project->maven_settings,parsed.jvm.maven_settings);
+    if (cJSON_GetObjectItemCaseSensitive(root,"gradle.projectPath")) strcpy(project->gradle,parsed.jvm.gradle);
+    if (cJSON_GetObjectItemCaseSensitive(root,"gradle.javaHome")) strcpy(project->gradle_java,parsed.jvm.gradle_java);
+    cJSON_Delete(root);
+    return true;
+#endif
 }
 
 bool ced_preferences_load(CedPreferences *settings, char *error) {
