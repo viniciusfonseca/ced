@@ -523,10 +523,21 @@ static void open_folder_menu(cui_ctx *ui, Editor *e) {
     }
     if (ced_anchored_menu_begin(ui, id, 360)) {
         const char *recent = NULL;
+        const char *user_home = getenv("HOME");
+        char home[CED_PATH];
+        size_t home_length = user_home && *user_home && realpath(user_home, home) ? strlen(home) : 0;
         for (size_t i = 0; i < e->recent_folders.count; i++) {
             const char *path = e->recent_folders.paths[i];
+            const char *label = path;
+            char abbreviated[CED_PATH + 1];
+            if (home_length && (home[home_length - 1] == '/'
+                    ? !strncmp(path, home, home_length) : ced_path_within(path, home))) {
+                const char *suffix = path + home_length;
+                snprintf(abbreviated, sizeof abbreviated, "~%s%s", *suffix && *suffix != '/' ? "/" : "", suffix);
+                label = abbreviated;
+            }
             cui_push_id_int(ui, (int)i);
-            if (ced_menu_item(ui, path, .icon = CUI_ICON_FOLDER, .disabled = e->git_sync.running)) recent = path;
+            if (ced_menu_item(ui, label, .icon = CUI_ICON_FOLDER, .disabled = e->git_sync.running)) recent = path;
             cui_pop_id(ui);
         }
         if (e->recent_folders.count) cui_menu_separator(ui);
