@@ -16,7 +16,7 @@
 
 typedef struct {
     char *path;                    /* Relative to the workspace; sorted depth first. */
-    int parent;
+    int parent, subtree_end;       /* Index immediately after this entry and its descendants. */
     bool directory, expanded, ignored;
 } CedEntry;
 
@@ -69,6 +69,7 @@ const char *ced_basename(const char *path);
 const char *ced_language(const char *path);
 bool ced_markdown_file(const char *path);
 bool ced_workspace_open(CedWorkspace *ws, const char *path, char *error);
+int ced_workspace_compact_directory(const CedWorkspace *ws, int index);
 void ced_workspace_free(CedWorkspace *ws);
 bool ced_document_open(CedDocument *doc, const char *path, char *error);
 bool ced_document_save(CedDocument *doc, const char *path, bool force, char *error);

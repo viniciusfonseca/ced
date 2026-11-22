@@ -164,6 +164,10 @@ static void test_workspace_search(void) {
     write_text("node_modules/dependency.txt", "dependency contents");
     path_for(path, "dist"); assert(!mkdir(path, 0700));
     write_text("dist/package.txt", "package contents");
+    path_for(path, "src"); assert(!mkdir(path, 0700));
+    path_for(path, "src/main"); assert(!mkdir(path, 0700));
+    path_for(path, "src/main/java"); assert(!mkdir(path, 0700));
+    write_text("src/main/java/example.txt", "");
     write_text(".DS_Store", "");
     path_for(path, "nested/.git"); assert(!mkdir(path, 0700));
     write_text("nested/.git/config", "needle");
@@ -171,12 +175,18 @@ static void test_workspace_search(void) {
     CedWorkspace ws = {0};
     assert(ced_workspace_open(&ws, root, error));
     bool nested = false;
+    int source = -1;
     for (int i = 0; i < ws.count; i++) {
         assert(strncmp(ws.entries[i].path, "nested/.git", strlen("nested/.git")));
         assert(strcmp(ws.entries[i].path, "loop"));
         if (!strcmp(ws.entries[i].path, "nested")) { nested = true; ws.entries[i].expanded = true; }
+        if (!strcmp(ws.entries[i].path, "src")) source = i;
     }
     assert(nested);
+    assert(source >= 0);
+    int compact = ced_workspace_compact_directory(&ws, source);
+    assert(!strcmp(ws.entries[compact].path, "src/main/java"));
+    assert(ws.entries[compact].subtree_end == ws.entries[source].subtree_end);
     assert_ignored(&ws, "dist/package.txt", false);
     assert_ignored(&ws, "node_modules/dependency.txt", false);
     assert_ignored(&ws, ".DS_Store", false);
@@ -184,10 +194,14 @@ static void test_workspace_search(void) {
         char name[64]; snprintf(name, sizeof name, "nested/item-%03d.txt", i);
         write_text(name, "");
     }
+    write_text("src/README.md", "");
     assert(ced_workspace_open(&ws, root, error));
     assert(ws.count > 150);
-    for (int i = 0; i < ws.count; i++)
+    for (int i = 0; i < ws.count; i++) {
         if (!strcmp(ws.entries[i].path, "nested")) assert(ws.entries[i].expanded);
+        if (!strcmp(ws.entries[i].path, "src")) source = i;
+    }
+    assert(ced_workspace_compact_directory(&ws, source) == source);
     static CedSearch search;
     pthread_mutex_init(&search.mutex, NULL);
     assert(ced_search_start(&search, &ws, "needle", false));

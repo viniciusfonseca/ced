@@ -126,10 +126,21 @@ static bool scan(CedWorkspace *ws, const char *relative, int parent, int depth, 
         if (!copy) { ok = false; break; }
         ws->entries[ws->count++] = (CedEntry){.path = copy, .parent = parent, .directory = items[i].dir};
         if (items[i].dir) ok = scan(ws, child, index, depth + 1, capacity);
+        ws->entries[index].subtree_end = ws->count;
     }
     for (size_t i = 0; i < count; i++) free(items[i].name);
     free(items);
     return ok;
+}
+
+int ced_workspace_compact_directory(const CedWorkspace *ws, int index) {
+    int end = ws->entries[index].subtree_end;
+    while (index + 1 < end) {
+        const CedEntry *child = &ws->entries[index + 1];
+        if (!child->directory || child->subtree_end != end) break;
+        index++;
+    }
+    return index;
 }
 
 static int compare_entry_paths(const void *left, const void *right) {

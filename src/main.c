@@ -733,32 +733,31 @@ static void perform_file_action(Editor *e) {
 }
 
 static int tree_node(cui_ctx *ui, Editor *e, int index) {
-    CedEntry *entry = &e->workspace.entries[index];
+    CedEntry *head = &e->workspace.entries[index];
+    int tail = ced_workspace_compact_directory(&e->workspace, index);
+    CedEntry *entry = &e->workspace.entries[tail];
+    const char *label = entry->path + (ced_basename(head->path) - head->path);
     bool selected = false;
     char path[CED_PATH];
-    if (!ced_join(path, sizeof path, e->workspace.root, entry->path)) return index + 1;
+    if (!ced_join(path, sizeof path, e->workspace.root, entry->path)) return entry->subtree_end;
     if (e->selected >= 0) selected = !strcmp(path, e->docs[e->selected].file.path);
-    cui_push_id(ui, entry->path);
-    bool expanded = ced_tree_begin(ui, ced_basename(entry->path), &entry->expanded,
+    cui_push_id(ui, head->path);
+    bool was_expanded = head->expanded;
+    bool expanded = ced_tree_begin(ui, label, &head->expanded,
         &(cui_tree_opts){.leaf = !entry->directory, .selected = selected,
                         .icon = entry->directory ? CUI_ICON_FOLDER : CUI_ICON_FILE_TEXT}, entry->ignored);
+    if (head->expanded != was_expanded) {
+        for (int i = index + 1; i <= tail; i++) e->workspace.entries[i].expanded = head->expanded;
+    }
     if (!entry->directory && cui_tree_clicked(ui)) open_document(e, path, 0, 0);
     file_context_menu(ui, e, path, entry->directory, false);
-    int next = index + 1;
     if (expanded) {
-        while (next < e->workspace.count && e->workspace.entries[next].parent == index)
+        for (int next = tail + 1; next < entry->subtree_end;)
             next = tree_node(ui, e, next);
         cui_tree_end(ui);
-    } else if (entry->directory) {
-        /* Skip its depth-first subtree. */
-        while (next < e->workspace.count) {
-            int parent = e->workspace.entries[next].parent;
-            if (parent < index) break;
-            next++;
-        }
     }
     cui_pop_id(ui);
-    return next;
+    return entry->subtree_end;
 }
 
 static void search_panel(cui_ctx *ui, Editor *e) {
