@@ -37,7 +37,7 @@ The command returns a complete model for its tab.
 }
 ```
 
-The host renders plain text and native controls. `heading` is limited to 256 bytes, `text` to 24,000 bytes and `actions` to 32 entries with distinct IDs. Action and input IDs are limited to 128 bytes. `input` and `refresh` are optional. If `refresh` is true, the host sends the reserved `refresh` action about every 750 ms while the tab is displayed and idle. It should return a snapshot without side effects. Models are expected to fit the existing 64 KiB command response limit. Models and input drafts are cleared when the extension stops or the workspace changes.
+The host renders plain text and native controls. `heading` is limited to 256 bytes, `text` to 24,000 bytes and `actions` to 32 entries with distinct IDs. Action and input IDs are limited to 128 bytes. `input` and `refresh` are optional. If `refresh` is true, the host sends the reserved `refresh` action about every 750 ms while the tab is displayed and idle. It should return a snapshot without side effects. Models are expected to fit the existing 64 KiB command response limit. Models and input drafts are cleared when the extension stops. Hosts that announce `host.workspaceChanges: true` can keep a workspace-independent tab active between trusted workspaces. A tab extension without document capabilities can return `retainOnWorkspaceChange: true` from initialization to opt in. The host verifies the new workspace’s trust and the installed package, then sends `ced/workspaceChanged` with the new `context` and `workspace: {uri, trusted}`. Return `{}` and use that context for subsequent requests. Existing tab models and drafts are retained across the transition.
 
 ### Native tab widgets
 
@@ -52,6 +52,7 @@ When `host.tabWidgets` is at least `1`, a model can also set `selectors` and `ch
 - With `host.tabWidgets` at least `7`, `chat.back` can provide an action ID for a left chevron before the chat title. Clicking it dispatches the action with an empty value.
 - With `host.tabWidgets` at least `8`, a tab without `chat` can provide `groups: [{label, create, items: [{id, label, delete}]}]`. Each group shows its label, square rows with a delete button each, and a New Session button at the end. Clicking a row dispatches its `id`, and the buttons dispatch the `delete` and `create` action IDs, all with empty values. A model supports at most 32 groups and 32 items total. Group labels are limited to 1,024 bytes and item labels to 256 bytes.
 - With `host.tabWidgets` at least `9`, a model can include up to three selectors. Composer selectors appear from left to right in model order. A chat can provide `approval: {title, actions: [{id, label}]}` to present a request above the composer. The title is limited to 320 bytes and the request can contain 1 to 13 actions with labels up to 128 bytes. Clicking an action dispatches its ID with an empty value.
+- With `host.tabWidgets` at least `10`, a group item can include `busy: true` to show a native CUI spinner next to its title. The row still accepts clicks. Use the model’s `refresh` flag to keep the state current.
 
 ## Installation and trust
 

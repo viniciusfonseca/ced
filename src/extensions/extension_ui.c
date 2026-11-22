@@ -6,10 +6,10 @@
 
 const CedExtensionTab *ced_extension_tab_find(CedExtensions *m, const char *id,
     CedExtensionInstance **owner, size_t *index) {
-    if (!m || !*id || m->reload) return NULL;
+    if (!m || !*id) return NULL;
     for (size_t n = 0; n < m->count; n++) {
         CedExtensionInstance *instance = &m->instances[n];
-        if (!instance->record.valid || !instance->record.enabled) continue;
+        if (!instance->record.valid || !instance->record.enabled || (m->reload && !instance->rebind_workspace)) continue;
         for (size_t t = 0; t < instance->record.manifest.tab_count; t++) {
             const CedExtensionTab *tab = &instance->record.manifest.tabs[t];
             if (strcmp(id, tab->id)) continue;
@@ -23,10 +23,11 @@ const CedExtensionTab *ced_extension_tab_find(CedExtensions *m, const char *id,
 
 bool ced_extension_tab_buttons(cui_ctx *ui, CedExtensions *m, bool terminal, char *selected) {
     bool clicked = false;
-    if (!m || m->reload) return false;
+    if (!m) return false;
     for (size_t n = 0; n < m->count; n++) {
-        const CedExtensionRecord *record = &m->instances[n].record;
-        if (!record->valid || !record->enabled) continue;
+        CedExtensionInstance *instance = &m->instances[n];
+        const CedExtensionRecord *record = &instance->record;
+        if (!record->valid || !record->enabled || (m->reload && !instance->rebind_workspace)) continue;
         for (size_t t = 0; t < record->manifest.tab_count; t++) {
             const CedExtensionTab *tab = &record->manifest.tabs[t];
             if (tab->terminal != terminal) continue;
@@ -44,10 +45,11 @@ bool ced_extension_tab_buttons(cui_ctx *ui, CedExtensions *m, bool terminal, cha
 }
 
 bool ced_extension_has_tabs(const CedExtensions *m, bool terminal) {
-    if (!m || m->reload) return false;
+    if (!m) return false;
     for (size_t n = 0; n < m->count; n++) {
-        const CedExtensionRecord *record = &m->instances[n].record;
-        if (!record->valid || !record->enabled) continue;
+        const CedExtensionInstance *instance = &m->instances[n];
+        const CedExtensionRecord *record = &instance->record;
+        if (!record->valid || !record->enabled || (m->reload && !instance->rebind_workspace)) continue;
         for (size_t t = 0; t < record->manifest.tab_count; t++)
             if (record->manifest.tabs[t].terminal == terminal) return true;
     }
@@ -130,7 +132,12 @@ static void tab_groups(cui_ctx *ui, CedExtensionInstance *instance, size_t index
             cJSON_ArrayForEach(item, cJSON_GetObjectItemCaseSensitive(group, "items")) {
                 const char *id = ced_ext_json_string(item, "id");
                 cui_push_id(ui, id);
-                cui_row(ui, .width = CUI_FILL, .gap = 0, .clip = true) {
+                cui_row(ui, .width = CUI_FILL, .gap = 0, .align = CUI_ALIGN_CENTER, .clip = true) {
+                    if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(item, "busy"))) {
+                        cui_row(ui, .id = "session-progress", .pad_x = 5, .align = CUI_ALIGN_CENTER) {
+                            cui_spinner(ui, 14, .style = CUI_SPINNER_ARC);
+                        }
+                    }
                     if (tab_list_button(ui, ced_ext_json_string(item, "label"), NULL, *busy))
                         *busy = ced_extensions_tab_action(instance, index, id, "");
                     if (cui_icon_button(ui, CUI_ICON_TRASH_2, .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST,
@@ -471,11 +478,13 @@ void ced_extension_tab_body(cui_ctx *ui, CedExtensions *m, const char *selected)
     cui_push_id(ui, selected);
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 8, .gap = 6) {
         CedExtensionTabState *state = &instance->tabs[index];
-        if (!m->trusted) {
+        if (instance->rebind_workspace && !m->trusted) {
+            cui_secondary(ui, "Loading workspace…");
+        } else if (!m->trusted) {
             if (cui_button(ui, "Trust Workspace", .size = CUI_SIZE_SM, .disabled = m->job.running))
                 m->trust_open = true;
         } else {
-            bool busy = m->job.running || instance->state == EXT_STOPPING || *instance->command;
+            bool busy = m->job.running || instance->state == EXT_STOPPING || *instance->pending;
             if (!state->requested && !busy && instance->state != EXT_FAILED && !*instance->error) {
                 state->requested = true;
                 ced_extensions_tab_action(instance, index, "open", "");

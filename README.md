@@ -65,7 +65,7 @@ Pass paths containing spaces with inner quotes, for example `make run ARGS='"/pa
 
 The first argument is the project folder. Remaining arguments are file paths relative to that folder or absolute paths. With no arguments, the editor opens the current directory. On macOS, the build also creates `build/CED.app`, which you can open from Finder. Use **Open Folder** in the command palette or Mod Shift O to switch projects.
 
-Click **Open** to choose one of the last ten folders, or select **Open Folder…** at the bottom to browse for a different directory. The **Open Recent Folder** command also opens this menu. Recent folders are kept across sessions.
+Click the folder icon in the title bar to choose one of the last ten folders, or select **Open Folder…** at the bottom to browse for a different directory. The **Open Recent Folder** command also opens this menu. Recent folders are kept across sessions.
 
 ## Install
 
@@ -141,11 +141,13 @@ Press **Mod ,** or run **Open Preferences (JSON)** from the command palette to e
   "editor.fontSize": 14,
   "editor.fontFamily": "Geist Mono",
   "editor.fontPath": "",
-  "terminal.position": "bottom"
+  "terminal.position": "bottom",
+  "terminal.visible": false,
+  "terminal.tab": ""
 }
 ```
 
-Save to apply changes. CED also checks external changes once per second; **Reload Preferences** forces a reload. Preferences apply across projects. Invalid JSON or invalid setting values keep the last valid configuration in use and display an error. Automatic zoom and terminal-position updates preserve unknown JSON fields and never overwrite an invalid preferences file. The legacy file is left untouched.
+Save to apply changes. CED also checks external changes once per second, and **Reload Preferences** forces a reload. Preferences apply across projects. Invalid JSON or invalid setting values keep the last valid configuration in use and display an error. Automatic zoom and auxiliary panel updates preserve unknown JSON fields and never overwrite an invalid preferences file. The legacy file is left untouched.
 
 `editor.fontSize` accepts integers from 8 to 32. `terminal.position` accepts `"bottom"` or `"right"`. JSON must be an object without comments or duplicate keys, up to 64 KiB.
 
@@ -204,7 +206,7 @@ Click the auxiliary panel icon next to the theme toggle in the title bar or pres
 
 The terminal starts the shell specified by `SHELL` (or `/bin/sh`) in the project folder. The session preserves `cd`, variables, and processes between commands. It supports ANSI colors, the alternate screen, function keys, and Ctrl+C to interrupt the foreground process. Drag to select and use Mod C to copy; Mod V pastes. On Linux, Ctrl Shift C/V also copies/pastes. The mouse wheel and Shift PageUp/PageDown navigate up to 2,000 lines of scrollback.
 
-Terminal position is saved to `~/.ced/settings.json` whenever you change it through the panel or command palette, and restored on startup across projects. The default is **Bottom** when no valid preference exists. Changing the position preserves your saved editor zoom and font preferences.
+CED restores the auxiliary panel's position, visibility, and selected tab across projects from `~/.ced/settings.json`. The defaults are **Bottom**, closed, and **Shell**. The `terminal.tab` setting stores an extension tab ID or an empty string for **Shell**. If the saved tab is unavailable, the panel shows **Shell**.
 
 Hiding the panel keeps the session running. **Restart Terminal** ends the session and starts another; switching projects or closing CED ends the shell and foreground process. Multiple sessions, mouse-event forwarding to terminal programs, and scrollback reflow on resize are not implemented yet; font attributes such as bold/italic do not change glyph rendering.
 
@@ -218,7 +220,7 @@ When the operating system closes the window, unsaved drafts are preserved in `~/
 
 - Up to 32 tabs, 2 MiB per text file, 20,000 tree entries, and 500 search results. Files containing NUL bytes are treated as binary.
 - Search is case-sensitive and uses files **saved on disk**, not unsaved editor buffers.
-- The tree and search skip symbolic links and the `.git`, `node_modules`, `build`, `dist`, `target`, `.venv`, `venv`, and `__pycache__` directories. Other `.gitignore` rules are not interpreted by the explorer/search; the Git panel uses Git's own rules.
+- The tree and search skip `.git` metadata and symbolic links. In Git workspaces, the tree dims entries ignored by Git. Check **Include Git-ignored files** to search their text files.
 - Use the refresh button to update files/Git. Automatic filesystem monitoring is not implemented yet.
 - A diff is a snapshot of the versions at the time of the click; click the item again after refreshing to reload it.
 - Git operations may wait for hooks, signing, credential helpers, or user configuration. Working-tree changes are discarded only through the explicit **Discard Changes** confirmation.

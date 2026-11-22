@@ -216,6 +216,21 @@ int main(int argc,char **argv) {
     for (int n = 0; n < ui->node_count; n++) {
         if (ui->nodes[n].id == first_id) assert(ui->nodes[n].radius.tl == 0 && ui->nodes[n].radius.br == 0);
     }
+    cJSON *groups = cJSON_GetObjectItemCaseSensitive(instance->tabs[0].model, "groups");
+    cJSON *rows = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(groups, 0), "items");
+    assert(cJSON_AddBoolToObject(cJSON_GetArrayItem(rows, 0), "busy", true));
+    render(ui,sw,m,argv[2],"extension-tabs-busy.png");
+    cui_push_id(ui, "example.uppercase-selection.side");
+    cui_push_id(ui, "new-directory:editor");
+    cui_push_id(ui, "session:1");
+    cui_rect spinner = cui_get_rect(ui, cui_make_id(ui, "session-progress"));
+    cui_rect active_button = cui_get_rect(ui, first_id);
+    cui_pop_id(ui);
+    cui_pop_id(ui);
+    cui_pop_id(ui);
+    assert(spinner.w >= 14 && spinner.h >= 14);
+    assert(spinner.x == contents.x && spinner.x + spinner.w == active_button.x);
+    assert(active_button.x + active_button.w == remove.x);
     cui_push_id(ui, "example.uppercase-selection.term");
     cui_rect back = cui_get_rect(ui, cui_make_id(ui, "chat-back"));
     const char *heading = ced_ext_json_string(instance->tabs[1].model, "heading");

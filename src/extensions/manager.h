@@ -40,7 +40,7 @@ typedef struct {
     char session[96], pending[64], command[257], error[CED_ERROR];
     char pending_method[64];
     cJSON *invocation_editor, *invocation_arguments;
-    bool tab_action;
+    bool tab_action, retain_on_workspace_change, rebind_workspace;
     CedExtensionTabState tabs[CED_EXTENSION_TAB_LIMIT];
     double deadline, request_started, message_window, violation_window;
     double activation_started, activation_ms;

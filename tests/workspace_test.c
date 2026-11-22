@@ -110,11 +110,11 @@ static void test_workspace_ignored(void) {
     char repo[CED_PATH], folder[CED_PATH]; path_for(repo, "ignore-tree"); assert(!mkdir(repo, 0700));
     const char *init[] = {"git", "-C", repo, "init", "-q", NULL}; command(init);
     write_text("ignore-tree/.gitignore", "*.tmp\n!keep.tmp\ncache/\n");
-    write_text("ignore-tree/hidden.tmp", "ignored"); write_text("ignore-tree/keep.tmp", "visible");
-    write_text("ignore-tree/tracked.tmp", "tracked"); write_text("ignore-tree/odd\nname.tmp", "ignored");
+    write_text("ignore-tree/hidden.tmp", "search-token"); write_text("ignore-tree/keep.tmp", "search-token");
+    write_text("ignore-tree/tracked.tmp", "search-token"); write_text("ignore-tree/odd\nname.tmp", "ignored");
     const char *add[] = {"git", "-C", repo, "add", "-f", "--", "tracked.tmp", NULL}; command(add);
     path_for(folder, "ignore-tree/cache"); assert(!mkdir(folder, 0700));
-    write_text("ignore-tree/cache/file.c", "ignored");
+    write_text("ignore-tree/cache/file.c", "search-token");
     path_for(folder, "ignore-tree/nested"); assert(!mkdir(folder, 0700));
     write_text("ignore-tree/nested/.gitignore", "*.log\n!keep.log\n");
     write_text("ignore-tree/nested/hidden.log", "ignored"); write_text("ignore-tree/nested/keep.log", "visible");
@@ -135,6 +135,17 @@ static void test_workspace_ignored(void) {
     assert_ignored(&ws, "cache", true); assert_ignored(&ws, "cache/file.c", true);
     assert_ignored(&ws, "nested", false); assert_ignored(&ws, "nested/hidden.log", true);
     assert_ignored(&ws, "nested/keep.log", false); assert_ignored(&ws, "local.txt", true);
+    static CedSearch search;
+    pthread_mutex_init(&search.mutex, NULL);
+    assert(ced_search_start(&search, &ws, "search-token", true));
+    ced_search_finish(&search);
+    assert(search.count == 4);
+    assert(ced_search_start(&search, &ws, "search-token", false));
+    ced_search_finish(&search);
+    assert(search.count == 2);
+    assert(!strcmp(search.hits[0].path, "keep.tmp"));
+    assert(!strcmp(search.hits[1].path, "tracked.tmp"));
+    pthread_mutex_destroy(&search.mutex);
     path_for(folder, "ignore-tree/nested");
     assert(ced_workspace_open(&ws, folder, error));
     assert_ignored(&ws, "hidden.log", true); assert_ignored(&ws, "keep.log", false);
@@ -150,17 +161,25 @@ static void test_workspace_search(void) {
     write_text("nested/find.txt", "first\nneedle here\nneedle needle\n");
     write_text("nested/unicode.txt", "\té alvo\n");
     path_for(path, "node_modules"); assert(!mkdir(path, 0700));
-    write_text("node_modules/ignored.txt", "needle");
+    write_text("node_modules/dependency.txt", "dependency contents");
+    path_for(path, "dist"); assert(!mkdir(path, 0700));
+    write_text("dist/package.txt", "package contents");
+    write_text(".DS_Store", "");
+    path_for(path, "nested/.git"); assert(!mkdir(path, 0700));
+    write_text("nested/.git/config", "needle");
     path_for(path, "loop"); assert(!symlink(root, path));
     CedWorkspace ws = {0};
     assert(ced_workspace_open(&ws, root, error));
     bool nested = false;
     for (int i = 0; i < ws.count; i++) {
-        assert(!strstr(ws.entries[i].path, "node_modules"));
+        assert(strncmp(ws.entries[i].path, "nested/.git", strlen("nested/.git")));
         assert(strcmp(ws.entries[i].path, "loop"));
         if (!strcmp(ws.entries[i].path, "nested")) { nested = true; ws.entries[i].expanded = true; }
     }
     assert(nested);
+    assert_ignored(&ws, "dist/package.txt", false);
+    assert_ignored(&ws, "node_modules/dependency.txt", false);
+    assert_ignored(&ws, ".DS_Store", false);
     for (int i = 0; i < 150; i++) {
         char name[64]; snprintf(name, sizeof name, "nested/item-%03d.txt", i);
         write_text(name, "");
@@ -171,19 +190,19 @@ static void test_workspace_search(void) {
         if (!strcmp(ws.entries[i].path, "nested")) assert(ws.entries[i].expanded);
     static CedSearch search;
     pthread_mutex_init(&search.mutex, NULL);
-    assert(ced_search_start(&search, &ws, "needle"));
+    assert(ced_search_start(&search, &ws, "needle", false));
     ced_search_finish(&search);
     assert(search.count == 3);
     assert(search.hits[0].line == 2 && search.hits[0].column == 1);
     assert(search.hits[2].line == 3 && search.hits[2].column == 8);
-    assert(ced_search_start(&search, &ws, "Needle"));
+    assert(ced_search_start(&search, &ws, "Needle", false));
     ced_search_finish(&search); assert(search.count == 0);
-    assert(ced_search_start(&search, &ws, "alvo"));
+    assert(ced_search_start(&search, &ws, "alvo", false));
     ced_search_finish(&search); assert(search.count == 1 && search.hits[0].column == 7);
-    assert(ced_search_start(&search, &ws, "needle"));
+    assert(ced_search_start(&search, &ws, "needle", false));
     ced_search_cancel(&search);
     assert(!search.running);
-    assert(ced_search_start(&search, &ws, "")); assert(!search.count);
+    assert(ced_search_start(&search, &ws, "", false)); assert(!search.count);
     pthread_mutex_destroy(&search.mutex);
     ced_workspace_free(&ws);
     puts("OK: recursive tree, exclusions, symlinks, refresh, async search and locations");
@@ -401,6 +420,17 @@ static void test_preferences(void) {
     assert(ced_font_size_save(22)); assert(ced_terminal_right_save(false));
     assert(ced_preferences_load(&settings,error));
     assert(settings.font_size==22 && !settings.terminal_right && !strcmp(settings.font_family,"Menlo"));
+    assert(!settings.terminal_visible && !*settings.terminal_tab);
+    assert(ced_terminal_state_save(true, "viniciusfonseca.agents.panel"));
+    assert(ced_preferences_load(&settings,error));
+    assert(settings.terminal_visible && !strcmp(settings.terminal_tab, "viniciusfonseca.agents.panel"));
+    assert(ced_terminal_state_save(false, settings.terminal_tab));
+    assert(ced_terminal_right_save(true));
+    assert(ced_preferences_load(&settings,error));
+    assert(settings.terminal_right && !settings.terminal_visible && !strcmp(settings.terminal_tab, "viniciusfonseca.agents.panel"));
+    assert(ced_terminal_state_save(true, ""));
+    assert(ced_preferences_load(&settings,error));
+    assert(settings.terminal_right && settings.terminal_visible && !*settings.terminal_tab);
     CedRecentFolders recent;
     assert(ced_recent_folders_load(&recent, error) && recent.count == 0);
     for (int i = 0; i <= CED_RECENT_FOLDERS_LIMIT; i++) {
@@ -426,7 +456,8 @@ static void test_preferences(void) {
     const char *invalid[]={"", "[]", "{", "{} garbage", "{\"editor.fontSize\":7}",
         "{\"editor.fontSize\":33}", "{\"editor.fontSize\":14.5}", "{\"editor.fontSize\":\"14\"}",
         "{\"editor.fontSize\":014}", "{\"editor.fontSize\":1e999}",
-        "{\"terminal.position\":\"left\"}", "{\"editor.fontFamily\":42}",
+        "{\"terminal.position\":\"left\"}", "{\"terminal.visible\":\"true\"}", "{\"terminal.tab\":false}",
+        "{\"terminal.tab\":\"bad\\nname\"}", "{\"editor.fontFamily\":42}",
         "{\"editor.fontPath\":\"relative.ttf\"}", "{\"editor.fontFamily\":\"Menlo\\u0000hidden\"}",
         "{\"editor.fontSize\":14,\"editor.fontSize\":15}"};
     for (size_t n=0;n<sizeof invalid/sizeof *invalid;n++) {
@@ -435,6 +466,7 @@ static void test_preferences(void) {
         assert(settings.font_size==previous.font_size && !strcmp(settings.font_family,previous.font_family));
         write_text(".ced/settings.json",invalid[n]);
         assert(!ced_font_size_save(18) && !ced_terminal_right_save(true));
+        assert(!ced_terminal_state_save(false, ""));
         assert(!ced_recent_folder_record(first));
         assert(ced_preferences_ensure(path,error)); /* Invalid JSON can still be opened for repair. */
         assert(ced_document_open(&doc,path,error)); assert(!strcmp(doc.text,invalid[n])); ced_document_free(&doc);

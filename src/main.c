@@ -87,6 +87,7 @@ typedef struct {
     bool diff, diff_staged;
     char diff_path[CED_PATH], *before, *after;
     char query[256], commit[1024], message[CED_ERROR];
+    bool search_include_ignored;
     char recovery[CED_PATH];
     int goto_line, goto_column;
     cui_code_editor_result caret;
@@ -99,6 +100,7 @@ typedef struct {
     CedTerminal *terminal;
     CedTerminalView terminal_view;
     bool terminal_visible, terminal_right;
+    char terminal_tab[CED_TERMINAL_TAB_CAPACITY];
     float terminal_bottom_split, terminal_right_split;
     FileAction file_action;
     CedCommands commands;
@@ -108,7 +110,7 @@ typedef struct {
     size_t selection_anchor, selection_cursor;
 #ifdef CED_ENABLE_EXTENSIONS
     CedExtensions *extensions;
-    char sidebar_tab[257], terminal_tab[257];
+    char sidebar_tab[257];
 #endif
 } Editor;
 static void dispatch(Editor *e, const char *id);
@@ -359,7 +361,9 @@ static void poll_preferences(cui_ctx *ui, Editor *e) {
         if (strcmp(error,e->preferences_error)) notify(e,error);
         snprintf(e->preferences_error,sizeof e->preferences_error,"%s",error); return;
     }
-    bool settings_changed=force || !e->preferences_loaded || settings.font_size!=e->preferences.font_size ||
+    bool visibility_changed=force || !e->preferences_loaded || settings.terminal_visible!=e->preferences.terminal_visible;
+    bool tab_changed=force || !e->preferences_loaded || strcmp(settings.terminal_tab,e->preferences.terminal_tab);
+    bool settings_changed=visibility_changed || tab_changed || settings.font_size!=e->preferences.font_size ||
         settings.terminal_right!=e->preferences.terminal_right || strcmp(settings.font_family,e->preferences.font_family) || strcmp(settings.font_path,e->preferences.font_path);
     bool font_changed=force || !e->preferences_loaded || *e->preferences_error || strcmp(settings.font_family,e->preferences.font_family) || strcmp(settings.font_path,e->preferences.font_path);
     if (font_changed && !ced_editor_font_apply(ui,&e->editor_font,&settings,error)) {
@@ -370,6 +374,8 @@ static void poll_preferences(cui_ctx *ui, Editor *e) {
         *e->preferences_error=0;
     }
     e->font_size=settings.font_size; e->terminal_right=settings.terminal_right;
+    if (visibility_changed) e->terminal_visible=settings.terminal_visible;
+    if (tab_changed) snprintf(e->terminal_tab,sizeof e->terminal_tab,"%s",settings.terminal_tab);
     e->preferences=settings; e->preferences_loaded=true;
     if (!settings_changed) return;
     /* Refresh only clean settings buffers; never replace unsaved JSON edits. */
@@ -473,7 +479,7 @@ static bool open_folder(Editor *e, const char *path) {
     if (!ced_workspace_open(&next, path, error)) { notify(e, error); return false; }
 #ifdef CED_ENABLE_EXTENSIONS
     ced_extensions_workspace(e->extensions, next.root);
-    *e->sidebar_tab = *e->terminal_tab = 0;
+    if (!ced_extension_tab_find(e->extensions, e->sidebar_tab, NULL, NULL)) *e->sidebar_tab = 0;
 #endif
     ced_lsp_stop(e->lsp); e->lsp = NULL; e->lsp_attempted = false;
     ced_assist_reset(&e->assist);
@@ -504,7 +510,7 @@ static void choose_folder(Editor *e) {
 static void open_folder_menu(cui_ctx *ui, Editor *e) {
     const char *id = "open-folder-menu";
     bool open = cui_popover_is_open(ui, id);
-    bool clicked = cui_toolbar_button(ui, CUI_ICON_FOLDER_OPEN, .label = "Open", .flyout = true);
+    bool clicked = cui_toolbar_button(ui, CUI_ICON_FOLDER_OPEN, .tooltip = "Open Folder", .flyout = true);
     bool keyboard = cui_key_pressed(ui, CUI_KEY_ENTER) || cui_key_pressed(ui, CUI_KEY_SPACE);
     if ((!open && clicked) || e->open_menu_requested) {
         char error[CED_ERROR];
@@ -612,10 +618,21 @@ static void apply_completion(cui_ctx *ui, Editor *e, int index) {
     ced_assist_reset(&e->assist);
 }
 
+static void set_terminal_panel(Editor *e, bool visible, const char *tab) {
+    bool tab_changed = strcmp(e->terminal_tab, tab) != 0;
+    if (!tab_changed && e->terminal_visible == visible) return;
+    if (e->terminal_visible != visible) {
+        e->terminal_visible = visible;
+        if (visible) e->terminal_view.autofocus = true;
+        else if (e->selected >= 0) e->docs[e->selected].focus = true;
+    }
+    if (tab_changed) snprintf(e->terminal_tab, sizeof e->terminal_tab, "%s", tab);
+    if (!ced_terminal_state_save(visible, e->terminal_tab)) notify(e, "Could not save editor settings.");
+    else e->preferences_reload = true;
+}
+
 static void toggle_terminal(Editor *e) {
-    e->terminal_visible = !e->terminal_visible;
-    if (e->terminal_visible) e->terminal_view.autofocus = true;
-    else if (e->selected >= 0) e->docs[e->selected].focus = true;
+    set_terminal_panel(e, !e->terminal_visible, e->terminal_tab);
 }
 
 static void request_file_action(Editor *e, FileOperation operation, const char *path, bool directory) {
@@ -702,7 +719,7 @@ static void perform_file_action(Editor *e) {
     ced_assist_reset(&e->assist);
     e->diff = false;
     refresh(e);
-    if (e->query[0]) ced_search_start(&e->search, &e->workspace, e->query);
+    if (e->query[0]) ced_search_start(&e->search, &e->workspace, e->query, e->search_include_ignored);
     if (!ok) { a->open = true; notify(e, a->error); return; }
     if (a->operation == CED_FILE_CREATE || a->operation == CED_DIRECTORY_CREATE) {
         for (int i = 0; i < e->workspace.count; i++) {
@@ -746,7 +763,9 @@ static int tree_node(cui_ctx *ui, Editor *e, int index) {
 
 static void search_panel(cui_ctx *ui, Editor *e) {
     bool changed = cui_search(ui, "project-search", e->query, sizeof e->query, .placeholder = "Search files...");
-    if (changed && !ced_search_start(&e->search, &e->workspace, e->query)) notify(e, "Could not start search.");
+    bool options_changed = cui_checkbox_ex(ui, "Include Git-ignored files", &e->search_include_ignored, NULL);
+    if ((changed || options_changed) && !ced_search_start(&e->search, &e->workspace, e->query, e->search_include_ignored))
+        notify(e, "Could not start search.");
     if (e->search.running) {
         cui_secondary(ui, "Searching...");
     } else if (e->query[0]) {
@@ -913,7 +932,8 @@ static void sidebar(cui_ctx *ui, Editor *e) {
                     }
                     if (cui_icon_button(ui, CUI_ICON_REFRESH_CW, .size = CUI_SIZE_SM, .tooltip = "Refresh Files and Git")) {
                         refresh(e);
-                        if (e->panel == 1 && e->query[0]) ced_search_start(&e->search, &e->workspace, e->query);
+                        if (e->panel == 1 && e->query[0])
+                            ced_search_start(&e->search, &e->workspace, e->query, e->search_include_ignored);
                     }
                 }
                 if (e->panel == 0) {
@@ -1091,8 +1111,15 @@ static void set_terminal_position(Editor *e, bool right) {
 static void terminal_panel(cui_ctx *ui, Editor *e) {
     bool shell = true;
 #ifdef CED_ENABLE_EXTENSIONS
-    if (!ced_extension_tab_find(e->extensions, e->terminal_tab, NULL, NULL)) *e->terminal_tab = 0;
-    shell = !*e->terminal_tab;
+    char selected[CED_TERMINAL_TAB_CAPACITY] = "";
+    const CedExtensionTab *tab = ced_extension_tab_find(e->extensions, e->terminal_tab, NULL, NULL);
+    if (tab && tab->terminal) snprintf(selected, sizeof selected, "%s", e->terminal_tab);
+    else if (*e->terminal_tab && e->extensions &&
+             (e->extensions->reload || (e->extensions->job.running && e->extensions->job.kind == EXT_LOAD))) {
+        cui_secondary(ui, "Loading extensions…");
+        return;
+    }
+    shell = !*selected;
 #endif
     if (shell && !e->terminal) {
         char error[CED_ERROR];
@@ -1110,13 +1137,15 @@ static void terminal_panel(cui_ctx *ui, Editor *e) {
                         theme->radius_control = 0;
                         if (cui_button(ui, "Shell", .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST, .selected = shell)) {
 #ifdef CED_ENABLE_EXTENSIONS
-                            *e->terminal_tab = 0;
+                            selected[0] = 0;
+                            set_terminal_panel(e, true, selected);
 #endif
                             e->terminal_view.autofocus = true;
                         }
 #ifdef CED_ENABLE_EXTENSIONS
-                        ced_extension_tab_buttons(ui, e->extensions, true, e->terminal_tab);
-                        shell = !*e->terminal_tab;
+                        if (ced_extension_tab_buttons(ui, e->extensions, true, selected))
+                            set_terminal_panel(e, true, selected);
+                        shell = !*selected;
 #endif
                         theme->radius_control = radius;
                     }
@@ -1137,7 +1166,7 @@ static void terminal_panel(cui_ctx *ui, Editor *e) {
 #ifdef CED_ENABLE_EXTENSIONS
         if (!shell) {
             e->terminal_view.focused = false;
-            ced_extension_tab_body(ui, e->extensions, e->terminal_tab);
+            ced_extension_tab_body(ui, e->extensions, selected);
         }
 #endif
         if (shell && e->terminal) {
@@ -1421,8 +1450,7 @@ static void frame(cui_ctx *ui, Editor *e) {
     if (e->extensions && *e->extensions->reveal_tab) {
         const CedExtensionTab *tab = ced_extension_tab_find(e->extensions, e->extensions->reveal_tab, NULL, NULL);
         if (tab && tab->terminal) {
-            snprintf(e->terminal_tab, sizeof e->terminal_tab, "%s", tab->id);
-            e->terminal_visible = true;
+            set_terminal_panel(e, true, tab->id);
         } else if (tab) {
             snprintf(e->sidebar_tab, sizeof e->sidebar_tab, "%s", tab->id);
             e->sidebar = true;
@@ -1489,15 +1517,15 @@ static void frame(cui_ctx *ui, Editor *e) {
 #endif
             cui_toolbar_button(ui, CUI_ICON_PANEL_LEFT, .tooltip = "Toggle Sidebar", .toggle = &e->sidebar);
             open_folder_menu(ui, e);
+            if (cui_toolbar_button(ui, CUI_ICON_COMMAND, .tooltip = "Command Palette", .shortcut = "Cmd/Ctrl Shift P")) {
+                ced_assist_reset(&e->assist);
+                e->palette = true;
+            }
 #ifdef __APPLE__
             cui_box(ui, .id = "titlebar-drag", .width = CUI_FILL, .height = CUI_PX(cui_theme_get(ui)->control_sm)) {}
 #else
             cui_toolbar_spacer(ui);
 #endif
-            if (cui_toolbar_button(ui, CUI_ICON_COMMAND, .tooltip = "Command Palette", .shortcut = "Cmd/Ctrl Shift P")) {
-                ced_assist_reset(&e->assist);
-                e->palette = true;
-            }
             cui_row(ui, .width = CUI_FIT, .pad_x = 6) {
                 if (ced_aux_panel_button(ui, "auxiliary-panel", e->terminal_right, e->terminal_visible,
                         e->terminal_visible ? "Hide Auxiliary Panel" : "Show Auxiliary Panel"))

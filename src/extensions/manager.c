@@ -74,6 +74,7 @@ void ced_extensions_stop(CedExtensionInstance *i, const char *reason) {
     *i->command = 0;
     i->invocation_document = 0;
     cJSON_Delete(i->invocation_editor); i->invocation_editor = NULL;
+    i->retain_on_workspace_change = i->rebind_workspace = false;
     clear_tab_state(i);
 }
 
@@ -152,20 +153,27 @@ static void invoke(CedExtensionInstance *i) {
     request(i, "commands/invoke", params, 5);
 }
 
+static cJSON *workspace_params(const CedExtensionInstance *i, cJSON *params) {
+    cJSON *workspace = cJSON_AddObjectToObject(params, "workspace");
+    char *uri = ced_lsp_uri(i->manager->workspace);
+    bool ok = uri && workspace && cJSON_AddStringToObject(workspace, "uri", uri) &&
+        cJSON_AddBoolToObject(workspace, "trusted", true);
+    free(uri);
+    if (!ok) { cJSON_Delete(params); return NULL; }
+    return params;
+}
+
 static void initialize(CedExtensionInstance *i) {
     cJSON *p = cJSON_CreateObject(), *host = cJSON_AddObjectToObject(p, "host");
     cJSON_AddStringToObject(host, "name", "CED"); cJSON_AddStringToObject(host, "version", CED_EXTENSION_APP_VERSION);
     cJSON_AddNumberToObject(host, "tabProtocol", 1);
-    cJSON_AddNumberToObject(host, "tabWidgets", 9);
+    cJSON_AddNumberToObject(host, "tabWidgets", 10);
+    cJSON_AddBoolToObject(host, "workspaceChanges", true);
     cJSON *extension = cJSON_AddObjectToObject(p, "extension");
     cJSON_AddStringToObject(extension, "id", i->record.manifest.id);
     cJSON_AddStringToObject(extension, "version", i->record.manifest.version);
     cJSON *versions = cJSON_AddArrayToObject(p, "apiVersions");
     cJSON_AddItemToArray(versions, cJSON_CreateString(CED_EXTENSION_API));
-    cJSON *workspace = cJSON_AddObjectToObject(p, "workspace");
-    char *uri = ced_lsp_uri(i->manager->workspace);
-    cJSON_AddStringToObject(workspace, "uri", uri ? uri : ""); free(uri);
-    cJSON_AddBoolToObject(workspace, "trusted", true);
     cJSON *grants = cJSON_AddArrayToObject(p, "grantedCapabilities");
     if (i->record.granted & CED_EXT_READ) cJSON_AddItemToArray(grants, cJSON_CreateString("documents.read"));
     if (i->record.granted & CED_EXT_EDIT) cJSON_AddItemToArray(grants, cJSON_CreateString("documents.edit"));
@@ -182,7 +190,7 @@ static void initialize(CedExtensionInstance *i) {
         {"serviceTimeoutMs",1000},{"deactivateTimeoutMs",500}};
     for (size_t n = 0; n < sizeof values / sizeof *values; n++) cJSON_AddNumberToObject(limits, values[n].key, values[n].value);
     i->state = EXT_INITIALIZING;
-    request(i, "ced/initialize", p, 3);
+    request(i, "ced/initialize", workspace_params(i, p), 3);
 }
 
 static bool execute_command(CedExtensionInstance *i, const char *id, const CedCommandContext *context,
@@ -192,7 +200,7 @@ static bool execute_command(CedExtensionInstance *i, const char *id, const CedCo
     if (!m->trusted) failure = "Trust this workspace in Manage Extensions before running extensions.";
     else if (m->job.running || m->reload || i->state == EXT_STOPPING) failure = "Extension manager is busy.";
     else if (i->state == EXT_FAILED) failure = "Restart the failed extension in Manage Extensions.";
-    else if (*i->command) failure = "Busy: an extension command is already running.";
+    else if (*i->pending) failure = "Busy: an extension request is already running.";
     size_t active = 0;
     for (size_t n = 0; n < m->count; n++) if (m->instances[n].process) active++;
     if (!failure && !i->process && active >= 4) failure = "ResourceLimit: four extensions are already running.";
@@ -381,7 +389,7 @@ static bool tab_action_id(const char *id) {
 
 static bool valid_tab_groups(const cJSON *groups) {
     static const char *const group_fields[] = {"label", "create", "items", NULL};
-    static const char *const item_fields[] = {"id", "label", "delete", NULL};
+    static const char *const item_fields[] = {"id", "label", "delete", "busy", NULL};
     char error[CED_ERROR];
     const cJSON *group, *item;
     int count = 0;
@@ -397,7 +405,9 @@ static bool valid_tab_groups(const cJSON *groups) {
         cJSON_ArrayForEach(item, items) {
             const char *id = ced_ext_json_string(item, "id");
             const char *remove = ced_ext_json_string(item, "delete");
+            const cJSON *busy = cJSON_GetObjectItemCaseSensitive(item, "busy");
             if (++count > 32 || !ced_ext_json_fields(item, item_fields, error) ||
+                (busy && !cJSON_IsBool(busy)) ||
                 !tab_text(ced_ext_json_string(item, "label"), 256, false) ||
                 !tab_action_id(id) || !tab_action_id(remove) || !strcmp(id, remove)) return false;
             for (const cJSON *previous = items->child; previous != item; previous = previous->next)
@@ -500,14 +510,19 @@ static void response(CedExtensionInstance *i, const cJSON *message) {
     char log[240]; snprintf(log, sizeof log, "%s %s: %s after %.1f ms\n", id, i->pending_method,
         error ? "error" : "success", (ced_ext_now() - i->request_started) * 1000);
     ced_extension_process_log(i->process, log);
+    bool rebinding = !strcmp(i->pending_method, "ced/workspaceChanged");
     *i->pending = 0;
+    if (rebinding && !error) {
+        if (!cJSON_IsObject(result)) { ced_extensions_stop(i, "shutdown"); i->state = EXT_FAILED; }
+        return;
+    }
     if (error) {
         for (size_t n = 0; n < i->record.manifest.tab_count; n++) i->tabs[n].submitted = false;
         const char *text = ced_ext_json_string(error, "message");
         snprintf(i->error, sizeof i->error, "%s", text ? text : "Invalid extension response");
         snprintf(log,sizeof log,"%s %s: error code %.0f\n",id,i->pending_method,cJSON_GetObjectItemCaseSensitive(error,"code")->valuedouble);
         ced_extension_process_log(i->process,log);
-        if (i->state != EXT_ACTIVE) { ced_extensions_stop(i, "shutdown"); i->state = EXT_FAILED; }
+        if (i->state != EXT_ACTIVE || rebinding) { ced_extensions_stop(i, "shutdown"); i->state = EXT_FAILED; }
         *i->command = 0; i->invocation_document = 0; report(i->manager, i->error); return;
     }
     if (i->state == EXT_INITIALIZING) {
@@ -515,6 +530,8 @@ static void response(CedExtensionInstance *i, const cJSON *message) {
             snprintf(i->error, sizeof i->error, "Unsupported API, identity, or required host method");
             ced_extensions_stop(i, "shutdown"); i->state = EXT_FAILED; report(i->manager, i->error); return;
         }
+        i->retain_on_workspace_change = !i->record.manifest.capabilities && !i->record.granted &&
+            i->record.manifest.tab_count && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(result, "retainOnWorkspaceChange"));
         cJSON *params = cJSON_CreateObject(), *reason = cJSON_AddObjectToObject(params, "reason");
         char event[280]; snprintf(event, sizeof event, "onCommand:%s", i->command);
         cJSON_AddStringToObject(reason, "event", event);
@@ -566,24 +583,66 @@ bool ced_extensions_job(CedExtensions *m, CedExtensionJobKind kind, const char *
     snprintf(j->workspace, sizeof j->workspace, "%s", m->workspace);
     snprintf(j->argument, sizeof j->argument, "%s", argument ? argument : "");
     if (kind == EXT_INSTALL) { j->review = m->review; memset(&m->review, 0, sizeof m->review); m->review_open = false; }
-    if (kind != EXT_INSPECT) for (size_t n = 0; n < m->count; n++) ced_extensions_stop(&m->instances[n], "restart");
-    if (pthread_create(&j->thread, NULL, catalog_worker, j)) { ced_extension_record_free(&j->review); report(m, "Could not start extension catalog worker."); return false; }
+    if (kind != EXT_INSPECT) for (size_t n = 0; n < m->count; n++) {
+        CedExtensionInstance *i = &m->instances[n];
+        if (kind != EXT_LOAD || !i->rebind_workspace) ced_extensions_stop(i, "restart");
+    }
+    if (pthread_create(&j->thread, NULL, catalog_worker, j)) {
+        for (size_t n = 0; n < m->count; n++)
+            if (m->instances[n].rebind_workspace) ced_extensions_stop(&m->instances[n], "workspaceChanged");
+        ced_extension_record_free(&j->review);
+        report(m, "Could not start extension catalog worker."); return false;
+    }
     j->running = true; return true;
+}
+
+/* Keep existing command owners in place. A record that moved or changed
+ * during the catalog reload takes the normal stop/register path. */
+static bool ready_to_publish(CedExtensions *m) {
+    CedExtensionJob *j = &m->job;
+    bool ready = true;
+    for (size_t n = 0; n < m->count; n++) {
+        CedExtensionInstance *i = &m->instances[n];
+        if (!i->rebind_workspace) continue;
+        CedExtensionRecord *next = n < j->catalog.count ? &j->catalog.entries[n] : NULL;
+        if (j->ok && j->catalog.workspace_trusted && next && next->valid && next->enabled && !next->granted &&
+            !strcmp(next->manifest.id, i->record.manifest.id) &&
+            !strcmp(next->manifest.version, i->record.manifest.version) &&
+            !strcmp(next->hash, i->record.hash)) continue;
+        ced_extensions_stop(i, "workspaceChanged");
+        ready = false;
+    }
+    return ready;
 }
 
 static void publish(CedExtensions *m) {
     *m->reveal_tab = 0;
     for (size_t n = 0; n < m->count; n++) {
-        clear_tab_state(&m->instances[n]);
-        ced_commands_remove_owner(m->commands, &m->instances[n]);
-        ced_extension_record_free(&m->instances[n].record);
-        cJSON_Delete(m->instances[n].invocation_editor);
+        CedExtensionInstance *i = &m->instances[n];
+        if (i->rebind_workspace) continue;
+        clear_tab_state(i);
+        ced_commands_remove_owner(m->commands, i);
+        ced_extension_record_free(&i->record);
+        cJSON_Delete(i->invocation_editor);
+        *i = (CedExtensionInstance){0};
     }
-    memset(m->instances, 0, sizeof m->instances);
     m->trusted = m->job.catalog.workspace_trusted;
     m->count = m->job.catalog.count;
     for (size_t n = 0; n < m->count; n++) {
         CedExtensionInstance *i = &m->instances[n];
+        if (i->rebind_workspace) {
+            i->rebind_workspace = false;
+            ced_extension_record_free(&m->job.catalog.entries[n]);
+            for (size_t t = 0; t < i->record.manifest.tab_count; t++) {
+                cJSON *model = i->tabs[t].model;
+                if (model) {
+                    cJSON_DeleteItemFromObjectCaseSensitive(model, "refresh");
+                    cJSON_AddBoolToObject(model, "refresh", true);
+                }
+            }
+            request(i, "ced/workspaceChanged", workspace_params(i, cJSON_CreateObject()), 3);
+            continue;
+        }
         i->manager = m; i->record = m->job.catalog.entries[n]; i->state = EXT_REGISTERED;
         memset(&m->job.catalog.entries[n], 0, sizeof i->record);
         if (!i->record.valid || !i->record.enabled) continue;
@@ -639,14 +698,16 @@ void ced_extensions_tick(CedExtensions *m) {
                 report(m, i->error);
             } else i->state = EXT_REGISTERED;
             *i->pending = 0; *i->command = 0; i->invocation_document = 0;
+            i->retain_on_workspace_change = i->rebind_workspace = false;
             cJSON_Delete(i->invocation_editor); i->invocation_editor = NULL;
             clear_tab_state(i);
-        } else stopped = false;
+        } else if (!i->rebind_workspace || *i->pending) stopped = false;
     }
     CedExtensionJob *j = &m->job;
     if (j->running) {
         pthread_mutex_lock(&j->mutex); bool done = j->done; pthread_mutex_unlock(&j->mutex);
-        if (done && (j->kind == EXT_INSPECT || stopped)) {
+        if (done && (j->kind == EXT_INSPECT || (stopped &&
+            (j->generation != m->generation || ready_to_publish(m))))) {
             pthread_join(j->thread, NULL); j->running = false;
             if (j->generation != m->generation) { ced_extension_catalog_free(&j->catalog); ced_extension_record_free(&j->review); m->reload = true; }
             else if (!j->ok) {
@@ -664,7 +725,14 @@ void ced_extensions_tick(CedExtensions *m) {
 
 void ced_extensions_workspace(CedExtensions *m, const char *workspace) {
     if (!m) return;
-    for (size_t n = 0; n < m->count; n++) { ced_extensions_stop(&m->instances[n], "workspaceChanged"); m->instances[n].grant_count = 0; }
+    for (size_t n = 0; n < m->count; n++) {
+        CedExtensionInstance *i = &m->instances[n];
+        i->grant_count = 0;
+        if (i->process && i->state == EXT_ACTIVE && i->retain_on_workspace_change)
+            i->rebind_workspace = true;
+        else
+            ced_extensions_stop(i, "workspaceChanged");
+    }
     ++m->generation; m->trusted = false; m->reload = true;
     *m->reveal_tab = 0;
     snprintf(m->workspace, sizeof m->workspace, "%s", workspace);

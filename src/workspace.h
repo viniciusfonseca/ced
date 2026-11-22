@@ -74,7 +74,7 @@ bool ced_document_open(CedDocument *doc, const char *path, char *error);
 bool ced_document_save(CedDocument *doc, const char *path, bool force, char *error);
 bool ced_document_dirty(const CedDocument *doc);
 void ced_document_free(CedDocument *doc);
-bool ced_search_start(CedSearch *search, const CedWorkspace *ws, const char *query);
+bool ced_search_start(CedSearch *search, const CedWorkspace *ws, const char *query, bool include_ignored);
 bool ced_search_done(CedSearch *search);
 void ced_search_finish(CedSearch *search);
 void ced_search_cancel(CedSearch *search);

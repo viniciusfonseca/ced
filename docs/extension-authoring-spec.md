@@ -301,7 +301,7 @@ The extension transitions through `waiting-for-initialize → initialized → ac
 
 ```typescript
 type InitializeParams = {
-  host: { name: "CED"; version: Version; tabProtocol?: 1; tabWidgets?: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 };
+  host: { name: "CED"; version: Version; tabProtocol?: 1; tabWidgets?: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10; workspaceChanges?: true };
   extension: { id: string; version: Version };
   apiVersions: string[]; // exact values, initially ["1.0"]
   context: Context; // establishes context; no prior-context check
@@ -314,6 +314,7 @@ type InitializeResult = {
   extension: { id: string; version: Version };
   apiVersion: string;
   requiredHostMethods: string[];
+  retainOnWorkspaceChange?: true;
 };
 ```
 

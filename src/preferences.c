@@ -56,9 +56,13 @@ static bool valid_tree(const cJSON *value) {
 static bool text_field(const cJSON *root, const char *key, char *out, size_t capacity, char *error) {
     const cJSON *value=cJSON_GetObjectItemCaseSensitive(root,key);
     if (!value) return true;
-    if (!cJSON_IsString(value) || strlen(value->valuestring)>=capacity) return failure(error,"Invalid editor font preference.");
+    if (!cJSON_IsString(value) || strlen(value->valuestring)>=capacity) {
+        snprintf(error,CED_ERROR,"%s must be a string shorter than %zu bytes.",key,capacity); return false;
+    }
     for (const unsigned char *p=(const unsigned char *)value->valuestring;*p;p++)
-        if (*p<32 || *p==127) return failure(error,"Font preferences cannot contain control characters.");
+        if (*p<32 || *p==127) {
+            snprintf(error,CED_ERROR,"%s cannot contain control characters.",key); return false;
+        }
     snprintf(out,capacity,"%s",value->valuestring); return true;
 }
 
@@ -117,8 +121,14 @@ static cJSON *parse(const char *text, size_t length, CedPreferences *settings, c
         failure(error,"terminal.position must be \"bottom\" or \"right\"."); goto failed;
     }
     if (position) next.terminal_right=!strcmp(position->valuestring,"right");
+    const cJSON *visible=cJSON_GetObjectItemCaseSensitive(root,"terminal.visible");
+    if (visible && !cJSON_IsBool(visible)) {
+        failure(error,"terminal.visible must be true or false."); goto failed;
+    }
+    next.terminal_visible=cJSON_IsTrue(visible);
     if (!text_field(root,"editor.fontFamily",next.font_family,sizeof next.font_family,error) ||
-        !text_field(root,"editor.fontPath",next.font_path,sizeof next.font_path,error)) goto failed;
+        !text_field(root,"editor.fontPath",next.font_path,sizeof next.font_path,error) ||
+        !text_field(root,"terminal.tab",next.terminal_tab,sizeof next.terminal_tab,error)) goto failed;
     bool absolute_font = *next.font_path=='/';
 #ifdef _WIN32
     absolute_font |= strlen(next.font_path)>2 && isalpha((unsigned char)next.font_path[0]) && next.font_path[1]==':' &&
@@ -146,7 +156,10 @@ static cJSON *load(CedPreferences *settings, char *error) {
         legacy_load(directory,settings); cJSON *root=cJSON_CreateObject();
         if (!root || !cJSON_AddNumberToObject(root,"editor.fontSize",settings->font_size) ||
             !cJSON_AddStringToObject(root,"editor.fontFamily",settings->font_family) || !cJSON_AddStringToObject(root,"editor.fontPath","") ||
-            !cJSON_AddStringToObject(root,"terminal.position",settings->terminal_right ? "right" : "bottom")) { cJSON_Delete(root); failure(error,"Out of memory."); return NULL; }
+            !cJSON_AddStringToObject(root,"terminal.position",settings->terminal_right ? "right" : "bottom") ||
+            !cJSON_AddBoolToObject(root,"terminal.visible",false) || !cJSON_AddStringToObject(root,"terminal.tab","")) {
+            cJSON_Delete(root); failure(error,"Out of memory."); return NULL;
+        }
         return root;
     }
     struct stat st;
@@ -195,16 +208,28 @@ bool ced_preferences_ensure(char *path, char *error) {
 int ced_font_size_load(void) { CedPreferences settings; char error[CED_ERROR]; ced_preferences_load(&settings,error); return settings.font_size; }
 bool ced_terminal_right_load(void) { CedPreferences settings; char error[CED_ERROR]; ced_preferences_load(&settings,error); return settings.terminal_right; }
 
+static bool replace_setting(cJSON *root, const char *key, cJSON *value) {
+    if (root && value) {
+        cJSON_DeleteItemFromObjectCaseSensitive(root,key);
+        if (cJSON_AddItemToObject(root,key,value)) return true;
+    }
+    cJSON_Delete(value); return false;
+}
+
 static bool update(const char *key, cJSON *value) {
     CedPreferences settings; char error[CED_ERROR]; cJSON *root=load(&settings,error);
-    if (!root || !value) { cJSON_Delete(root); cJSON_Delete(value); return false; }
-    cJSON_DeleteItemFromObjectCaseSensitive(root,key);
-    if (!cJSON_AddItemToObject(root,key,value)) { cJSON_Delete(root); cJSON_Delete(value); return false; }
-    bool ok=save(root,error); cJSON_Delete(root); return ok;
+    bool ok=replace_setting(root,key,value) && save(root,error);
+    cJSON_Delete(root); return ok;
 }
 
 bool ced_font_size_save(int size) { return size>=CED_FONT_SIZE_MIN && size<=CED_FONT_SIZE_MAX && update("editor.fontSize",cJSON_CreateNumber(size)); }
 bool ced_terminal_right_save(bool right) { return update("terminal.position",cJSON_CreateString(right ? "right" : "bottom")); }
+bool ced_terminal_state_save(bool visible, const char *tab) {
+    CedPreferences settings; char error[CED_ERROR]; cJSON *root=load(&settings,error);
+    bool ok=replace_setting(root,"terminal.visible",cJSON_CreateBool(visible)) &&
+        replace_setting(root,"terminal.tab",cJSON_CreateString(tab)) && save(root,error);
+    cJSON_Delete(root); return ok;
+}
 
 static const char recent_key[] = "workspace.recentFolders";
 

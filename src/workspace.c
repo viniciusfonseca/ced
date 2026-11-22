@@ -64,12 +64,7 @@ const char *ced_language(const char *path) {
 }
 
 static bool excluded(const char *name) {
-    static const char *names[] = {".git", "node_modules", "build", "dist", "target",
-                                  ".venv", "venv", "__pycache__", ".DS_Store"};
-    if (!strcmp(name, ".") || !strcmp(name, "..")) return true;
-    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
-        if (!strcmp(name, names[i])) return true;
-    return false;
+    return !strcmp(name, ".") || !strcmp(name, "..") || !strcmp(name, ".git");
 }
 
 typedef struct { char *name; bool dir; } DirectoryItem;
@@ -395,7 +390,6 @@ static void *search_worker(void *user) {
         pthread_mutex_unlock(&s->mutex);
         if (stop) break;
         CedEntry *entry = &s->snapshot.entries[i];
-        if (entry->directory) continue;
         char path[CED_PATH], error[CED_ERROR], *text = NULL;
         if (!ced_join(path, sizeof path, s->snapshot.root, entry->path) || !read_text(path, &text, NULL, error)) continue;
         const char *line_start = text;
@@ -431,7 +425,7 @@ static void *search_worker(void *user) {
     return NULL;
 }
 
-bool ced_search_start(CedSearch *s, const CedWorkspace *ws, const char *query) {
+bool ced_search_start(CedSearch *s, const CedWorkspace *ws, const char *query, bool include_ignored) {
     ced_search_cancel(s);
     s->count = 0;
     s->truncated = false;
@@ -443,10 +437,11 @@ bool ced_search_start(CedSearch *s, const CedWorkspace *ws, const char *query) {
     s->snapshot.entries = calloc((size_t)ws->count + 1, sizeof(CedEntry));
     if (!s->snapshot.entries) return false;
     for (int i = 0; i < ws->count; i++) {
-        s->snapshot.entries[i] = ws->entries[i];
-        s->snapshot.entries[i].path = strdup(ws->entries[i].path);
-        if (!s->snapshot.entries[i].path) { ced_workspace_free(&s->snapshot); return false; }
-        s->snapshot.count++;
+        const CedEntry *entry = &ws->entries[i];
+        if (entry->directory || (!include_ignored && entry->ignored)) continue;
+        char *path = strdup(entry->path);
+        if (!path) { ced_workspace_free(&s->snapshot); return false; }
+        s->snapshot.entries[s->snapshot.count++] = (CedEntry){.path = path};
     }
     if (pthread_create(&s->thread, NULL, search_worker, s)) {
         ced_workspace_free(&s->snapshot);

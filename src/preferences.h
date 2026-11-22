@@ -9,6 +9,7 @@
 #define CED_FONT_SIZE_MAX 32
 #define CED_PREFERENCES_LIMIT (64 * 1024)
 #define CED_RECENT_FOLDERS_LIMIT 10
+#define CED_TERMINAL_TAB_CAPACITY 257
 
 typedef struct {
     size_t count;
@@ -17,7 +18,8 @@ typedef struct {
 
 typedef struct {
     int font_size;
-    bool terminal_right;
+    bool terminal_right, terminal_visible;
+    char terminal_tab[CED_TERMINAL_TAB_CAPACITY];
     char font_family[256], font_path[CED_PATH];
 } CedPreferences;
 
@@ -33,5 +35,6 @@ int ced_font_size_load(void);
 bool ced_font_size_save(int size);
 bool ced_terminal_right_load(void);
 bool ced_terminal_right_save(bool right);
+bool ced_terminal_state_save(bool visible, const char *tab);
 
 #endif
