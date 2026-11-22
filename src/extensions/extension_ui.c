@@ -128,7 +128,7 @@ static void tab_groups(cui_ctx *ui, CedExtensionInstance *instance, size_t index
         cui_push_id(ui, create);
         cui_column(ui, .width = CUI_FILL, .gap = 0, .pad_y = 4) {
             cui_text(ui, ced_ext_json_string(group, "label"), .width = CUI_FILL, .size = 12,
-                .color = CUI_COLOR_TEXT_SECONDARY);
+                .color = CUI_COLOR_TEXT_SECONDARY, .nowrap = true);
             cJSON_ArrayForEach(item, cJSON_GetObjectItemCaseSensitive(group, "items")) {
                 const char *id = ced_ext_json_string(item, "id");
                 cui_push_id(ui, id);
@@ -237,6 +237,12 @@ static void tab_chat(cui_ctx *ui, const cJSON *chat, const char *text, bool anim
         cui_chat_message(ui, body, .mine = mine, .author = author,
             .grouped = previous_role && !strcmp(role, previous_role),
             .last_in_group = !next_role || strcmp(role, next_role), .markdown = !mine);
+        // CUI can wrap inside long words, but its default minimum width uses the longest word.
+        for (int n = row + 1; n < ui->node_count; n++) {
+            cui_node *node = &ui->nodes[n];
+            if ((node->flags & (CUI_NF_TEXT | CUI_NF_WRAP)) == (CUI_NF_TEXT | CUI_NF_WRAP))
+                node->flags |= CUI_NF_ADAPTIVE;
+        }
         if (id) {
             // The CUI bubble otherwise fades back in for each newly revealed prefix.
             ui->nodes[row].opacity = 1;

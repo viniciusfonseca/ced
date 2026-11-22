@@ -43,6 +43,68 @@ static void append_chat_message(cJSON *messages, const char *role, const char *t
     assert(cJSON_AddItemToArray(messages, item));
 }
 
+static void draw_narrow_chat(cui_ctx *ui, CedExtensions *m) {
+    float ratio = .95f;
+    for (int n = 0; n < 6; n++) {
+        cui_begin_frame(ui, .1f);
+        cui_split(ui, "chat-split", &ratio, .min_first = 220, .min_second = 260, .height = CUI_FILL) {
+            cui_text(ui, "Editor");
+            cui_split_next(ui);
+            ced_extension_tab_body(ui, m, "example.uppercase-selection.term");
+        }
+        cui_end_frame(ui);
+    }
+}
+
+static void test_chat_long_word(cui_sw_renderer *sw, CedExtensions *m) {
+    cui_ctx *ui = cui_create(&(cui_ctx_desc){.renderer = cui_sw_iface(sw), .theme = CUI_THEME_DARK});
+    assert(ui);
+    cui_set_viewport(ui, 1000, 800, 1);
+    CedExtensionTabState *tab = &m->instances[0].tabs[1];
+    CedExtensionTabState previous = *tab;
+    *tab = (CedExtensionTabState){.requested = true,
+        .model = cJSON_Parse("{\"heading\":\"\",\"text\":\"\",\"actions\":[],"
+            "\"chat\":{\"author\":\"Codex\",\"messages\":[]}}")};
+    assert(tab->model);
+    cJSON *messages = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(tab->model, "chat"), "messages");
+    append_chat_message(messages, "agent", "Short reply.");
+    cui_push_id(ui, "example.uppercase-selection.term");
+    cui_id chat_id = cui_make_id(ui, "chat");
+    const cui_scroll_state *scroll = cui_state(ui, chat_id, sizeof *scroll);
+    cui_pop_id(ui);
+
+    draw_narrow_chat(ui, m);
+    float width = cui_get_rect(ui, chat_id).w;
+    float short_height = scroll->content_h;
+    assert(width > 0 && width <= 260);
+
+    char word[241];
+    memset(word, 'x', sizeof word - 1);
+    word[sizeof word - 1] = 0;
+    cJSON *reply = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(messages, 0), "text");
+    assert(cJSON_SetValuestring(reply, word));
+    draw_narrow_chat(ui, m);
+    assert(cui_get_rect(ui, chat_id).w == width && scroll->content_h > short_height + 20);
+
+    append_chat_message(messages, "user", word);
+    draw_narrow_chat(ui, m);
+    assert(cui_get_rect(ui, chat_id).w == width);
+    bool wrapped = false;
+    for (int n = 0; n < ui->node_count; n++) {
+        const cui_node *node = &ui->nodes[n];
+        if (!(node->flags & CUI_NF_TEXT) || node->text_len != sizeof word - 1 ||
+                memcmp(node->text, word, sizeof word - 1)) continue;
+        assert(node->rect.w <= width && node->text_lines > 1);
+        for (int line = 0; line < node->text_lines; line++)
+            assert(node->lines[line].width <= node->rect.w + 1);
+        wrapped = true;
+    }
+    assert(wrapped);
+    cJSON_Delete(tab->model);
+    *tab = previous;
+    cui_destroy(ui);
+}
+
 static void test_chat_typewriter(cui_ctx *ui, cui_sw_renderer *sw, CedExtensions *m, const char *directory) {
     CedExtensionTabState *tab = &m->instances[0].tabs[1];
     cJSON *messages = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(tab->model, "chat"), "messages");
@@ -195,6 +257,10 @@ int main(int argc,char **argv) {
     }
     assert(ced_extension_tab_find(m, "example.uppercase-selection.side", NULL, NULL));
     assert(ced_extension_tab_find(m, "example.uppercase-selection.term", NULL, NULL));
+    cJSON *groups = cJSON_GetObjectItemCaseSensitive(instance->tabs[0].model, "groups");
+    const char *long_directory = "~/projects/clients/editor/release/features/auxiliary-panel/session-directory";
+    cJSON *directory_label = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(groups, 0), "label");
+    assert(cJSON_SetValuestring(directory_label, long_directory));
     render(ui,sw,m,argv[2],"extension-tabs.png");
     cui_push_id(ui, "example.uppercase-selection.side");
     cui_rect contents = cui_get_rect(ui, cui_make_id(ui, "contents"));
@@ -213,10 +279,17 @@ int main(int argc,char **argv) {
     assert(first.x == contents.x && first.w > 0 && remove.w > 0);
     assert(first.x + first.w == remove.x && remove.x + remove.w == contents.x + contents.w);
     assert(first.y + first.h == second.y && second.y + second.h == create.y && create.w == contents.w);
+    bool saw_directory = false;
     for (int n = 0; n < ui->node_count; n++) {
-        if (ui->nodes[n].id == first_id) assert(ui->nodes[n].radius.tl == 0 && ui->nodes[n].radius.br == 0);
+        const cui_node *node = &ui->nodes[n];
+        if (node->id == first_id) assert(node->radius.tl == 0 && node->radius.br == 0);
+        if (!(node->flags & CUI_NF_TEXT) || node->text_len != (int)strlen(long_directory) ||
+                memcmp(node->text, long_directory, strlen(long_directory))) continue;
+        assert(node->pref_w > contents.w && node->minc_w < contents.w);
+        assert(node->rect.w == contents.w && !(node->flags & CUI_NF_WRAP));
+        saw_directory = true;
     }
-    cJSON *groups = cJSON_GetObjectItemCaseSensitive(instance->tabs[0].model, "groups");
+    assert(saw_directory);
     cJSON *rows = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(groups, 0), "items");
     assert(cJSON_AddBoolToObject(cJSON_GetArrayItem(rows, 0), "busy", true));
     render(ui,sw,m,argv[2],"extension-tabs-busy.png");
@@ -360,6 +433,7 @@ int main(int argc,char **argv) {
     draw_frame(ui, m);
     cui_input_key(ui, CUI_KEY_ESCAPE, false, 0);
     for (int n = 0; n < 8; n++) draw_frame(ui, m);
+    test_chat_long_word(sw, m);
     test_chat_typewriter(ui, sw, m, argv[2]);
     test_chat_controls(ui, sw, m, argv[2]);
     draw_frame(ui, m);
