@@ -68,6 +68,7 @@ bool ced_join(char *out, size_t cap, const char *root, const char *relative);
 const char *ced_basename(const char *path);
 const char *ced_language(const char *path);
 bool ced_markdown_file(const char *path);
+bool ced_workspace_resolve(const char *path, char root[CED_PATH], char *error);
 bool ced_workspace_open(CedWorkspace *ws, const char *path, char *error);
 int ced_workspace_compact_directory(const CedWorkspace *ws, int index);
 void ced_workspace_free(CedWorkspace *ws);

@@ -8,10 +8,13 @@ typedef struct { cui_edit_state edit; double sy; float sx; int preferred_column;
 
 bool ced_tree_begin(cui_ctx *ui, const char *label, bool *open, const cui_tree_opts *options, bool ignored) {
     int row = ui->node_count;
+    int depth = ui->tree_depth;
     bool expanded = cui_tree_begin(ui, label, open, options);
     /* The pinned CUI creates the row first and fixes its height at 30 px.
      * Adjust its layout so drawing and hit testing both use the compact height. */
-    ui->nodes[row].h = CUI_PX(24);
+    ui->nodes[row].h = CUI_PX(CED_COMPACT_ROW_HEIGHT);
+    ui->nodes[row].pad[3] = 6 + 16.0f * depth;
+    ui->nodes[row].pad[1] = 0;
     ui->nodes[row].radius = CUI_CORNERS(0);
     ui->nodes[row].opacity = ignored ? 0.5f : 1.0f;
     return expanded;
@@ -46,6 +49,15 @@ bool ced_nav_item_ex(cui_ctx *ui, const char *label, const cui_nav_opts *opts) {
         node->paint_data = color;
         node->paint = paint_square_nav_highlight;
     }
+    return clicked;
+}
+
+bool ced_compact_nav_item_ex(cui_ctx *ui, const char *label, const cui_nav_opts *opts) {
+    int row = ui->node_count;
+    bool clicked = ced_nav_item_ex(ui, label, opts);
+    ui->nodes[row].h = CUI_PX(CED_COMPACT_ROW_HEIGHT);
+    ui->nodes[row].pad[3] = 6;
+    ui->nodes[row].pad[1] = 0;
     return clicked;
 }
 
@@ -157,7 +169,14 @@ cui_code_editor_result ced_editor_render(cui_ctx *ui, const char *id, CedDocumen
     cui_code_editor_opts opts = *options;
     /* Refuse edits if their revision cannot be tracked; navigation still works. */
     opts.read_only |= (input && !before) || doc->version >= CED_REVISION_MAX;
+    int outer = ui->node_count;
     cui_code_editor_result result = cui_code_editor_ex(ui, id, doc->text, CED_TEXT_CAP, &opts);
+    /* CUI draws the tinted border and the keyboard focus ring on the outer box. */
+    cui_node *frame = &ui->nodes[outer];
+    frame->border_color = CUI_C(ui, BORDER);
+    frame->paint = NULL;
+    frame->paint_data = NULL;
+    frame->flags &= ~CUI_NF_PAINT_AFTER;
     if (result.changed && before && !strcmp(before, doc->text)) result.changed = false;
     if (result.changed) ced_document_note_change(doc);
     free(before);

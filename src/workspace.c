@@ -240,11 +240,16 @@ static void mark_ignored(CedWorkspace *ws) {
     free(entries);
 }
 
+bool ced_workspace_resolve(const char *path, char root[CED_PATH], char *error) {
+    struct stat st;
+    if (!realpath(path, root) || stat(root, &st) || !S_ISDIR(st.st_mode))
+        return fail(error, "Could not open folder: %s", path);
+    return true;
+}
+
 bool ced_workspace_open(CedWorkspace *ws, const char *path, char *error) {
     CedWorkspace next = {0};
-    struct stat st;
-    if (!realpath(path, next.root) || stat(next.root, &st) || !S_ISDIR(st.st_mode))
-        return fail(error, "Could not open folder: %s", path);
+    if (!ced_workspace_resolve(path, next.root, error)) return false;
     size_t capacity = 0;
     if (!scan(&next, "", -1, 0, &capacity)) {
         ced_workspace_free(&next);

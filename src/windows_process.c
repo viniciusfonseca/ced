@@ -30,6 +30,23 @@ static wchar_t *command_line(const char *const args[]) {
     wchar_t *wide = ced_windows_wide(line); free(line); return wide;
 }
 
+bool ced_windows_relaunch(const char *const args[]) {
+    wchar_t executable[32768];
+    DWORD length = GetModuleFileNameW(NULL, executable, sizeof executable / sizeof *executable);
+    if (!length || length >= sizeof executable / sizeof *executable) return false;
+    wchar_t *line = command_line(args);
+    if (!line) return false;
+    STARTUPINFOW startup = {.cb = sizeof startup};
+    PROCESS_INFORMATION child = {0};
+    bool started = CreateProcessW(executable, line, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &child);
+    free(line);
+    if (started) {
+        CloseHandle(child.hThread);
+        CloseHandle(child.hProcess);
+    }
+    return started;
+}
+
 /* Parent ends support overlapped I/O; child/ConPTY ends remain synchronous. */
 static bool pipe_pair(HANDLE *parent, HANDLE *child, bool writing) {
     static LONG serial;

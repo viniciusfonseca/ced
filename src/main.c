@@ -25,9 +25,20 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include "windows_process.h"
+#else
+#include <spawn.h>
+extern char **environ;
+#endif
 
 #define MAX_DOCS 32
 #define CED_OUTPUT_TAB "ced.output"
+
+#ifdef _WIN32
+bool ced_windows_titlebar(cui_app *app, cui_id drag_region);
+void ced_windows_titlebar_buttons(cui_ctx *ui, cui_app *app);
+#endif
 
 #ifdef __APPLE__
 void ced_macos_set_icon(void);
@@ -63,6 +74,23 @@ typedef struct {
 } GitSync;
 
 typedef struct {
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    bool requested, running, done, ok;
+    char root[CED_PATH], error[CED_ERROR];
+    CedGit result;
+} GitStatus;
+
+typedef struct {
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    bool running, done, ok, initial, superseded;
+    char path[CED_PATH], error[CED_ERROR];
+    CedWorkspace workspace;
+    CedGit git;
+} WorkspaceLoad;
+
+typedef struct {
     bool open, execute;
     char root[CED_PATH], path[CED_PATH], error[CED_ERROR];
 } GitDiscard;
@@ -80,8 +108,12 @@ typedef struct {
 
 typedef struct {
     CedWorkspace workspace;
+    const char *executable;
+    bool disable_extensions, reloading;
+    WorkspaceLoad workspace_load;
     CedGit git;
     GitSync git_sync;
+    GitStatus git_status;
     GitDiscard git_discard;
     CedSearch search;
     EditorTab docs[MAX_DOCS];
@@ -176,16 +208,52 @@ static void notify(Editor *e, const char *message) {
 }
 
 static void refresh_git(Editor *e) {
-    char error[CED_ERROR];
-    if (!ced_git_refresh(&e->git, e->workspace.root, error)) {
-        if (e->git.available) notify(e, error);
+    e->git_status.requested = true;
+    cui_request_wakeup(cui_app_ui(e->app), 0);
+}
+
+static void *git_status_worker(void *user) {
+    GitStatus *job = user;
+    job->ok = ced_git_refresh(&job->result, job->root, job->error);
+    pthread_mutex_lock(&job->mutex);
+    job->done = true;
+    pthread_mutex_unlock(&job->mutex);
+    return NULL;
+}
+
+static void poll_git_status(cui_ctx *ui, Editor *e) {
+    GitStatus *job = &e->git_status;
+    if (job->running) {
+        pthread_mutex_lock(&job->mutex);
+        bool done = job->done;
+        pthread_mutex_unlock(&job->mutex);
+        if (!done) { cui_request_wakeup(ui, 0.05f); return; }
+        pthread_join(job->thread, NULL);
+        job->running = false;
+        if (!job->requested && !strcmp(job->root, e->workspace.root)) {
+            if (!job->ok && e->git.available) notify(e, job->error);
+            ced_git_free(&e->git);
+            e->git = job->result;
+            job->result = (CedGit){0};
+        }
+        ced_git_free(&job->result);
     }
+    if (!job->requested || e->git_sync.running || e->workspace_load.running) return;
+    job->requested = job->done = false;
+    snprintf(job->root, sizeof job->root, "%s", e->workspace.root);
+    if (pthread_create(&job->thread, NULL, git_status_worker, job)) {
+        notify(e, "Could not start loading Git status.");
+        return;
+    }
+    job->running = true;
+    cui_request_wakeup(ui, 0.05f);
 }
 
 static void refresh(Editor *e) {
     char root[CED_PATH], error[CED_ERROR];
     snprintf(root, sizeof root, "%s", e->workspace.root);
     if (!ced_workspace_open(&e->workspace, root, error)) notify(e, error);
+    else if (e->workspace_load.running && e->workspace_load.initial) e->workspace_load.superseded = true;
     refresh_git(e);
 }
 
@@ -472,10 +540,10 @@ static void recovery_path(Editor *e) {
 }
 
 static bool write_recovery(Editor *e) {
-    if (!e->recovery[0]) return false;
     bool dirty = false;
     for (int i = 0; i < e->count; i++) dirty |= ced_document_dirty(&e->docs[i].file);
-    if (!dirty) { unlink(e->recovery); return true; }
+    if (!dirty) { if (*e->recovery) unlink(e->recovery); return true; }
+    if (!e->recovery[0]) return false;
     char temp[CED_PATH];
     int n = snprintf(temp, sizeof temp, "%s.XXXXXX", e->recovery);
     if (n < 0 || (size_t)n >= sizeof temp) return false;
@@ -496,6 +564,44 @@ static bool write_recovery(Editor *e) {
     if (ok && rename(temp, e->recovery)) ok = false;
     if (!ok) unlink(temp);
     return ok;
+}
+
+static bool reload_editor(Editor *e, char *error) {
+    if (e->reloading) return true;
+    if (e->git_sync.running) {
+        snprintf(error, CED_ERROR, "Wait for the Git operation to finish before reloading.");
+        return false;
+    }
+    char root[CED_PATH];
+    if (!ced_workspace_resolve(e->workspace.root, root, error)) return false;
+    if (!write_recovery(e)) {
+        snprintf(error, CED_ERROR, "Could not save recovery data. Save your files before reloading.");
+        return false;
+    }
+    const char *args[MAX_DOCS + 4] = {e->executable};
+    int count = 1;
+    if (e->disable_extensions) args[count++] = "--disable-extensions";
+    args[count++] = root;
+    for (int i = 0; i < e->count; i++)
+        if (i != e->selected && *e->docs[i].file.path) args[count++] = e->docs[i].file.path;
+    if (e->selected >= 0 && *e->docs[e->selected].file.path) args[count++] = e->docs[e->selected].file.path;
+    args[count] = NULL;
+#ifdef _WIN32
+    if (!ced_windows_relaunch(args)) {
+        snprintf(error, CED_ERROR, "Could not restart CED.");
+        return false;
+    }
+#else
+    pid_t child;
+    int result = posix_spawnp(&child, e->executable, NULL, NULL, (char *const *)args, environ);
+    if (result) {
+        snprintf(error, CED_ERROR, "Could not restart CED: %s", strerror(result));
+        return false;
+    }
+#endif
+    e->reloading = true;
+    cui_app_quit(e->app);
+    return true;
 }
 
 static void restore_recovery(Editor *e) {
@@ -528,38 +634,101 @@ static void restore_recovery(Editor *e) {
     if (restored) notify(e, "Recovered unsaved files.");
 }
 
+static void *workspace_load_worker(void *user) {
+    WorkspaceLoad *job = user;
+    job->ok = ced_workspace_open(&job->workspace, job->path, job->error);
+    if (job->ok) {
+        char error[CED_ERROR];
+        ced_git_refresh(&job->git, job->workspace.root, error);
+    }
+    pthread_mutex_lock(&job->mutex);
+    job->done = true;
+    pthread_mutex_unlock(&job->mutex);
+    return NULL;
+}
+
+static bool start_workspace_load(Editor *e, const char *path, bool initial) {
+    WorkspaceLoad *job = &e->workspace_load;
+    if (job->running) { notify(e, "Wait for the folder to finish loading."); return false; }
+    if (strlen(path) >= sizeof job->path) { notify(e, "Folder path is too long."); return false; }
+    snprintf(job->path, sizeof job->path, "%s", path);
+    job->done = job->superseded = false;
+    job->initial = initial;
+    if (pthread_create(&job->thread, NULL, workspace_load_worker, job)) {
+        notify(e, "Could not start loading the folder.");
+        return false;
+    }
+    job->running = true;
+    cui_request_wakeup(cui_app_ui(e->app), 0);
+    return true;
+}
+
 static bool open_folder(Editor *e, const char *path) {
     if (e->git_sync.running) { notify(e, "Wait for the Git operation to finish."); return false; }
-    if (!strcmp(path, e->workspace.root)) return true;
-    if (!write_recovery(e)) { notify(e, "Recovery failed. Save your files before switching folders."); return false; }
-    CedWorkspace next = {0};
-    char error[CED_ERROR];
-    if (!ced_workspace_open(&next, path, error)) { notify(e, error); return false; }
+    return !strcmp(path, e->workspace.root) || start_workspace_load(e, path, false);
+}
+
+static void poll_workspace_load(cui_ctx *ui, Editor *e) {
+    WorkspaceLoad *job = &e->workspace_load;
+    if (!job->running) return;
+    pthread_mutex_lock(&job->mutex);
+    bool done = job->done;
+    pthread_mutex_unlock(&job->mutex);
+    if (!done || e->git_sync.running || (!job->initial && (e->file_action.open || e->git_discard.open ||
+            e->close_dialog || e->commit_dialog || extension_modal(e)))) {
+        cui_request_wakeup(ui, 0.05f);
+        return;
+    }
+    pthread_join(job->thread, NULL);
+    job->running = false;
+    if (!job->ok) {
+        notify(e, job->error);
+        return;
+    }
+    if (job->superseded || (!job->initial && !strcmp(e->workspace.root, job->workspace.root))) goto discard;
+    if (!job->initial) {
+        if (!write_recovery(e)) {
+            notify(e, "Recovery failed. Save your files before switching folders.");
+            goto discard;
+        }
 #ifdef CED_ENABLE_EXTENSIONS
-    ced_extensions_workspace(e->extensions, next.root);
-    if (!ced_extension_tab_find(e->extensions, e->sidebar_tab, NULL, NULL)) *e->sidebar_tab = 0;
+        ced_extensions_workspace(e->extensions, job->workspace.root);
+        if (!ced_extension_tab_find(e->extensions, e->sidebar_tab, NULL, NULL)) *e->sidebar_tab = 0;
 #endif
-    reset_languages(e);
-    ced_assist_reset(&e->assist);
-    ced_terminal_stop(e->terminal); e->terminal = NULL;
-    e->terminal_view = (CedTerminalView){.autofocus = true};
-    ced_search_cancel(&e->search);
-    while (e->count) remove_tab(e, e->count - 1);
+        reset_languages(e);
+        ced_assist_reset(&e->assist);
+        ced_terminal_stop(e->terminal); e->terminal = NULL;
+        e->terminal_view = (CedTerminalView){.autofocus = true};
+        ced_search_cancel(&e->search);
+        while (e->count) remove_tab(e, e->count - 1);
+        e->diff = false;
+        e->query[0] = 0;
+        e->search.count = 0;
+    }
     ced_workspace_free(&e->workspace);
-    e->workspace = next;
-    e->diff = false;
-    e->query[0] = 0;
-    e->search.count = 0;
-    refresh_git(e);
+    e->workspace = job->workspace;
+    job->workspace = (CedWorkspace){0};
+    ced_git_free(&e->git);
+    e->git = job->git;
+    job->git = (CedGit){0};
+    if (e->git_status.running) e->git_status.requested = true;
+    if (job->initial) {
+        if (e->query[0]) ced_search_start(&e->search, &e->workspace, e->query, e->search_include_ignored);
+        return;
+    }
     recovery_path(e);
     restore_recovery(e);
     if (!e->count) notify(e, "Folder opened.");
     if (!ced_recent_folder_record(e->workspace.root)) notify(e, "Could not save recent folders.");
-    return true;
+    return;
+discard:
+    ced_workspace_free(&job->workspace);
+    ced_git_free(&job->git);
 }
 
 static void choose_folder(Editor *e) {
     if (e->git_sync.running) { notify(e, "Wait for the Git operation to finish."); return; }
+    if (e->workspace_load.running) { notify(e, "Wait for the folder to finish loading."); return; }
     char path[CED_PATH];
     if (cui_app_file_dialog(e->app, &(cui_file_dialog_opts){.kind = CUI_FILE_FOLDER, .title = "Open Folder"}, path, sizeof path))
         open_folder(e, path);
@@ -595,11 +764,13 @@ static void open_folder_menu(cui_ctx *ui, Editor *e) {
                 label = abbreviated;
             }
             cui_push_id_int(ui, (int)i);
-            if (ced_menu_item(ui, label, .icon = CUI_ICON_FOLDER, .disabled = e->git_sync.running)) recent = path;
+            if (ced_menu_item(ui, label, .icon = CUI_ICON_FOLDER,
+                    .disabled = e->git_sync.running || e->workspace_load.running)) recent = path;
             cui_pop_id(ui);
         }
         if (e->recent_folders.count) cui_menu_separator(ui);
-        bool browse = ced_menu_item(ui, "Open Folder…", .icon = CUI_ICON_FOLDER_OPEN, .disabled = e->git_sync.running);
+        bool browse = ced_menu_item(ui, "Open Folder…", .icon = CUI_ICON_FOLDER_OPEN,
+            .disabled = e->git_sync.running || e->workspace_load.running);
         cui_menu_end(ui);
         if (recent) open_folder(e, recent);
         else if (browse) dispatch(e, "ced.workspace.open");
@@ -927,26 +1098,30 @@ static void open_diff(Editor *e, CedChange *change, bool staged) {
 }
 
 static void git_panel(cui_ctx *ui, Editor *e) {
+    bool loading = e->git_status.requested || e->git_status.running;
     if (!e->git.available) {
-        cui_empty_state(ui, "No Git repository", .icon = CUI_ICON_GIT_BRANCH);
+        if (!loading && !e->workspace_load.running)
+            cui_empty_state(ui, "No Git repository", .icon = CUI_ICON_GIT_BRANCH);
         return;
     }
-    cui_push_disabled(ui, e->git_sync.running);
-    cui_text(ui, e->git.branch, .font = CUI_FONT_MEDIUM);
-    cui_input(ui, "commit-message", e->commit, sizeof e->commit, .placeholder = "Commit message");
+    cui_push_disabled(ui, loading || e->git_sync.running);
     bool staged_any = false, unstaged_any = false;
     for (int i = 0; i < e->git.count; i++) {
         staged_any |= e->git.changes[i].index != ' ' && e->git.changes[i].index != '?';
         unstaged_any |= e->git.changes[i].worktree != ' ';
     }
-    if (cui_button(ui, "Commit...", .icon = CUI_ICON_CHECK, .variant = CUI_BUTTON_PRIMARY,
-                   .full_width = true, .disabled = !staged_any || !e->commit[0])) e->commit_dialog = true;
-    int bulk = -1;
-    cui_row(ui, .gap = 4, .width = CUI_FILL) {
-        if (cui_button(ui, "Push", .icon = CUI_ICON_UPLOAD, .size = CUI_SIZE_SM, .full_width = true)) start_git_sync(e, false);
-        if (cui_button(ui, "Pull", .icon = CUI_ICON_DOWNLOAD, .size = CUI_SIZE_SM, .full_width = true)) start_git_sync(e, true);
+    cui_column(ui, .width = CUI_FILL, .pad = 10, .gap = 10) {
+        cui_text(ui, e->git.branch, .font = CUI_FONT_MEDIUM);
+        cui_input(ui, "commit-message", e->commit, sizeof e->commit, .placeholder = "Commit message");
+        if (cui_button(ui, "Commit...", .icon = CUI_ICON_CHECK, .variant = CUI_BUTTON_PRIMARY,
+                       .full_width = true, .disabled = !staged_any || !e->commit[0])) e->commit_dialog = true;
+        cui_row(ui, .gap = 4, .width = CUI_FILL) {
+            if (cui_button(ui, "Push", .icon = CUI_ICON_UPLOAD, .size = CUI_SIZE_SM, .full_width = true)) start_git_sync(e, false);
+            if (cui_button(ui, "Pull", .icon = CUI_ICON_DOWNLOAD, .size = CUI_SIZE_SM, .full_width = true)) start_git_sync(e, true);
+        }
     }
-    cui_scroll(ui, .id = "git-changes", .height = CUI_FILL, .gap = 2) {
+    int bulk = -1;
+    cui_scroll(ui, .id = "git-changes", .width = CUI_FILL, .height = CUI_FILL) {
         cui_theme *theme = cui_theme_get(ui);
         float radius = theme->radius_control;
         theme->radius_control = 0;
@@ -955,7 +1130,7 @@ static void git_panel(cui_ctx *ui, Editor *e) {
         for (int group = 0; group < 2 && !mutated; group++) {
             bool staged = group == 0;
             cui_push_id(ui, staged ? "staged-header" : "changes-header");
-            cui_row(ui, .width = CUI_FILL, .gap = 4, .align = CUI_ALIGN_CENTER) {
+            cui_row(ui, .width = CUI_FILL, .pad_left = 6, .gap = 4, .align = CUI_ALIGN_CENTER) {
                 cui_text(ui, staged ? "STAGED CHANGES" : "CHANGES", .size = 11,
                          .color = CUI_COLOR_TEXT_MUTED, .width = CUI_FILL);
                 if (cui_icon_button(ui, staged ? CUI_ICON_MINUS : CUI_ICON_PLUS,
@@ -974,9 +1149,11 @@ static void git_panel(cui_ctx *ui, Editor *e) {
                 char label[CED_PATH + 8];
                 snprintf(label, sizeof label, "%c  %s", status, change->path);
                 cui_push_id_int(ui, group * CED_MAX_CHANGES + i);
-                cui_row(ui, .gap = 2) {
+                float control_height = theme->control_sm;
+                theme->control_sm = CED_COMPACT_ROW_HEIGHT;
+                cui_row(ui, .width = CUI_FILL, .align = CUI_ALIGN_CENTER) {
                     cui_column(ui, .width = CUI_FILL) {
-                        if (ced_nav_item(ui, label, .selected = e->diff && e->diff_staged == staged && !strcmp(e->diff_path, change->path))) open_diff(e, change, staged);
+                        if (ced_compact_nav_item(ui, label, .selected = e->diff && e->diff_staged == staged && !strcmp(e->diff_path, change->path))) open_diff(e, change, staged);
                     }
                     if (!staged && cui_icon_button(ui, CUI_ICON_TRASH_2, .size = CUI_SIZE_SM,
                             .variant = CUI_BUTTON_GHOST, .tooltip = "Discard Changes")) {
@@ -993,6 +1170,7 @@ static void git_panel(cui_ctx *ui, Editor *e) {
                         mutated = true;
                     }
                 }
+                theme->control_sm = control_height;
                 cui_pop_id(ui);
                 if (mutated) break;
             }
@@ -1049,7 +1227,12 @@ static void sidebar(cui_ctx *ui, Editor *e) {
             }
         }
         if (old != e->panel && e->panel == 2) refresh_git(e);
-        cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 10, .gap = 10) {
+        bool flush_panel = e->panel == 0 || e->panel == 2;
+#ifdef CED_ENABLE_EXTENSIONS
+        flush_panel = flush_panel && !*e->sidebar_tab;
+#endif
+        float inset = flush_panel ? 0 : 10;
+        cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = inset, .gap = inset) {
 #ifdef CED_ENABLE_EXTENSIONS
             if (*e->sidebar_tab) {
                 ced_extension_tab_body(ui, e->extensions, e->sidebar_tab);
@@ -1058,7 +1241,7 @@ static void sidebar(cui_ctx *ui, Editor *e) {
             } else
 #endif
             {
-                cui_row(ui, .gap = 4) {
+                cui_row(ui, .gap = 4, .pad_x = e->panel == 2 ? 10 : 0, .pad_top = e->panel == 2 ? 10 : 0) {
                     cui_column(ui, .width = CUI_FILL) {
                         ced_nav_item(ui, ced_basename(e->workspace.root), .icon = CUI_ICON_FOLDER);
                         file_context_menu(ui, e, e->workspace.root, true, true);
@@ -1070,9 +1253,9 @@ static void sidebar(cui_ctx *ui, Editor *e) {
                     }
                 }
                 if (e->panel == 0) {
-                    cui_scroll(ui, .id = "files", .height = CUI_FILL) {
+                    cui_scroll(ui, .id = "files", .width = CUI_FILL, .height = CUI_FILL) {
                         for (int i = 0; i < e->workspace.count;) i = tree_node(ui, e, i);
-                        if (!e->workspace.count) cui_secondary(ui, "Empty folder.");
+                        if (!e->workspace.count && !e->workspace_load.running) cui_secondary(ui, "Empty folder.");
                     }
                     if (e->workspace.truncated) cui_secondary(ui, "Partial listing: limit reached or access denied.");
                 } else if (e->panel == 1) search_panel(ui, e);
@@ -1176,8 +1359,13 @@ static void editor_pane(cui_ctx *ui, Editor *e) {
             if (accepted >= 0) apply_completion(ui, e, accepted);
             if (ced_markdown_file(tab->file.path)) {
                 cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_END) {
-                    if (cui_button(ui, tab->markdown_preview ? "Edit" : "Preview",
-                            .icon = tab->markdown_preview ? CUI_ICON_CODE : CUI_ICON_EYE, .size = CUI_SIZE_SM)) dispatch(e,"ced.markdown.toggle");
+                    cui_theme *theme = cui_theme_get(ui);
+                    float radius = theme->radius_control;
+                    theme->radius_control = 0;
+                    bool clicked = cui_button(ui, tab->markdown_preview ? "Edit" : "Preview",
+                        .icon = tab->markdown_preview ? CUI_ICON_CODE : CUI_ICON_EYE, .size = CUI_SIZE_SM);
+                    theme->radius_control = radius;
+                    if (clicked) dispatch(e, "ced.markdown.toggle");
                 }
             }
             if (tab->markdown_preview && ced_markdown_file(tab->file.path)) {
@@ -1521,6 +1709,7 @@ static const struct { const char *id, *title, *category, *shortcut; } builtin_co
     {"ced.preferences.reload", "Reload Preferences", "Preferences", ""},
     {"ced.workspace.openRecent", "Open Recent Folder", "File", ""},
     {"ced.output.show", "Show Output", "View", ""},
+    {"ced.app.reload", "Reload CED", "View", ""},
 #ifdef CED_ENABLE_EXTENSIONS
     {"ced.language.importJvm", "Import JVM Project", "Language", ""},
 #endif
@@ -1529,6 +1718,7 @@ static const struct { const char *id, *title, *category, *shortcut; } builtin_co
 static bool builtin_execute(void *user, const char *id, const CedCommandContext *context, char *error) {
     (void)context;
     Editor *e = user; cui_ctx *ui = cui_app_ui(e->app);
+    if (!strcmp(id, "ced.app.reload")) return reload_editor(e, error);
     if (!strcmp(id,"ced.output.show")) {
         set_terminal_panel(e,true,CED_OUTPUT_TAB); return true;
     }
@@ -1626,6 +1816,8 @@ static void frame(cui_ctx *ui, Editor *e) {
      * needed by the renderer here, so filesystem actions can refresh them. */
     perform_file_action(e);
     perform_git_discard(e);
+    poll_workspace_load(ui, e);
+    poll_git_status(ui, e);
     poll_preferences(ui,e);
     for (int n = 0; n < e->count; n++) {
         cui_push_id_int(ui, e->docs[n].id); ced_editor_touch(ui, "source"); cui_pop_id(ui);
@@ -1706,13 +1898,18 @@ static void frame(cui_ctx *ui, Editor *e) {
 #ifdef __APPLE__
             if (inset > 0) cui_gap(ui, inset);
 #endif
+#ifdef _WIN32
+            cui_row(ui, .width = CUI_FIT, .pad_x = 8) {
+                cui_text(ui, "CED", .font = CUI_FONT_MEDIUM);
+            }
+#endif
             cui_toolbar_button(ui, CUI_ICON_PANEL_LEFT, .tooltip = "Toggle Sidebar", .toggle = &e->sidebar);
             open_folder_menu(ui, e);
             if (cui_toolbar_button(ui, CUI_ICON_COMMAND, .tooltip = "Command Palette", .shortcut = "Cmd/Ctrl Shift P")) {
                 ced_assist_reset(&e->assist);
                 e->palette = true;
             }
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
             cui_box(ui, .id = "titlebar-drag", .width = CUI_FILL, .height = CUI_PX(cui_theme_get(ui)->control_sm)) {}
 #else
             cui_toolbar_spacer(ui);
@@ -1723,6 +1920,9 @@ static void frame(cui_ctx *ui, Editor *e) {
                     dispatch(e, "ced.terminal.toggle");
             }
             cui_theme_toggle(ui);
+#ifdef _WIN32
+            ced_windows_titlebar_buttons(ui, e->app);
+#endif
         }
         cui_box(ui, .width = CUI_FILL, .height = CUI_FILL) {
             if (e->sidebar) {
@@ -1734,8 +1934,17 @@ static void frame(cui_ctx *ui, Editor *e) {
             } else document_area(ui, e);
         }
         cui_status_bar(ui, "status", .no_border = false) {
-            cui_status_bar_text(ui, e->git.available ? e->git.branch : "No Git", .icon = CUI_ICON_GIT_BRANCH);
-            cui_status_bar_text(ui, e->message, .tone = CUI_TONE_NEUTRAL);
+            bool loading_git = e->git_status.requested || e->git_status.running || e->git_sync.running;
+            const char *git_label = e->git.available ? e->git.branch : loading_git || e->workspace_load.running ? "Git" : "No Git";
+            cui_status_bar_text(ui, git_label, .icon = CUI_ICON_GIT_BRANCH);
+            if (e->workspace_load.running || loading_git) {
+                cui_row(ui, .width = CUI_FIT, .align = CUI_ALIGN_CENTER, .pad_x = 6, .gap = 6) {
+                    cui_spinner(ui, 12, .style = CUI_SPINNER_ARC);
+                    cui_text(ui, "Loading...", .size = 12, .color = CUI_COLOR_TEXT_SECONDARY);
+                }
+            } else {
+                cui_status_bar_text(ui, e->message, .tone = CUI_TONE_NEUTRAL);
+            }
             cui_status_bar_spacer(ui);
             if (!e->diff && e->selected >= 0) {
                 const char *path=e->docs[e->selected].file.path;
@@ -1787,6 +1996,13 @@ static void frame(cui_ctx *ui, Editor *e) {
 }
 
 static void editor_free(Editor *e) {
+    if (e->git_status.running) pthread_join(e->git_status.thread, NULL);
+    ced_git_free(&e->git_status.result);
+    pthread_mutex_destroy(&e->git_status.mutex);
+    if (e->workspace_load.running) pthread_join(e->workspace_load.thread, NULL);
+    ced_workspace_free(&e->workspace_load.workspace);
+    ced_git_free(&e->workspace_load.git);
+    pthread_mutex_destroy(&e->workspace_load.mutex);
 #ifdef CED_ENABLE_EXTENSIONS
     ced_extensions_destroy(e->extensions);
 #endif
@@ -1817,6 +2033,8 @@ static int ced_main(int argc, char **argv) {
     int first = 1;
     if (argc > first && !strcmp(argv[first], "--disable-extensions")) { disable_extensions = true; first++; }
     static Editor e;
+    e.executable = argv[0];
+    e.disable_extensions = disable_extensions;
     e.selected = -1;
     e.sidebar = true;
     e.split = 0.27f;
@@ -1826,10 +2044,11 @@ static int ced_main(int argc, char **argv) {
     e.terminal_bottom_split = 0.65f; e.terminal_right_split = 0.6f;
     pthread_mutex_init(&e.search.mutex, NULL);
     pthread_mutex_init(&e.git_sync.mutex, NULL);
+    pthread_mutex_init(&e.git_status.mutex, NULL);
+    pthread_mutex_init(&e.workspace_load.mutex, NULL);
     char error[CED_ERROR];
     const char *root = argc > first ? argv[first] : ".";
-    if (!ced_workspace_open(&e.workspace, root, error)) { fprintf(stderr, "%s\n", error); editor_free(&e); return 1; }
-    refresh_git(&e);
+    if (!ced_workspace_resolve(root, e.workspace.root, error)) { fprintf(stderr, "%s\n", error); editor_free(&e); return 1; }
     recovery_path(&e);
     restore_recovery(&e);
     for (int i = first + 1; i < argc; i++) {
@@ -1843,6 +2062,9 @@ static int ced_main(int argc, char **argv) {
     }
     e.app = cui_app_create(&(cui_app_desc){.title = "CED · Editor", .width = 1280, .height = 820,
         .min_width = 760, .min_height = 480, .theme = CUI_THEME_DARK, .accent = CUI_ACCENT_BLUE,
+#ifdef _WIN32
+        .hidden = true,
+#endif
         .app_id = "dev.ced.Editor"});
     if (!e.app) { fprintf(stderr, "Could not create window.\n"); editor_free(&e); return 1; }
     e.logo = ced_editor_logo_create(cui_app_ui(e.app));
@@ -1861,17 +2083,28 @@ static int ced_main(int argc, char **argv) {
 #ifdef __APPLE__
     ced_macos_set_icon();
     ced_macos_titlebar(e.app);
+#endif
+#if defined(__APPLE__) || defined(_WIN32)
     cui_ctx *ui = cui_app_ui(e.app);
     cui_push_id(ui, "main-toolbar");
     cui_id drag_region = cui_make_id(ui, "titlebar-drag");
     cui_pop_id(ui);
+#endif
+#ifdef _WIN32
+    if (!ced_windows_titlebar(e.app, drag_region)) {
+        fprintf(stderr, "Could not create the Windows title bar.\n");
+        editor_free(&e);
+        return 1;
+    }
+#elif defined(__APPLE__)
     void *window_monitor = ced_macos_window_events(e.app, drag_region);
 #endif
+    start_workspace_load(&e, e.workspace.root, true);
     while (cui_app_frame(e.app)) frame(cui_app_ui(e.app), &e);
 #ifdef __APPLE__
     ced_macos_remove_window_events(window_monitor);
 #endif
-    if (!write_recovery(&e)) {
+    if (!e.reloading && !write_recovery(&e)) {
         fprintf(stderr, "Could not write recovery file: %s\n", e.recovery);
         /* Last-resort copies in the workspace, without replacing user files. */
         for (int i = 0; i < e.count; i++) {

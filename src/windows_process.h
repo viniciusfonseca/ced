@@ -20,5 +20,6 @@ ssize_t ced_windows_read(CedWindowsProcess *process, char *bytes, size_t capacit
 ssize_t ced_windows_write(CedWindowsProcess *process, const char *bytes, size_t length);
 bool ced_windows_exited(CedWindowsProcess *process, int *status);
 void ced_windows_process_close(CedWindowsProcess *process);
+bool ced_windows_relaunch(const char *const args[]);
 int ced_windows_command(const char *const args[], char **output, size_t *length, int input_fd);
 #endif
