@@ -634,7 +634,9 @@ static void jvm_tick(Editor *e, CedLspLanguage language, EditorTab *tab) {
             strcpy(session->provider,provider->hash);
             if (valid) {
                 strcpy(session->root,root);
-                session->launch=ced_extension_lsp_launch(e->extensions->profile,provider,language,root,build,settings.gradle_java,maven_settings,error);
+                const char *server_executable=language==CED_LSP_JAVA ? settings.jdtls_path : settings.kotlin_lsp_path;
+                session->launch=ced_extension_lsp_launch(e->extensions->profile,provider,language,root,build,
+                    settings.gradle_java,maven_settings,server_executable,error);
             }
             if (!session->launch) {
                 snprintf(session->status,sizeof session->status,"%s",error);

@@ -18,6 +18,7 @@ typedef struct {
 
 typedef struct {
     char pom[CED_PATH], maven_settings[CED_PATH], gradle[CED_PATH], gradle_java[CED_PATH];
+    char jdtls_path[CED_PATH], kotlin_lsp_path[CED_PATH];
 } CedJvmSettings;
 
 typedef struct {

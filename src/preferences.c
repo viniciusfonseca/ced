@@ -132,7 +132,9 @@ static cJSON *parse(const char *text, size_t length, CedPreferences *settings, c
         !text_field(root,"maven.pomPath",next.jvm.pom,sizeof next.jvm.pom,error) ||
         !text_field(root,"maven.settingsPath",next.jvm.maven_settings,sizeof next.jvm.maven_settings,error) ||
         !text_field(root,"gradle.projectPath",next.jvm.gradle,sizeof next.jvm.gradle,error) ||
-        !text_field(root,"gradle.javaHome",next.jvm.gradle_java,sizeof next.jvm.gradle_java,error)) goto failed;
+        !text_field(root,"gradle.javaHome",next.jvm.gradle_java,sizeof next.jvm.gradle_java,error) ||
+        !text_field(root,"java.jdtlsPath",next.jvm.jdtls_path,sizeof next.jvm.jdtls_path,error) ||
+        !text_field(root,"kotlin.lspPath",next.jvm.kotlin_lsp_path,sizeof next.jvm.kotlin_lsp_path,error)) goto failed;
     bool absolute_font = *next.font_path=='/';
 #ifdef _WIN32
     absolute_font |= strlen(next.font_path)>2 && isalpha((unsigned char)next.font_path[0]) && next.font_path[1]==':' &&
@@ -203,6 +205,8 @@ bool ced_preferences_project(const char *workspace, const CedJvmSettings *defaul
     if (cJSON_GetObjectItemCaseSensitive(root,"maven.settingsPath")) strcpy(project->maven_settings,parsed.jvm.maven_settings);
     if (cJSON_GetObjectItemCaseSensitive(root,"gradle.projectPath")) strcpy(project->gradle,parsed.jvm.gradle);
     if (cJSON_GetObjectItemCaseSensitive(root,"gradle.javaHome")) strcpy(project->gradle_java,parsed.jvm.gradle_java);
+    if (cJSON_GetObjectItemCaseSensitive(root,"java.jdtlsPath")) strcpy(project->jdtls_path,parsed.jvm.jdtls_path);
+    if (cJSON_GetObjectItemCaseSensitive(root,"kotlin.lspPath")) strcpy(project->kotlin_lsp_path,parsed.jvm.kotlin_lsp_path);
     cJSON_Delete(root);
     return true;
 #endif

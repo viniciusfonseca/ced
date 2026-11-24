@@ -11,7 +11,8 @@ struct CedExtensionLspLaunch {
     bool done, abandoned;
     CedLspLanguage language;
     CedJvmBuild build;
-    char profile[CED_PATH], package[CED_PATH], root[CED_PATH], gradle_java[CED_PATH], maven_settings[CED_PATH], id[129], version[64], hash[65], error[CED_ERROR];
+    char profile[CED_PATH], package[CED_PATH], root[CED_PATH], gradle_java[CED_PATH], maven_settings[CED_PATH], server_executable[CED_PATH];
+    char id[129], version[64], hash[65], error[CED_ERROR];
     CedLsp *peer;
     int lease;
 };
@@ -59,8 +60,10 @@ static void *worker(void *data) {
     }
     char *json=settings ? cJSON_PrintUnformatted(settings) : NULL;
     cJSON_Delete(settings);
+    const char *gradle_jdk=!java && job->build==CED_JVM_GRADLE ? job->gradle_java : "";
     const char *argv[]={executable,"--language-server",java ? "java" : "kotlin",job->root,
-        !java && job->build==CED_JVM_GRADLE && *job->gradle_java ? job->gradle_java : NULL,NULL};
+        *gradle_jdk || *job->server_executable ? gradle_jdk : NULL,
+        *job->server_executable ? job->server_executable : NULL,NULL};
     CedLspServer server={job->root,label,job->language,argv,json,java ? NULL : job->maven_settings};
     pthread_mutex_lock(&job->mutex);
     if (valid && !job->abandoned) job->peer=ced_lsp_start_server(&server,job->error,sizeof job->error);
@@ -73,12 +76,14 @@ static void *worker(void *data) {
 }
 
 CedExtensionLspLaunch *ced_extension_lsp_launch(const char *profile, const CedExtensionRecord *record,
-    CedLspLanguage language, const char *root, CedJvmBuild build, const char *gradle_java, const char *maven_settings, char *error) {
+    CedLspLanguage language, const char *root, CedJvmBuild build, const char *gradle_java,
+    const char *maven_settings, const char *server_executable, char *error) {
     CedExtensionLspLaunch *job=calloc(1,sizeof *job);
     if (job && !pthread_mutex_init(&job->mutex,NULL)) {
         job->language=language; job->build=build; job->lease=-1;
         strcpy(job->profile,profile); strcpy(job->package,record->package); strcpy(job->root,root);
         strcpy(job->gradle_java,gradle_java); strcpy(job->maven_settings,maven_settings);
+        strcpy(job->server_executable,server_executable);
         strcpy(job->id,record->manifest.id); strcpy(job->version,record->manifest.version); strcpy(job->hash,record->hash);
         pthread_t thread;
         if (!pthread_create(&thread,NULL,worker,job)) { pthread_detach(thread); return job; }

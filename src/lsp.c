@@ -543,7 +543,7 @@ static char *const *server_environment(CedLspLanguage language, char **env) {
     if (language==CED_LSP_C) return environ;
     static const char *const allowed[]={
         "HOME","TMPDIR","LANG","LC_ALL","LC_CTYPE","PATH","JAVA_HOME","GRADLE_USER_HOME",
-        "XDG_CACHE_HOME","M2_HOME","MAVEN_HOME","CED_JDTLS","CED_KOTLIN_LSP",NULL
+        "XDG_CACHE_HOME","M2_HOME","MAVEN_HOME",NULL
     };
     size_t count=0;
     for (size_t n=0;allowed[n];n++) {
