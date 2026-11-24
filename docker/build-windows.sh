@@ -5,10 +5,11 @@ case "$arch" in i686|x86_64|aarch64) ;; *) echo "Unsupported Windows CPU: $arch"
 cmake -S /src -B /build -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE=/src/docker/windows-toolchain.cmake \
     -DCED_WINDOWS_ARCH="$arch" -DCMAKE_BUILD_TYPE=Release \
-    -DCED_ENABLE_EXTENSIONS=OFF -DBUILD_TESTING=OFF
-cmake --build /build --target ced --parallel "${BUILD_JOBS:-4}"
+    -DCED_ENABLE_EXTENSIONS=ON -DBUILD_TESTING=OFF
+cmake --build /build --target ced ced_uppercase_extension --parallel "${BUILD_JOBS:-4}"
 mkdir -p /out/licenses
 cp /build/ced.exe /out/ced.exe
+cp -R /build/examples /out/examples
 cp /src/THIRD_PARTY.md /out/THIRD_PARTY.md
 cp /src/docker/WINDOWS.md /out/README.md
 cp /src/third_party/CUI/LICENSE /out/licenses/CUI.txt

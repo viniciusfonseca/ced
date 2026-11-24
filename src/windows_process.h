@@ -15,6 +15,8 @@ typedef struct {
 
 bool ced_windows_spawn(CedWindowsProcess *process, const char *const args[], const char *cwd,
                        bool terminal, bool merge_stderr, bool capture_stderr, HANDLE stdin_file);
+bool ced_windows_spawn_restricted(CedWindowsProcess *process, const char *const args[], const char *cwd,
+                                  const wchar_t *const allowed[]);
 ssize_t ced_windows_read_stderr(CedWindowsProcess *process, char *bytes, size_t capacity);
 ssize_t ced_windows_read(CedWindowsProcess *process, char *bytes, size_t capacity);
 ssize_t ced_windows_write(CedWindowsProcess *process, const char *bytes, size_t length);

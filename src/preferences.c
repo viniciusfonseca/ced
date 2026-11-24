@@ -1,5 +1,6 @@
 #include "preferences.h"
 #include "documents.h"
+#include "file_operations.h"
 #include "cJSON.h"
 #include <ctype.h>
 #include <errno.h>
@@ -186,18 +187,26 @@ static cJSON *load(CedPreferences *settings, char *error) {
 
 bool ced_preferences_project(const char *workspace, const CedJvmSettings *defaults, CedJvmSettings *project, char *error) {
     *project=*defaults; *error=0;
-#ifdef _WIN32
-    (void)workspace;
-    return true;
-#else
     char directory[CED_PATH];
     if (!ced_join(directory,sizeof directory,workspace,".ced")) return failure(error,"Workspace settings path is too long.");
+#ifdef _WIN32
+    char path[CED_PATH], canonical[CED_PATH];
+    struct stat st;
+    if (lstat(directory,&st)) return errno==ENOENT || failure(error,"Could not open workspace .ced directory.");
+    if (!S_ISDIR(st.st_mode) || !ced_join(path,sizeof path,directory,"settings.json"))
+        return failure(error,"Could not open workspace .ced directory.");
+    if (lstat(path,&st)) return errno==ENOENT || failure(error,"Could not read workspace settings.json.");
+    if (!S_ISREG(st.st_mode) || !realpath(path,canonical) || !ced_path_within(canonical,workspace))
+        return failure(error,"Could not read workspace settings.json.");
+    int fd=open(path,O_RDONLY|O_CLOEXEC);
+#else
     int dir=open(directory,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
     if (dir<0) return errno==ENOENT || failure(error,"Could not open workspace .ced directory.");
     int fd=openat(dir,"settings.json",O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC);
     int open_error=errno;
     close(dir);
     if (fd<0 && open_error==ENOENT) return true;
+#endif
     CedPreferences parsed;
     cJSON *root=read_preferences(fd,&parsed,error);
     if (!root) return false;
@@ -209,7 +218,6 @@ bool ced_preferences_project(const char *workspace, const CedJvmSettings *defaul
     if (cJSON_GetObjectItemCaseSensitive(root,"kotlin.lspPath")) strcpy(project->kotlin_lsp_path,parsed.jvm.kotlin_lsp_path);
     cJSON_Delete(root);
     return true;
-#endif
 }
 
 bool ced_preferences_load(CedPreferences *settings, char *error) {

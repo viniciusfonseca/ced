@@ -23,7 +23,7 @@ A desktop text editor written in C99 with [CUI](https://github.com/yappologistic
 
 Requirements: GNU Make, CMake 3.20+, a C compiler, Git, and Perl 5 on your PATH. Perl generates libvterm's encoding headers during the build. The primary supported platforms are **macOS and Linux**. On Linux, install the X11 development headers (`libx11-dev` on Debian/Ubuntu); file dialogs require `zenity` or `kdialog`.
 
-Experimental **native Windows** executables for x86, x64 and ARM64 can be cross-compiled through Docker. See [Docker build instructions](docker/README.md) and [Windows requirements and limitations](docker/WINDOWS.md). These builds use the Win32 backend and disable the experimental POSIX extension host.
+Experimental **native Windows** executables for x86, x64 and ARM64 can be cross-compiled through Docker. See [Docker build instructions](docker/README.md) and [Windows requirements and limitations](docker/WINDOWS.md). These builds use the Win32 backend and include the experimental extension host. Executable extensions need a Windows entrypoint for the corresponding CPU.
 
 Clone this repository with `git clone --recurse-submodules`, or initialize the submodules in an existing checkout before configuring:
 
@@ -232,13 +232,13 @@ When the operating system closes the window, unsaved drafts are preserved in `~/
 - Use the refresh button to update files/Git. Automatic filesystem monitoring is not implemented yet.
 - A diff is a snapshot of the versions at the time of the click; click the item again after refreshing to reload it.
 - Git operations may wait for hooks, signing, credential helpers, or user configuration. Working-tree changes are discarded only through the explicit **Discard Changes** confirmation.
-- Windows is not implemented yet.
+- See [Windows requirements and limitations](docker/WINDOWS.md) for the experimental Win32 build.
 
 ## Extensions (experimental)
 
 Build normally with `make`. The **Extensions** tab next to **Git** lists installed extensions and their status. Click **+** in the tab or run **Install Extension from Folder** from the command palette. Select a package containing `ced-extension.json` and review its identity, version, source, SHA-256 and requested API permissions before choosing **Allow and Install**. Installation copies the package without running it. In **Manage Extensions**, choose **Trust Workspace** to authorize execution for the current canonical workspace path. Commands activate their extension on demand.
 
-The native C example is built into `build/examples/extensions/uppercase-selection`. Install that generated folder, open a text file inside the trusted workspace, select text, and run **Uppercase ASCII Selection**. ASCII letters become uppercase, other Unicode characters are preserved, and one undo restores the selection's original text. The command reads unsaved buffers and never saves them. Untitled documents and files outside the workspace require **Allow Active Document for This Session** for that extension in the manager.
+The native C example is built into `build/examples/extensions/uppercase-selection` and is included in the exported Windows package under `examples/extensions/uppercase-selection`. Install that generated folder, open a text file inside the trusted workspace, select text, and run **Uppercase ASCII Selection**. ASCII letters become uppercase, other Unicode characters are preserved, and one undo restores the selection's original text. The command reads unsaved buffers and never saves them. Untitled documents and files outside the workspace require **Allow Active Document for This Session** for that extension in the manager.
 
 The manager supports enable/disable, explicit restart after failure, uninstall, workspace-trust revocation, document-access revocation and opening a process log. Packages and permissions are stored under `~/.ced/extensions/` and `~/.ced/extensions.json`; logs are under `~/.ced/logs/extensions/`. Updating to another version retains the previous package for manual rollback by reinstalling it; uninstall removes all versions if no window is using them. Changed contents with the same registered version are rejected.
 

@@ -514,16 +514,29 @@ CedLsp *ced_lsp_start(const char *root, const char *executable, char *error, siz
     return ced_lsp_start_server(&server,error,cap);
 }
 
-#ifndef _WIN32
 static bool kotlin_maven_project(CedLsp *lsp, cJSON *options, const char *settings) {
+    char args[CED_PATH + 12], pom[CED_PATH];
+#ifdef _WIN32
+    /* Maven splits MAVEN_ARGS on whitespace. Use the short path when Windows
+     * provides one for a settings file whose native path contains spaces. */
+    wchar_t *path = ced_windows_wide(settings), alias[CED_PATH];
+    DWORD length = path ? GetShortPathNameW(path, alias, CED_PATH) : 0;
+    free(path);
+    char *native = length && length < CED_PATH ? ced_windows_utf8(alias) : NULL;
+    bool valid = native && !strpbrk(native, " \t") && strlen(native) < CED_PATH;
+    if (valid) snprintf(args, sizeof args, "--settings=%s", native);
+    free(native);
+    if (!valid) return false;
+#else
     char directory[]="/tmp/ced-maven-XXXXXX";
     if (!mkdtemp(directory)) return false;
     strcpy(lsp->maven_directory,directory);
-    char alias[64], pom[CED_PATH];
-    if (!ced_join(alias,sizeof alias,directory,"settings.xml") || symlink(settings,alias) ||
-        !ced_join(pom,sizeof pom,lsp->root,"pom.xml")) return false;
+    char alias[64];
+    if (!ced_join(alias,sizeof alias,directory,"settings.xml") || symlink(settings,alias)) return false;
+    snprintf(args,sizeof args,"--settings=%s",alias);
+#endif
+    if (!ced_join(pom,sizeof pom,lsp->root,"pom.xml")) return false;
     char *uri=ced_lsp_uri(pom);
-    char args[80]; snprintf(args,sizeof args,"--settings=%s",alias);
     cJSON *projects=cJSON_AddArrayToObject(options,"projects");
     cJSON *project=cJSON_CreateObject();
     bool ok=uri && projects && project && cJSON_AddStringToObject(project,"type","maven") &&
@@ -539,6 +552,7 @@ static bool kotlin_maven_project(CedLsp *lsp, cJSON *options, const char *settin
 
 /* The launcher needs tool locations and build/cache directories. Keep the
  * command extension's reduced environment independent of the native LSP. */
+#ifndef _WIN32
 static char *const *server_environment(CedLspLanguage language, char **env) {
     if (language==CED_LSP_C) return environ;
     static const char *const allowed[]={
@@ -570,7 +584,15 @@ CedLsp *ced_lsp_start_server(const CedLspServer *server, char *error, size_t cap
     snprintf(lsp->root,sizeof lsp->root,"%s",server->root);
     lsp->settings=server->settings_json ? cJSON_Parse(server->settings_json) : NULL;
 #ifdef _WIN32
-    int result=ced_windows_spawn(&lsp->process,server->argv,server->root,false,false,true,NULL) ? 0 : ENOENT;
+    static const wchar_t *const allowed[] = {
+        L"APPDATA", L"COMSPEC", L"GRADLE_USER_HOME", L"HOME", L"JAVA_HOME", L"LANG",
+        L"LC_ALL", L"LC_CTYPE", L"LOCALAPPDATA", L"M2_HOME", L"MAVEN_HOME", L"PATH",
+        L"PATHEXT", L"SYSTEMROOT", L"TEMP", L"TMP", L"USERPROFILE", L"WINDIR", L"XDG_CACHE_HOME", NULL
+    };
+    bool spawned = server->language == CED_LSP_C
+        ? ced_windows_spawn(&lsp->process,server->argv,server->root,false,false,true,NULL)
+        : ced_windows_spawn_restricted(&lsp->process,server->argv,server->root,allowed);
+    int result=spawned ? 0 : ENOENT;
 #else
     int sockets[2];
     if (socketpair(AF_UNIX,SOCK_STREAM,0,sockets)) {
@@ -641,7 +663,6 @@ CedLsp *ced_lsp_start_server(const CedLspServer *server, char *error, size_t cap
         cJSON *folders=cJSON_AddArrayToObject(options,"workspaceFolders");
         if (root_uri) add_element(folders,cJSON_CreateString(root_uri));
         free(root_uri);
-#ifndef _WIN32
         /* Maven's launcher splits MAVEN_ARGS on whitespace. The private alias
          * carries the real path without copying its contents into CED or logs. */
         if (server->language==CED_LSP_KOTLIN && server->maven_settings && *server->maven_settings &&
@@ -649,7 +670,6 @@ CedLsp *ced_lsp_start_server(const CedLspServer *server, char *error, size_t cap
             cJSON_Delete(params); ced_lsp_stop(lsp);
             snprintf(error,cap,"Could not prepare the Kotlin Maven settings path."); return NULL;
         }
-#endif
     }
     if (!send_message(lsp,"initialize",params,1)) {
         ced_lsp_stop(lsp); snprintf(error,cap,"Could not initialize %s.",server->label); return NULL;

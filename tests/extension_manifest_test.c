@@ -1,3 +1,4 @@
+#include "extension_temp.h"
 #include "extensions/catalog.h"
 #include "extensions/sha256.h"
 #include "file_operations.h"
@@ -24,7 +25,7 @@ int main(int argc, char **argv) {
     cJSON *json=cJSON_Parse(declarative); cJSON_AddNumberToObject(json,"unknown",1); char *text=cJSON_PrintUnformatted(json);
     assert(!ced_extension_manifest_parse(text,strlen(text),&manifest,error)); cJSON_free(text); cJSON_Delete(json);
     CedExtensionRecord approved={0}; assert(ced_extension_inspect(argv[1],&approved,error));
-    char root[]="/tmp/ced-extension-catalog-XXXXXX"; assert(mkdtemp(root));
+    char root[CED_PATH], parent[CED_PATH]; extension_temp("ced-extension-catalog-XXXXXX", root, parent);
     char profile[CED_PATH], workspace[CED_PATH], path[CED_PATH];
     assert(ced_join(profile,sizeof profile,root,"profile")); assert(ced_join(workspace,sizeof workspace,root,"workspace")); assert(!mkdir(workspace,0700));
     assert(ced_extension_install(profile,&approved,error));
@@ -63,7 +64,11 @@ int main(int argc, char **argv) {
     assert(!ced_extension_manifest_parse(text, strlen(text), &manifest, error));
     cJSON_free(text);
     assert(cJSON_ReplaceItemInObjectCaseSensitive(tab, "panel", cJSON_CreateString("terminal")));
-    text=cJSON_PrintUnformatted(json); assert(!chmod(path,0600)); write_file(path,text); cJSON_free(text); cJSON_Delete(json);
+    text=cJSON_PrintUnformatted(json);
+#ifndef _WIN32
+    assert(!chmod(path,0600));
+#endif
+    write_file(path,text); cJSON_free(text); cJSON_Delete(json);
     CedExtensionRecord update={0}; assert(ced_extension_inspect(author_package,&update,error));
     assert(update.manifest.tab_count == 1 && update.manifest.tabs[0].terminal);
     assert(ced_extension_install(profile,&update,error)); assert(!access(installed,F_OK));
@@ -76,8 +81,30 @@ int main(int argc, char **argv) {
     assert(ced_extension_set_enabled(profile,approved.manifest.id,false,error));
     assert(ced_extension_catalog_load(profile,workspace,&catalog,error)); assert(catalog.workspace_trusted && !catalog.entries[0].enabled); ced_extension_catalog_free(&catalog);
     /* Links are rejected even when the linked file is not an entrypoint. */
-    assert(ced_join(path,sizeof path,installed,"linked")); assert(!symlink("/etc/passwd",path));
+    assert(ced_join(path,sizeof path,installed,"linked"));
+#ifdef _WIN32
+    wchar_t *link = ced_windows_wide(path), *target = ced_windows_wide(workspace);
+    assert(link && target);
+    for (wchar_t *p = link; *p; p++) if (*p == L'/') *p = L'\\';
+    for (wchar_t *p = target; *p; p++) if (*p == L'/') *p = L'\\';
+    /* Creating symlinks on Windows requires Developer Mode or elevated rights. */
+    if (CreateSymbolicLinkW(link, target, SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
+        DWORD attributes = GetFileAttributesW(link);
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            CedExtensionRecord linked;
+            assert(!ced_extension_inspect(installed,&linked,error));
+            assert(RemoveDirectoryW(link));
+        } else {
+            assert(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version"));
+            if (attributes != INVALID_FILE_ATTRIBUTES) assert(RemoveDirectoryW(link));
+            puts("SKIP: this Wine filesystem did not expose a Windows reparse point");
+        }
+    }
+    free(target); free(link);
+#else
+    assert(!symlink("/etc/passwd",path));
     CedExtensionRecord linked; assert(!ced_extension_inspect(installed,&linked,error)); assert(!unlink(path));
+#endif
     int lease=ced_extension_lease(profile,approved.manifest.id,approved.manifest.version,false,error); assert(lease>=0);
     assert(!ced_extension_uninstall(profile,approved.manifest.id,error)); close(lease);
     assert(ced_extension_uninstall(profile,approved.manifest.id,error));
@@ -86,8 +113,7 @@ int main(int argc, char **argv) {
     assert(ced_join(path,sizeof path,profile,"extensions.json")); write_file(path,"broken profile");
     assert(!ced_extension_catalog_load(profile,workspace,&catalog,error)); ced_extension_catalog_free(&catalog);
     ced_extension_record_free(&approved);
-    char cleanup_root[CED_PATH], cleanup_parent[CED_PATH]; assert(realpath(root,cleanup_root)); assert(realpath("/tmp",cleanup_parent));
-    assert(ced_file_delete(cleanup_parent,cleanup_root,error));
+    assert(ced_file_delete(parent,root,error));
     puts("OK: strict manifests/JSON, SHA-256, local install, permissions, trust persistence, leases, uninstall and corrupt profiles");
     return 0;
 }

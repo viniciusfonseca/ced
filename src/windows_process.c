@@ -63,13 +63,42 @@ static bool pipe_pair(HANDLE *parent, HANDLE *child, bool writing) {
     return true;
 }
 
-bool ced_windows_spawn(CedWindowsProcess *p, const char *const args[], const char *cwd,
-                       bool terminal, bool merge_stderr, bool capture_stderr, HANDLE stdin_file) {
+/* GetEnvironmentStringsW supplies the sorted native block. Copy only the
+ * selected variables, preserving their UTF-16 values and order. */
+static wchar_t *restricted_environment(const wchar_t *const allowed[]) {
+    wchar_t *inherited = GetEnvironmentStringsW();
+    if (!inherited) return NULL;
+    size_t capacity = 2;
+    for (const wchar_t *entry = inherited; *entry; entry += wcslen(entry) + 1)
+        capacity += wcslen(entry) + 1;
+    wchar_t *block = calloc(capacity, sizeof *block);
+    size_t used = 0;
+    for (const wchar_t *entry = inherited; block && *entry; entry += wcslen(entry) + 1) {
+        const wchar_t *separator = wcschr(entry, L'=');
+        if (!separator || separator == entry) continue;
+        size_t length = (size_t)(separator - entry);
+        for (size_t i = 0; allowed[i]; i++) {
+            if (wcslen(allowed[i]) != length || _wcsnicmp(entry, allowed[i], length)) continue;
+            size_t count = wcslen(entry) + 1;
+            memcpy(block + used, entry, count * sizeof *block);
+            used += count;
+            break;
+        }
+    }
+    FreeEnvironmentStringsW(inherited);
+    return block;
+}
+
+static bool spawn(CedWindowsProcess *p, const char *const args[], const char *cwd,
+                  bool terminal, bool merge_stderr, bool capture_stderr, HANDLE stdin_file,
+                  const wchar_t *const allowed[]) {
     memset(p, 0, sizeof *p);
     HANDLE child_input = NULL, child_output = NULL, child_error = NULL;
     wchar_t *command = command_line(args), *directory = cwd ? ced_windows_wide(cwd) : NULL;
+    wchar_t *environment = allowed ? restricted_environment(allowed) : NULL;
+    wchar_t *application = allowed ? ced_windows_wide(args[0]) : NULL;
     STARTUPINFOEXW startup = {0}; PROCESS_INFORMATION info = {0};
-    bool ok = command && (!cwd || directory);
+    bool ok = command && (!cwd || directory) && (!allowed || (environment && application));
     if (ok && stdin_file) {
         ok = DuplicateHandle(GetCurrentProcess(), stdin_file, GetCurrentProcess(), &child_input, 0, TRUE, DUPLICATE_SAME_ACCESS);
     } else if (ok) ok = pipe_pair(&p->input, &child_input, true);
@@ -114,7 +143,7 @@ bool ced_windows_spawn(CedWindowsProcess *p, const char *const args[], const cha
     startup.StartupInfo.cb = sizeof startup;
     DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT;
     if (!terminal) flags |= CREATE_NO_WINDOW;
-    if (ok) ok = CreateProcessW(NULL, command, NULL, NULL, !terminal, flags, NULL, directory, &startup.StartupInfo, &info);
+    if (ok) ok = CreateProcessW(application, command, NULL, NULL, !terminal, flags, environment, directory, &startup.StartupInfo, &info);
     if (ok) {
         p->process = info.hProcess;
         ok = AssignProcessToJobObject(p->job, p->process) && ResumeThread(info.hThread) != (DWORD)-1;
@@ -122,12 +151,22 @@ bool ced_windows_spawn(CedWindowsProcess *p, const char *const args[], const cha
         CloseHandle(info.hThread);
     }
     if (attributes) DeleteProcThreadAttributeList(startup.lpAttributeList);
-    free(startup.lpAttributeList); free(command); free(directory);
+    free(startup.lpAttributeList); free(command); free(directory); free(environment); free(application);
     if (child_input) CloseHandle(child_input);
     if (child_output) CloseHandle(child_output);
     if (child_error) CloseHandle(child_error);
     if (!ok) ced_windows_process_close(p);
     return ok;
+}
+
+bool ced_windows_spawn(CedWindowsProcess *p, const char *const args[], const char *cwd,
+                       bool terminal, bool merge_stderr, bool capture_stderr, HANDLE stdin_file) {
+    return spawn(p, args, cwd, terminal, merge_stderr, capture_stderr, stdin_file, NULL);
+}
+
+bool ced_windows_spawn_restricted(CedWindowsProcess *p, const char *const args[], const char *cwd,
+                                  const wchar_t *const allowed[]) {
+    return spawn(p, args, cwd, false, false, true, NULL, allowed);
 }
 
 ssize_t ced_windows_read_stderr(CedWindowsProcess *p, char *bytes, size_t capacity) {

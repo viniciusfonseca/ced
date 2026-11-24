@@ -6,7 +6,7 @@
   "description": "Uppercase ASCII letters in the captured selection; preserve other Unicode characters.",
   "ced": {"minVersion": "0.2.0", "apiMajor": 1},
   "kind": "executable",
-  "entrypoints": {"@CED_EXTENSION_PLATFORM@": "bin/uppercase-selection"},
+  "entrypoints": {"@CED_EXTENSION_PLATFORM@": "@CED_EXAMPLE_ENTRYPOINT@"},
   "activationEvents": ["onCommand:example.text-tools.uppercase"],
   "capabilities": ["documents.read", "documents.edit"],
   "untrustedWorkspaces": false,

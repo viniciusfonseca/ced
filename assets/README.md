@@ -6,6 +6,7 @@ The blue angular C with a terminal cursor is the project's primary logo.
 - `ced-256.png`: 256 × 256 PNG embedded for the empty editor pane and macOS CLI icon, and installed in the Linux icon theme.
 - `ced-interface.png`: user-provided screenshot presenting the editor interface in the main README.
 - `../packaging/ced.icns`: macOS bundle icon, containing standard and Retina sizes from 16 to 1024 pixels.
+- `../packaging/ced.ico`: Windows icon embedded in `ced.exe`, with sizes from 16 to 256 pixels.
 
 The chosen concept was generated with the built-in ImageGen tool. Its white presentation background was removed with ImageGen, preserving the dark tile and blue mark. PNG sizes were exported with `sips`; the macOS icon was assembled with `iconutil`.
 
@@ -35,4 +36,16 @@ for size in 16 32 128 256 512; do
 done
 iconutil -c icns build/ced.iconset -o packaging/ced.icns
 make
+```
+
+To regenerate the Windows icon, run this from the repository root with Pillow installed.
+
+```sh
+python3 - <<'PY'
+from PIL import Image
+
+Image.open("assets/ced.png").save(
+    "packaging/ced.ico", sizes=[(size, size) for size in (16, 20, 24, 32, 40, 48, 64, 128, 256)]
+)
+PY
 ```

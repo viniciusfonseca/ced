@@ -1,21 +1,14 @@
-#ifdef __linux__
-#define _GNU_SOURCE
-#endif
 #include "process_internal.h"
 #include "output.h"
-#include <dirent.h>
+#include "child.h"
+#include "files.h"
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <pthread.h>
-#include <signal.h>
-#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #define QUEUE_LIMIT 8
@@ -170,28 +163,32 @@ static char *serialize(const cJSON *json, size_t *length) {
 }
 
 static int log_open(CedExtensionProcess *process, char path[CED_PATH]) {
-    char directory[CED_PATH];
+    CedExtDirectory dirs[4]; size_t count = 0;
     const char *parts[] = {"logs", "extensions", process->session};
-    snprintf(directory, sizeof directory, "%s", process->profile);
+    int fd = -1;
+    if (!ced_ext_directory(&dirs[0], NULL, process->profile, false)) return -1;
+    count++;
     for (size_t i = 0; i < 3; i++) {
-        char next[CED_PATH];
-        if (!ced_join(next, sizeof next, directory, parts[i]) || (mkdir(next, 0700) && errno != EEXIST)) return -1;
-        int fd = open(next, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-        if (fd < 0) return -1;
-        close(fd); snprintf(directory, sizeof directory, "%s", next);
+        if (!ced_ext_directory(&dirs[count], &dirs[count - 1], parts[i], true)) goto done;
+        count++;
     }
-    char name[160]; snprintf(name, sizeof name, "%s.log", process->id);
-    if (!ced_join(path, CED_PATH, directory, name)) return -1;
-    return open(path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    char relative[320], name[160];
+    snprintf(name, sizeof name, "%s.log", process->id);
+    snprintf(relative, sizeof relative, "logs/extensions/%s/%s", process->session, name);
+    if (ced_join(path, CED_PATH, process->profile, relative))
+        fd = ced_ext_file(&dirs[count - 1], name, O_WRONLY | O_APPEND | O_CREAT);
+done:
+    while (count) ced_ext_directory_close(&dirs[--count]);
+    return fd;
 }
 
-static void log_write(const char *source, int *fd, const char *path, const char *bytes, size_t length, size_t *total, size_t *rate, double *window) {
+static void log_write(CedExtensionProcess *process, int *fd, char *path, const char *bytes, size_t length, size_t *total, size_t *rate, double *window) {
     double now = ced_ext_now();
     if (now - *window >= 1) { *window = now; *rate = 0; }
     if (*rate >= 65536) return;
     if (length > 8192) length = 8192;
     if (length > 65536 - *rate) length = 65536 - *rate;
-    ced_output_write(source,bytes,length);
+    ced_output_write(process->id,bytes,length);
     *rate += length;
     if (*fd < 0) return;
     if (*total + length > 1024 * 1024) {
@@ -199,7 +196,7 @@ static void log_write(const char *source, int *fd, const char *path, const char 
         char first[CED_PATH + 4], second[CED_PATH + 4];
         snprintf(first, sizeof first, "%s.1", path); snprintf(second, sizeof second, "%s.2", path);
         unlink(second); rename(first, second); rename(path, first);
-        *fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600); *total = 0;
+        *fd = log_open(process, path); *total = 0;
         if (*fd < 0) return;
     }
     char clean[8193];
@@ -215,55 +212,6 @@ static void log_write(const char *source, int *fd, const char *path, const char 
         used += (size_t)n;
     }
     *total += used;
-}
-
-static int spawn_extension(CedExtensionProcess *process, const char *entrypoint, int *socket_fd, int *stderr_fd, pid_t *pid) {
-    int sockets[2], errors[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets)) return errno;
-    if (pipe(errors)) { int code = errno; close(sockets[0]); close(sockets[1]); return code; }
-    for (unsigned i = 0; i < 2; i++) { fcntl(sockets[i], F_SETFD, FD_CLOEXEC); fcntl(errors[i], F_SETFD, FD_CLOEXEC); }
-    posix_spawn_file_actions_t actions; posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_adddup2(&actions, sockets[1], STDIN_FILENO);
-    posix_spawn_file_actions_adddup2(&actions, sockets[1], STDOUT_FILENO);
-    posix_spawn_file_actions_adddup2(&actions, errors[1], STDERR_FILENO);
-    posix_spawn_file_actions_addchdir_np(&actions, process->package);
-#ifdef __linux__
-    DIR *descriptors = opendir("/proc/self/fd");
-    if (!descriptors) { posix_spawn_file_actions_destroy(&actions); for (unsigned i=0;i<2;i++){close(sockets[i]);close(errors[i]);} return errno; }
-    struct dirent *descriptor;
-    while ((descriptor = readdir(descriptors))) {
-        char *end; long fd = strtol(descriptor->d_name, &end, 10);
-        if (!*end && fd > STDERR_FILENO && fd != dirfd(descriptors)) posix_spawn_file_actions_addclose(&actions, (int)fd);
-    }
-    closedir(descriptors);
-#endif
-    posix_spawnattr_t attributes; posix_spawnattr_init(&attributes);
-    short flags = POSIX_SPAWN_SETPGROUP;
-#ifdef __APPLE__
-    flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
-#endif
-    posix_spawnattr_setflags(&attributes, flags); posix_spawnattr_setpgroup(&attributes, 0);
-    char *environment[6] = {0};
-    const char *allowed[] = {"HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"};
-    size_t env_count = 0;
-    bool allocated = true;
-    for (size_t i = 0; i < 5; i++) {
-        const char *value = getenv(allowed[i]);
-        if (!value) continue;
-        size_t length = strlen(allowed[i]) + strlen(value) + 2;
-        environment[env_count] = malloc(length);
-        if (!environment[env_count]) { allocated = false; break; }
-        snprintf(environment[env_count++], length, "%s=%s", allowed[i], value);
-    }
-    char *arguments[] = {(char *)entrypoint, NULL};
-    int result = allocated ? posix_spawn(pid, entrypoint, &actions, &attributes, arguments, environment) : ENOMEM;
-    for (size_t i = 0; i < env_count; i++) free(environment[i]);
-    posix_spawn_file_actions_destroy(&actions); posix_spawnattr_destroy(&attributes);
-    close(sockets[1]); close(errors[1]);
-    if (result) { close(sockets[0]); close(errors[0]); return result; }
-    fcntl(sockets[0], F_SETFL, O_NONBLOCK); fcntl(errors[0], F_SETFL, O_NONBLOCK);
-    *socket_fd = sockets[0]; *stderr_fd = errors[0];
-    return 0;
 }
 
 static bool receive_frames(CedExtensionProcess *process, CedRpcReader *reader) {
@@ -306,9 +254,9 @@ static void release_process(CedExtensionProcess *process) {
 
 static void *process_worker(void *user) {
     CedExtensionProcess *process = user;
-    sigset_t signals; sigemptyset(&signals); sigaddset(&signals, SIGPIPE); pthread_sigmask(SIG_BLOCK, &signals, NULL);
-    int socket_fd = -1, stderr_fd = -1, lease = -1, log_fd = -1;
-    pid_t pid = -1;
+    CedExtChild child;
+    bool started = false;
+    int lease = -1, log_fd = -1;
     CedRpcReader reader = {0};
     char *output = NULL; size_t output_length = 0, output_at = 0;
     char log_path[CED_PATH] = {0}, error[CED_ERROR];
@@ -321,62 +269,53 @@ static void *process_worker(void *user) {
     if (!ced_join(executable, sizeof executable, process->package, verified.manifest.entrypoint)) { set_error(process, "Entrypoint path is too long"); goto finished; }
     pthread_mutex_lock(&process->mutex); bool cancelled = process->stop; pthread_mutex_unlock(&process->mutex);
     if (cancelled) goto finished;
-    int spawned = spawn_extension(process, executable, &socket_fd, &stderr_fd, &pid);
+    started = ced_ext_child_start(&child, executable, process->package, error);
     ced_extension_record_free(&verified);
-    if (spawned) { snprintf(error, sizeof error, "Extension spawn failed: %s", strerror(spawned)); set_error(process, error); goto finished; }
+    if (!started) { set_error(process, error); goto finished; }
     log_fd = log_open(process, log_path);
     size_t log_total = 0, log_rate = 0;
     double log_window = 0, stop_time = 0;
-    bool term_sent = false, kill_sent = false, child_done = false;
-    while (!child_done) {
+    bool term_sent = false, kill_sent = false, child_exited = false;
+    for (;;) {
         char pending_log[8193];
         pthread_mutex_lock(&process->mutex);
         bool stop = process->stop;
         memcpy(pending_log, process->pending_log, sizeof pending_log); process->pending_log[0] = 0;
         CedExtensionMessage *send_message = !output ? pop(&process->outgoing) : NULL;
         pthread_mutex_unlock(&process->mutex);
-        if (*pending_log) log_write(process->id,&log_fd, log_path, pending_log, strlen(pending_log), &log_total, &log_rate, &log_window);
+        if (*pending_log) log_write(process, &log_fd, log_path, pending_log, strlen(pending_log), &log_total, &log_rate, &log_window);
         if (stop && !stop_time) stop_time = ced_ext_now();
         double stopping = stop_time ? ced_ext_now() - stop_time : 0;
-        if (stop_time && stopping >= 0.5 && !term_sent) { kill(-pid, SIGTERM); term_sent = true; }
-        if (stop_time && stopping >= 1 && !kill_sent) { kill(-pid, SIGKILL); kill_sent = true; }
+        if (stop_time && stopping >= 0.5 && !term_sent) { ced_ext_child_terminate(&child, false); term_sent = true; }
+        if (stop_time && stopping >= 1 && !kill_sent) { ced_ext_child_terminate(&child, true); kill_sent = true; }
         if (send_message) {
             output = serialize(send_message->json, &output_length); output_at = 0;
             ced_extension_message_free(send_message);
             if (!output) set_error(process, "ResourceLimit: serialization budget");
         }
-        struct pollfd descriptors[2] = {{socket_fd, POLLIN | (output ? POLLOUT : 0), 0}, {stderr_fd, POLLIN, 0}};
-        int ready = poll(descriptors, 2, 20);
-        if (ready < 0 && errno != EINTR) set_error(process, "Extension polling failed");
-        if (descriptors[0].revents & POLLOUT) {
-            size_t remaining = output_length - output_at;
-            if (remaining > 65536) remaining = 65536;
-            ssize_t n = write(socket_fd, output + output_at, remaining);
+        if (!child_exited) ced_ext_child_wait(&child, output != NULL);
+        if (output && !child_exited) {
+            ssize_t n = ced_ext_child_write(&child, output + output_at, output_length - output_at);
             if (n > 0) output_at += (size_t)n;
             else if (n < 0 && errno != EINTR && errno != EAGAIN) set_error(process, "Extension connection closed");
             if (output_at == output_length) { ced_rpc_frame_free(output, output_length); output = NULL; output_length = 0; }
         }
-        if (descriptors[0].revents & (POLLIN | POLLHUP)) {
-            char bytes[16384];
-            size_t room = CED_RPC_BODY_LIMIT + CED_RPC_HEADER_LIMIT - reader.length;
-            if (room > sizeof bytes) room = sizeof bytes;
-            ssize_t n = room ? read(socket_fd, bytes, room) : -1;
-            if (n > 0) {
-                if (!ced_rpc_feed(&reader, bytes, (size_t)n) || !receive_frames(process, &reader)) set_error(process, "Invalid extension message or queue limit");
-            } else if (!n) set_error(process, reader.length ? "Extension exited during a frame" : "Extension connection closed");
-            else if (!room || (errno != EINTR && errno != EAGAIN)) set_error(process, "Extension read failed");
-        } else if (reader.length) receive_frames(process, &reader);
-        if (descriptors[1].revents & (POLLIN | POLLHUP)) {
-            char bytes[8192]; ssize_t n = read(stderr_fd, bytes, sizeof bytes);
-            if (n > 0) log_write(process->id,&log_fd, log_path, bytes, (size_t)n, &log_total, &log_rate, &log_window);
-        }
-        if (descriptors[0].revents & (POLLERR | POLLNVAL)) set_error(process, "Extension transport failed");
-        int status;
-        pid_t reaped = waitpid(pid, &status, WNOHANG);
-        if (reaped == pid || (reaped < 0 && errno == ECHILD)) {
-            child_done = true;
-            /* Descendants must not outlive their extension instance. */
-            kill(-pid, SIGKILL);
+        char bytes[16384];
+        size_t room = CED_RPC_BODY_LIMIT + CED_RPC_HEADER_LIMIT - reader.length;
+        if (room > sizeof bytes) room = sizeof bytes;
+        ssize_t received = room ? ced_ext_child_read(&child, bytes, room) : -1;
+        if (received > 0) {
+            if (!ced_rpc_feed(&reader, bytes, (size_t)received) || !receive_frames(process, &reader)) set_error(process, "Invalid extension message or queue limit");
+        } else if (!received || (room && (errno == EINTR || errno == EAGAIN))) {
+            if (reader.length) receive_frames(process, &reader);
+            if (!received) set_error(process, reader.length ? "Extension exited during a frame" : "Extension connection closed");
+        } else set_error(process, "Extension read failed");
+        ssize_t n = ced_ext_child_stderr(&child, bytes, 8192);
+        if (n > 0) log_write(process, &log_fd, log_path, bytes, (size_t)n, &log_total, &log_rate, &log_window);
+        if (child_exited && received <= 0 && n <= 0) break;
+        if (!child_exited && ced_ext_child_exited(&child)) {
+            child_exited = true;
+            ced_ext_child_terminate(&child, true);
             pthread_mutex_lock(&process->mutex); bool expected = process->stop; pthread_mutex_unlock(&process->mutex);
             if (!expected) set_error(process, "Extension process exited");
         }
@@ -385,8 +324,7 @@ finished:
     ced_extension_record_free(&verified);
     if (output) ced_rpc_frame_free(output, output_length);
     ced_rpc_reader_free(&reader);
-    if (socket_fd >= 0) close(socket_fd);
-    if (stderr_fd >= 0) close(stderr_fd);
+    if (started) ced_ext_child_close(&child);
     if (log_fd >= 0) close(log_fd);
     if (lease >= 0) close(lease);
     pthread_mutex_lock(&process->mutex); process->done = true; bool abandoned = process->abandoned; pthread_mutex_unlock(&process->mutex);
@@ -419,8 +357,9 @@ void ced_extension_process_destroy(CedExtensionProcess *process) {
     }
     pthread_mutex_lock(&process->mutex);
     bool done = process->done;
+    pthread_t thread = process->thread;
     if (!done) process->abandoned = true;
     pthread_mutex_unlock(&process->mutex);
-    if (!done) { pthread_detach(process->thread); return; }
-    pthread_join(process->thread, NULL); release_process(process);
+    if (!done) { pthread_detach(thread); return; }
+    pthread_join(thread, NULL); release_process(process);
 }

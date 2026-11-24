@@ -40,7 +40,7 @@ An agent MUST NOT invent APIs such as `ced.editor.replaceText`, `commands/execut
 | JVM LSP servers | Experimental host contribution on macOS and Linux | See the [host profile](extensions.md#jvm-language-server-contributions) |
 | Formatter contributions, rename, code actions | Deferred | Unsupported |
 | Multi-document transactions, webviews, arbitrary UI, save hooks | Outside this version | Unsupported |
-| Marketplace, inter-extension dependencies, Windows | Outside this version | Unsupported |
+| Marketplace, inter-extension dependencies | Outside this version | Unsupported |
 
 Do not put deferred fields into a manifest: unknown fields are rejected. During host development, use the negotiated `hostMethods` list to detect which draft services are actually available.
 
@@ -161,7 +161,7 @@ Unknown fields are errors at every manifest object level, except for arbitrary J
 | `license` | Optional; string | License identifier; include license text in the package. |
 | `ced` | Required; object | Exactly `minVersion` using the version syntax above and `apiMajor: 1`. |
 | `kind` | Required; `"executable"` or `"declarative"` | Whether the package starts a process. |
-| `entrypoints` | Required for executable; nonempty object | Platform key → relative executable path. Draft target keys: `darwin-arm64`, `darwin-x86_64`, `linux-arm64`, `linux-x86_64`. |
+| `entrypoints` | Required for executable; nonempty object | Platform key → relative executable path. Target keys: `darwin-arm64`, `darwin-x86_64`, `linux-arm64`, `linux-x86_64`, `windows-arm64`, `windows-x86_64`, `windows-i686`. Windows entrypoints use native `.exe` files and binary stdin/stdout. |
 | `activationEvents` | Required for executable; nonempty string array | Unique `onCommand:<own-command-id>` entries. Other activation events are deferred. |
 | `capabilities` | Required for executable; unique string array, possibly empty | Only `documents.read` and `documents.edit` are defined. Edit requires read. |
 | `untrustedWorkspaces` | Required for executable; `false` | Executables cannot run in untrusted workspaces in this version. |

@@ -27,8 +27,12 @@ successful cross-compilation does not establish runtime parity with macOS/Linux.
 - Custom font paths accept `C:/Windows/Fonts/consola.ttf`, for example. Installed
   font lookup uses the Windows font registry; use `editor.fontPath` if a family
   cannot be resolved. The embedded default font is always available.
-- The experimental extension host is disabled: its process and trust machinery
-  currently requires POSIX APIs. Configuring it ON for Windows fails explicitly.
+- The experimental extension host is enabled. Use **Install Extension from
+  Folder** to review and install a package, then use **Manage Extensions** to
+  trust the current workspace. The included example is at
+  `examples/extensions/uppercase-selection`. Executable packages require a
+  native `.exe` entrypoint for `windows-i686`, `windows-x86_64` or
+  `windows-arm64`. Use `--disable-extensions` to start without extensions.
 - The file tree skips symbolic links and directory junctions. File mutations
   reject reparse-point ancestors and protect parent directories against renames
   during the operation.

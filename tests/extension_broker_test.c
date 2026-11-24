@@ -1,3 +1,4 @@
+#include "extension_temp.h"
 #include "extensions/manager.h"
 #include "extensions/process_internal.h"
 #include "file_operations.h"
@@ -216,8 +217,8 @@ static void contention_test(void) {
     memset(second,0,sizeof *second); manager->count=1; reset();
 }
 int main(void) {
-    char temporary[] = "/tmp/ced-extension-broker-XXXXXX", root[CED_PATH], inside[CED_PATH], parent[CED_PATH], error[CED_ERROR];
-    assert(mkdtemp(temporary) && realpath(temporary,root) && realpath("/tmp",parent));
+    char root[CED_PATH], inside[CED_PATH], parent[CED_PATH], error[CED_ERROR];
+    extension_temp("ced-extension-broker-XXXXXX", root, parent);
     assert(ced_join(inside,sizeof inside,root,"notes.txt")); FILE *file = fopen(inside,"w"); assert(file); fputs("abc",file); fclose(file);
     host.document.text = calloc(CED_TEXT_CAP,1); host.document.saved = strdup("abc"); host.document.id = 1;
     strcpy(host.document.path,inside); assert(host.document.text && host.document.saved);

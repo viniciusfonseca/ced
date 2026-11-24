@@ -1,5 +1,4 @@
 #include "lsp_launch.h"
-#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,7 +26,6 @@ static void dispose(CedExtensionLspLaunch *launch) {
 static void *worker(void *data) {
     CedExtensionLspLaunch *job=data;
     job->lease=ced_extension_lease(job->profile,job->id,job->version,false,job->error);
-    if (job->lease>=0) fcntl(job->lease,F_SETFD,FD_CLOEXEC);
     CedExtensionRecord verified={0};
     char executable[CED_PATH], label[64];
     bool java=job->language==CED_LSP_JAVA;

@@ -796,8 +796,13 @@ static void jvm_tick(Editor *e, CedLspLanguage language, EditorTab *tab) {
             valid=ced_jvm_maven_settings(e->workspace.root,settings.maven_settings,maven_settings,error);
         if (valid && build==CED_JVM_GRADLE && *settings.gradle_java) {
             char java[CED_PATH]; struct stat st;
-            valid=*settings.gradle_java=='/' && ced_join(java,sizeof java,settings.gradle_java,"bin/java") &&
+#ifdef _WIN32
+            valid=ced_jvm_absolute(settings.gradle_java) && ced_join(java,sizeof java,settings.gradle_java,"bin/java.exe") &&
+                !stat(java,&st) && S_ISREG(st.st_mode);
+#else
+            valid=ced_jvm_absolute(settings.gradle_java) && ced_join(java,sizeof java,settings.gradle_java,"bin/java") &&
                 !stat(java,&st) && S_ISREG(st.st_mode) && !access(java,X_OK);
+#endif
             if (!valid) snprintf(error,sizeof error,"gradle.javaHome must be an absolute JDK installation path.");
         }
         if (!valid || strcmp(session->root,root)) {

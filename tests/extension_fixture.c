@@ -19,15 +19,55 @@ static void send_json(cJSON *message) {
     char *body=cJSON_PrintUnformatted(message); cJSON_Delete(message); if (!body) exit(2);
     printf("Content-Length: %zu\r\n\r\n%s",strlen(body),body); fflush(stdout); cJSON_free(body);
 }
-int main(void) {
+static void hang(void) {
+#ifdef _WIN32
+    Sleep(INFINITE);
+#else
+    for (;;) pause();
+#endif
+}
+
+#ifdef _WIN32
+static bool start_descendant(void) {
+    wchar_t image[CED_PATH], arguments[] = L"fixture.exe --descendant";
+    DWORD length = GetModuleFileNameW(NULL, image, CED_PATH);
+    STARTUPINFOW startup = {.cb = sizeof startup};
+    PROCESS_INFORMATION child;
+    if (!length || length >= CED_PATH ||
+        !CreateProcessW(image, arguments, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &startup, &child))
+        return false;
+    char marker[64];
+    int size = snprintf(marker, sizeof marker, "descendant pid=%lu\n", (unsigned long)child.dwProcessId);
+    write(STDERR_FILENO, marker, (size_t)size);
+    CloseHandle(child.hThread);
+    CloseHandle(child.hProcess);
+    return true;
+}
+#endif
+
+int main(int argc, char **argv) {
+#ifdef _WIN32
+    ced_windows_init();
+    if (GetEnvironmentVariableW(L"CED_EXTENSION_TEST_PRIVATE", NULL, 0)) return 3;
+    if (argc == 2 && !strcmp(argv[1], "--descendant")) hang();
+#else
+    (void)argc; (void)argv;
+#endif
     cJSON *message=receive(); if (!message) return 1;
     const cJSON *p=cJSON_GetObjectItemCaseSensitive(message,"params");
     const cJSON *extension=cJSON_GetObjectItemCaseSensitive(p,"extension");
     const char *name=ced_ext_json_string(extension,"id"), *id=ced_ext_json_string(message,"id");
     if (!name || !id) return 2;
     if (!strcmp(name,"fixture.crash")) _exit(7);
-    if (!strcmp(name,"fixture.malformed")) { fputs("Content-Length: -1\r\n\r\n",stdout); fflush(stdout); for (;;) pause(); }
-    if (!strcmp(name,"fixture.hang")) { signal(SIGTERM,SIG_IGN); for (;;) pause(); }
+    if (!strcmp(name,"fixture.malformed")) { fputs("Content-Length: -1\r\n\r\n",stdout); fflush(stdout); hang(); }
+    if (!strcmp(name,"fixture.hang")) {
+#ifdef _WIN32
+        if (!start_descendant()) return 4;
+#else
+        signal(SIGTERM,SIG_IGN);
+#endif
+        hang();
+    }
     if (!strcmp(name,"fixture.flood")) {
         char bytes[8192]; memset(bytes,'x',sizeof bytes);
         for (int n=0;n<256;n++) if (write(STDERR_FILENO,bytes,sizeof bytes)<0) break;

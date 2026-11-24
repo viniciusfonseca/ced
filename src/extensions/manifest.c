@@ -1,4 +1,5 @@
 #include "manifest.h"
+#include "files.h"
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -10,7 +11,13 @@
 #include <unistd.h>
 
 const char *ced_extension_platform(void) {
-#if defined(__APPLE__) && defined(__aarch64__)
+#if defined(_WIN32) && defined(__aarch64__)
+    return "windows-arm64";
+#elif defined(_WIN32) && defined(__x86_64__)
+    return "windows-x86_64";
+#elif defined(_WIN32) && defined(__i386__)
+    return "windows-i686";
+#elif defined(__APPLE__) && defined(__aarch64__)
     return "darwin-arm64";
 #elif defined(__APPLE__) && defined(__x86_64__)
     return "darwin-x86_64";
@@ -240,9 +247,14 @@ bool ced_extension_manifest_parse(const char *bytes, size_t length, CedExtension
             cJSON_GetArraySize(events) > 100 || !cJSON_IsArray(capabilities) || cJSON_GetArraySize(capabilities) > 2) goto parsed_invalid;
         const char *entrypoint = ced_ext_json_string(entrypoints, ced_extension_platform());
         if (!ced_extension_relative_path(entrypoint)) { snprintf(error, CED_ERROR, "No valid entrypoint for %s", ced_extension_platform()); goto parsed_invalid; }
+        static const char *const platforms[] = {
+            "darwin-arm64", "darwin-x86_64", "linux-arm64", "linux-x86_64",
+            "windows-arm64", "windows-x86_64", "windows-i686", NULL
+        };
         for (const cJSON *v = entrypoints->child; v; v = v->next) {
-            if ((strcmp(v->string, "darwin-arm64") && strcmp(v->string, "darwin-x86_64") && strcmp(v->string, "linux-x86_64") && strcmp(v->string, "linux-arm64")) ||
-                !cJSON_IsString(v) || !ced_extension_relative_path(v->valuestring)) goto parsed_invalid;
+            size_t i = 0;
+            while (platforms[i] && strcmp(v->string, platforms[i])) i++;
+            if (!platforms[i] || !cJSON_IsString(v) || !ced_extension_relative_path(v->valuestring)) goto parsed_invalid;
         }
         snprintf(out->entrypoint, sizeof out->entrypoint, "%s", entrypoint);
         for (const cJSON *v = capabilities->child; v; v = v->next) {
@@ -275,15 +287,19 @@ invalid:
 }
 
 bool ced_extension_manifest_load(const char *package, CedExtensionManifest *manifest, char *error) {
-    char path[CED_PATH];
-    if (!ced_join(path, sizeof path, package, "ced-extension.json")) return false;
-    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    struct stat st;
-    if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > CED_EXTENSION_MANIFEST_LIMIT) {
+    CedExtDirectory dir;
+    if (!ced_ext_directory(&dir, NULL, package, false)) {
+        snprintf(error, CED_ERROR, "Could not open a regular extension directory"); return false;
+    }
+    int fd = ced_ext_file(&dir, "ced-extension.json", O_RDONLY);
+    ced_ext_directory_close(&dir);
+    CedExtFileInfo info;
+    if (fd < 0 || !ced_ext_file_info(fd, "ced-extension.json", false, &info) ||
+        !info.size || info.size > CED_EXTENSION_MANIFEST_LIMIT) {
         if (fd >= 0) close(fd);
         snprintf(error, CED_ERROR, "Missing, linked, or oversized ced-extension.json"); return false;
     }
-    size_t length = (size_t)st.st_size, used = 0;
+    size_t length = (size_t)info.size, used = 0;
     char *bytes = malloc(length + 1);
     if (!bytes) { close(fd); return false; }
     while (used < length) {

@@ -128,6 +128,9 @@ static cJSON *uppercase(const cJSON *params) {
 }
 
 int main(void) {
+#ifdef _WIN32
+    ced_windows_init();
+#endif
     bool initialized=false, active=false; cJSON *message;
     while ((message=receive())) {
         const char *method=ced_ext_json_string(message,"method"), *id=ced_ext_json_string(message,"id");

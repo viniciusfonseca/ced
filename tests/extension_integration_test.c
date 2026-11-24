@@ -1,3 +1,4 @@
+#include "extension_temp.h"
 #include "extensions/manager.h"
 #include "editor_bridge.h"
 #include "file_operations.h"
@@ -33,14 +34,14 @@ static void settle(Host *host,CedExtensions *m) {
     do { tick(host,m); assert(ced_ext_now()<deadline); } while(m->job.running || m->reload);
 }
 int main(int argc,char **argv) {
-    assert(argc==2); char root[]="/tmp/ced-extension-integration-XXXXXX"; assert(mkdtemp(root));
-    char canonical[CED_PATH]; assert(realpath(root,canonical));
+    assert(argc==2); char root[CED_PATH], parent[CED_PATH];
+    extension_temp("ced extension integration-XXXXXX", root, parent);
     char profile[CED_PATH],path[CED_PATH],error[CED_ERROR]={0}; assert(ced_join(profile,sizeof profile,root,"profile"));
     assert(ced_join(path,sizeof path,root,"notes.txt")); FILE *f=fopen(path,"w"); assert(f); fputs("hello é🙂 world\n",f); fclose(f);
     Host host={0}; assert(ced_document_open(&host.doc,path,error)); ced_document_identify(&host.doc,1);
     host.context=(CedCommandContext){1,1,1,0,5,true,true,true,"text"};
     host.ui=cui_create(NULL); assert(host.ui); cui_set_viewport(host.ui,800,500,1); cui_input_focus(host.ui,true);
-    CedCommands commands={0}; CedExtensions *m=ced_extensions_create(&commands,(CedExtensionHost){&host,context,document,commit,message,NULL},profile,canonical); assert(m);
+    CedCommands commands={0}; CedExtensions *m=ced_extensions_create(&commands,(CedExtensionHost){&host,context,document,commit,message,NULL},profile,root); assert(m);
     settle(&host,m); assert(!m->count && !m->trusted);
     assert(ced_extensions_job(m,EXT_INSPECT,argv[1])); settle(&host,m); assert(m->review_open);
     assert(ced_extensions_job(m,EXT_INSTALL,NULL)); settle(&host,m); assert(m->count==1 && commands.count==1);
@@ -58,7 +59,8 @@ int main(int argc,char **argv) {
     deadline=ced_ext_now()+6;
     while (*m->instances[0].command) { tick(&host,m); assert(ced_ext_now()<deadline); }
     assert(host.commits==1 && host.doc.version==2);
-    char outside[]="/tmp/ced-extension-outside-XXXXXX"; int outside_fd=mkstemp(outside); assert(outside_fd>=0); close(outside_fd);
+    char outside[CED_PATH]; assert(ced_join(outside, sizeof outside, parent, "ced-extension-outside-XXXXXX"));
+    int outside_fd=mkstemp(outside); assert(outside_fd>=0); close(outside_fd);
     assert(realpath(outside,host.doc.path)); host.context.selection_version++;
     assert(!ced_extensions_authorized(&m->instances[0],&host.doc));
     assert(ced_commands_execute(&commands,"example.text-tools.uppercase",&host.context,error));
@@ -97,19 +99,18 @@ int main(int argc,char **argv) {
     assert(host.commits==2 && host.doc.version==3);
     assert(ced_document_save(&host.doc,path,true,error)); assert(!unlink(outside));
     /* A workspace generation change invalidates work before the next broker tick. */
-    assert(ced_commands_execute(&commands,"example.text-tools.uppercase",&host.context,error)); ced_extensions_workspace(m,canonical); settle(&host,m);
+    assert(ced_commands_execute(&commands,"example.text-tools.uppercase",&host.context,error)); ced_extensions_workspace(m,root); settle(&host,m);
     assert(host.commits==2 && !m->instances[0].process);
     /* Trust and installed metadata survive a fresh manager. */
     ced_extensions_destroy(m); assert(commands.count==0);
-    m=ced_extensions_create(&commands,(CedExtensionHost){&host,context,document,commit,message,NULL},profile,canonical); settle(&host,m); assert(m->trusted && m->count==1);
+    m=ced_extensions_create(&commands,(CedExtensionHost){&host,context,document,commit,message,NULL},profile,root); settle(&host,m); assert(m->trusted && m->count==1);
     ced_extensions_destroy(m);
-    CedExtensions *closing=ced_extensions_create(&commands,(CedExtensionHost){&host,context,document,commit,message,NULL},profile,canonical);
+    CedExtensions *closing=ced_extensions_create(&commands,(CedExtensionHost){&host,context,document,commit,message,NULL},profile,root);
     assert(ced_extensions_job(closing,EXT_INSPECT,argv[1])); double closing_started=ced_ext_now();
     ced_extensions_destroy(closing); assert(ced_ext_now()-closing_started<1.5);
     /* Let an abandoned inspection release its own results; it may not touch UI. */
     struct timespec cleanup_delay={.tv_nsec=100000000}; nanosleep(&cleanup_delay,NULL);
     ced_commands_free(&commands); cui_destroy(host.ui); ced_document_free(&host.doc);
-    assert(ced_rpc_memory_used()==0); char cleanup_root[CED_PATH], cleanup_parent[CED_PATH]; assert(realpath(root,cleanup_root)); assert(realpath("/tmp",cleanup_parent));
-    assert(ced_file_delete(cleanup_parent,cleanup_root,error));
+    assert(ced_rpc_memory_used()==0 && ced_file_delete(parent,root,error));
     puts("OK: reviewed local install, trust, lazy native process handshake, command, unsaved edit, stale selection, workspace invalidation, restart and cleanup"); return 0;
 }

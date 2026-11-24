@@ -1,3 +1,4 @@
+#include "extension_temp.h"
 #include "extensions/manager.h"
 #include "file_operations.h"
 #include <assert.h>
@@ -54,8 +55,8 @@ static void snapshot(unsigned version) {
     ced_extension_message_free(message);
 }
 int main(int argc,char **argv) {
-    assert(argc==2); char temporary[]="/tmp/ced-extension-example-XXXXXX",root[CED_PATH],parent[CED_PATH],profile[CED_PATH],error[CED_ERROR]={0};
-    assert(mkdtemp(temporary) && realpath(temporary,root) && realpath("/tmp",parent));
+    assert(argc==2); char root[CED_PATH],parent[CED_PATH],profile[CED_PATH],error[CED_ERROR]={0};
+    extension_temp("ced-extension-example-XXXXXX", root, parent);
     assert(ced_join(profile,sizeof profile,root,"profile"));
     CedExtensionRecord approved={0}; assert(ced_extension_inspect(argv[1],&approved,error));
     assert(ced_extension_install(profile,&approved,error)); ced_extension_record_free(&approved);

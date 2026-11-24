@@ -1,5 +1,6 @@
 #include "manager.h"
 #include "lsp.h"
+#include "file_operations.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,9 +11,7 @@ bool ced_extensions_authorized(const CedExtensionInstance *i, const CedDocument 
     for (size_t n = 0; n < i->grant_count; n++) if (i->document_grants[n] == doc->id) return true;
     char canonical[CED_PATH];
     if (!*doc->path || !realpath(doc->path, canonical)) return false;
-    size_t length = strlen(i->manager->workspace);
-    return !strncmp(canonical, i->manager->workspace, length) &&
-        (length == 1 || canonical[length] == '/');
+    return ced_path_within(canonical, i->manager->workspace);
 }
 
 static bool accessible(const CedDocument *doc) {
