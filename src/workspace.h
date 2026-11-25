@@ -17,7 +17,7 @@
 typedef struct {
     char *path;                    /* Relative to the workspace; sorted depth first. */
     int parent, subtree_end;       /* Index immediately after this entry and its descendants. */
-    bool directory, expanded, ignored;
+    bool directory, expanded, ignored, deferred;
 } CedEntry;
 
 typedef struct {
@@ -45,7 +45,7 @@ typedef struct {
 typedef struct {
     pthread_t thread;
     pthread_mutex_t mutex;
-    bool running, done, cancelled, truncated;
+    bool running, done, cancelled, truncated, scan_all;
     char query[256];
     CedWorkspace snapshot;
     CedHit hits[CED_MAX_HITS];
@@ -70,6 +70,8 @@ const char *ced_language(const char *path);
 bool ced_markdown_file(const char *path);
 bool ced_workspace_resolve(const char *path, char root[CED_PATH], char *error);
 bool ced_workspace_open(CedWorkspace *ws, const char *path, char *error);
+bool ced_workspace_read_children(CedWorkspace *children, const char *root, const char *relative, char *error);
+bool ced_workspace_insert_children(CedWorkspace *ws, int index, CedWorkspace *children, char *error);
 int ced_workspace_compact_directory(const CedWorkspace *ws, int index);
 void ced_workspace_free(CedWorkspace *ws);
 bool ced_document_open(CedDocument *doc, const char *path, char *error);

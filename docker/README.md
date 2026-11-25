@@ -1,6 +1,15 @@
 # Windows cross-builds with Docker
 
-Run these commands from the repository root, after initializing the submodules:
+From the repository root, initialize the submodules and build all three Windows packages:
+
+```sh
+make deps
+make windows
+```
+
+Build one architecture with `make windows-x86`, `make windows-x64`, or
+`make windows-arm64`. Use `JOBS=2` to limit compilation jobs per architecture.
+You can also invoke Docker directly from shells such as PowerShell.
 
 ```sh
 git submodule update --init --recursive
@@ -9,7 +18,7 @@ docker buildx build -f docker/Dockerfile.windows-x64 --output type=local,dest=di
 docker buildx build -f docker/Dockerfile.windows-arm64 --output type=local,dest=dist/windows-arm64 .
 ```
 
-The same commands work in PowerShell. On Windows, use Docker Desktop in **Linux
+On Windows, use Docker Desktop in **Linux
 containers** mode. The builder can run on Linux, macOS, or Windows with Docker
 Desktop. Linux AMD64 and ARM64 builders are supported. Each toolchain runs on
 the builder's own CPU and cross-compiles to the selected Windows CPU, so changing

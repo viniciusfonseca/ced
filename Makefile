@@ -9,8 +9,9 @@ DESTDIR ?=
 APPDIR ?= /Applications
 EXTENSIONS ?= ON
 UNAME_S := $(shell uname -s)
+WINDOWS_TARGETS := windows-x86 windows-x64 windows-arm64
 
-.PHONY: all deps configure build test run install install-cli install-macos clean
+.PHONY: all deps configure build windows $(WINDOWS_TARGETS) test run install install-cli install-macos clean
 
 all: build
 
@@ -22,6 +23,11 @@ configure:
 
 build: configure
 	cmake --build "$(BUILD_DIR)" --parallel "$(JOBS)"
+
+windows: $(WINDOWS_TARGETS)
+
+$(WINDOWS_TARGETS): windows-%:
+	docker buildx build -f "docker/Dockerfile.windows-$*" --build-arg "BUILD_JOBS=$(JOBS)" --output "type=local,dest=dist/$@" .
 
 test: build
 	ctest --test-dir "$(BUILD_DIR)" --output-on-failure

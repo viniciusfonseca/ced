@@ -91,6 +91,16 @@ typedef struct {
 } WorkspaceLoad;
 
 typedef struct {
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    bool running, done, ok;
+    uint64_t revision;
+    int head, index;
+    char root[CED_PATH], relative[CED_PATH], error[CED_ERROR];
+    CedWorkspace children;
+} TreeLoad;
+
+typedef struct {
     bool open, execute;
     char root[CED_PATH], path[CED_PATH], error[CED_ERROR];
 } GitDiscard;
@@ -111,6 +121,8 @@ typedef struct {
     const char *executable;
     bool disable_extensions, reloading;
     WorkspaceLoad workspace_load;
+    TreeLoad tree_load;
+    uint64_t tree_revision;
     CedGit git;
     GitSync git_sync;
     GitStatus git_status;
@@ -253,7 +265,10 @@ static void refresh(Editor *e) {
     char root[CED_PATH], error[CED_ERROR];
     snprintf(root, sizeof root, "%s", e->workspace.root);
     if (!ced_workspace_open(&e->workspace, root, error)) notify(e, error);
-    else if (e->workspace_load.running && e->workspace_load.initial) e->workspace_load.superseded = true;
+    else {
+        e->tree_revision++;
+        if (e->workspace_load.running && e->workspace_load.initial) e->workspace_load.superseded = true;
+    }
     refresh_git(e);
 }
 
@@ -707,6 +722,7 @@ static void poll_workspace_load(cui_ctx *ui, Editor *e) {
     }
     ced_workspace_free(&e->workspace);
     e->workspace = job->workspace;
+    e->tree_revision++;
     job->workspace = (CedWorkspace){0};
     ced_git_free(&e->git);
     e->git = job->git;
@@ -1039,6 +1055,50 @@ static void perform_file_action(Editor *e) {
     notify(e, a->operation == CED_FILE_CREATE ? "File created." : a->operation == CED_DIRECTORY_CREATE ? "Folder created." : a->operation == CED_FILE_RENAME ? "Renamed." : "Deleted.");
 }
 
+static void *tree_load_worker(void *user) {
+    TreeLoad *job = user;
+    job->ok = ced_workspace_read_children(&job->children, job->root, job->relative, job->error);
+    pthread_mutex_lock(&job->mutex);
+    job->done = true;
+    pthread_mutex_unlock(&job->mutex);
+    return NULL;
+}
+
+static void start_tree_load(cui_ctx *ui, Editor *e, int head, int index) {
+    TreeLoad *job = &e->tree_load;
+    if (job->running) return;
+    job->done = false;
+    job->revision = e->tree_revision;
+    job->head = head;
+    job->index = index;
+    snprintf(job->root, sizeof job->root, "%s", e->workspace.root);
+    snprintf(job->relative, sizeof job->relative, "%s", e->workspace.entries[index].path);
+    if (pthread_create(&job->thread, NULL, tree_load_worker, job)) {
+        for (int i = head; i <= index; i++) e->workspace.entries[i].expanded = false;
+        notify(e, "Could not start loading the folder.");
+        return;
+    }
+    job->running = true;
+    cui_request_wakeup(ui, 0.05f);
+}
+
+static void poll_tree_load(cui_ctx *ui, Editor *e) {
+    TreeLoad *job = &e->tree_load;
+    if (!job->running) return;
+    pthread_mutex_lock(&job->mutex);
+    bool done = job->done;
+    pthread_mutex_unlock(&job->mutex);
+    if (!done) { cui_request_wakeup(ui, 0.05f); return; }
+    pthread_join(job->thread, NULL);
+    job->running = false;
+    if (job->revision == e->tree_revision &&
+        (!job->ok || !ced_workspace_insert_children(&e->workspace, job->index, &job->children, job->error))) {
+        for (int i = job->head; i <= job->index; i++) e->workspace.entries[i].expanded = false;
+        notify(e, job->error);
+    }
+    ced_workspace_free(&job->children);
+}
+
 static int tree_node(cui_ctx *ui, Editor *e, int index) {
     CedEntry *head = &e->workspace.entries[index];
     int tail = ced_workspace_compact_directory(&e->workspace, index);
@@ -1059,8 +1119,16 @@ static int tree_node(cui_ctx *ui, Editor *e, int index) {
     if (!entry->directory && cui_tree_clicked(ui)) open_document(e, path, 0, 0);
     file_context_menu(ui, e, path, entry->directory, false);
     if (expanded) {
-        for (int next = tail + 1; next < entry->subtree_end;)
-            next = tree_node(ui, e, next);
+        if (entry->deferred) {
+            start_tree_load(ui, e, index, tail);
+            cui_row(ui, .align = CUI_ALIGN_CENTER, .gap = 6, .pad_x = 6) {
+                cui_spinner(ui, 12, .style = CUI_SPINNER_ARC);
+                cui_text(ui, "Loading...", .size = 12, .color = CUI_COLOR_TEXT_SECONDARY);
+            }
+        } else {
+            for (int next = tail + 1; next < entry->subtree_end;)
+                next = tree_node(ui, e, next);
+        }
         cui_tree_end(ui);
     }
     cui_pop_id(ui);
@@ -1822,6 +1890,7 @@ static void frame(cui_ctx *ui, Editor *e) {
     perform_file_action(e);
     perform_git_discard(e);
     poll_workspace_load(ui, e);
+    poll_tree_load(ui, e);
     poll_git_status(ui, e);
     poll_preferences(ui,e);
     for (int n = 0; n < e->count; n++) {
@@ -2008,6 +2077,9 @@ static void editor_free(Editor *e) {
     ced_workspace_free(&e->workspace_load.workspace);
     ced_git_free(&e->workspace_load.git);
     pthread_mutex_destroy(&e->workspace_load.mutex);
+    if (e->tree_load.running) pthread_join(e->tree_load.thread, NULL);
+    ced_workspace_free(&e->tree_load.children);
+    pthread_mutex_destroy(&e->tree_load.mutex);
 #ifdef CED_ENABLE_EXTENSIONS
     ced_extensions_destroy(e->extensions);
 #endif
@@ -2051,6 +2123,7 @@ static int ced_main(int argc, char **argv) {
     pthread_mutex_init(&e.git_sync.mutex, NULL);
     pthread_mutex_init(&e.git_status.mutex, NULL);
     pthread_mutex_init(&e.workspace_load.mutex, NULL);
+    pthread_mutex_init(&e.tree_load.mutex, NULL);
     char error[CED_ERROR];
     const char *root = argc > first ? argv[first] : ".";
     if (!ced_workspace_resolve(root, e.workspace.root, error)) { fprintf(stderr, "%s\n", error); editor_free(&e); return 1; }

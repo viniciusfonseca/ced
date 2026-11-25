@@ -42,6 +42,7 @@ CUI, cJSON, and libvterm are Git submodules under `third_party/`. Their exact re
 | `make deps` | Initialize and update dependency submodules |
 | `make configure` | Configure CMake with tests enabled |
 | `make build` | Configure and compile the project |
+| `make windows` | Cross-compile Windows x86, x64, and ARM64 packages with Docker |
 | `make run` | Build and launch CED |
 | `make test` | Build and run all tests |
 | `make install` | Install `ced` and the platform application icon/launcher |
@@ -228,7 +229,7 @@ When the operating system closes the window, unsaved drafts are preserved in `~/
 
 - Up to 32 tabs, 2 MiB per text file, 20,000 tree entries, and 500 search results. Files containing NUL bytes are treated as binary.
 - Search is case-sensitive and uses files **saved on disk**, not unsaved editor buffers.
-- The tree and search skip `.git` metadata and symbolic links. In Git workspaces, the tree dims entries ignored by Git. Check **Include Git-ignored files** to search their text files.
+- The tree and search skip `.git` metadata and symbolic links. In Git workspaces, the tree dims entries ignored by Git and reads the contents of ignored folders on expansion. Check **Include Git-ignored files** to search their text files, including in collapsed folders.
 - Use the refresh button to update files/Git. Automatic filesystem monitoring is not implemented yet.
 - A diff is a snapshot of the versions at the time of the click; click the item again after refreshing to reload it.
 - Git operations may wait for hooks, signing, credential helpers, or user configuration. Working-tree changes are discarded only through the explicit **Discard Changes** confirmation.

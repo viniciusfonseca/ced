@@ -99,22 +99,33 @@ static void test_documents(void) {
     puts("OK: open/save, CRLF, conflict detection, binary/size limits, permissions");
 }
 
+static int tree_entry(const CedWorkspace *ws, const char *path) {
+    for (int i = 0; i < ws->count; i++) if (!strcmp(ws->entries[i].path, path)) return i;
+    return -1;
+}
+
 static void assert_ignored(CedWorkspace *ws, const char *path, bool ignored) {
-    for (int i = 0; i < ws->count; i++) if (!strcmp(ws->entries[i].path, path)) {
-        assert(ws->entries[i].ignored == ignored); return;
-    }
-    fprintf(stderr, "Missing tree entry: %s\n", path); assert(false);
+    int index = tree_entry(ws, path);
+    if (index < 0) fprintf(stderr, "Missing tree entry: %s\n", path);
+    assert(index >= 0 && ws->entries[index].ignored == ignored);
 }
 
 static void test_workspace_ignored(void) {
     char repo[CED_PATH], folder[CED_PATH]; path_for(repo, "ignore-tree"); assert(!mkdir(repo, 0700));
     const char *init[] = {"git", "-C", repo, "init", "-q", NULL}; command(init);
-    write_text("ignore-tree/.gitignore", "*.tmp\n!keep.tmp\ncache/\n");
+    write_text("ignore-tree/.gitignore", "*.tmp\n!keep.tmp\ncache/\ntracked-cache/\nbuild/*\n");
     write_text("ignore-tree/hidden.tmp", "search-token"); write_text("ignore-tree/keep.tmp", "search-token");
     write_text("ignore-tree/tracked.tmp", "search-token"); write_text("ignore-tree/odd\nname.tmp", "ignored");
     const char *add[] = {"git", "-C", repo, "add", "-f", "--", "tracked.tmp", NULL}; command(add);
     path_for(folder, "ignore-tree/cache"); assert(!mkdir(folder, 0700));
     write_text("ignore-tree/cache/file.c", "search-token");
+    path_for(folder, "ignore-tree/cache/deep"); assert(!mkdir(folder, 0700));
+    write_text("ignore-tree/cache/deep/file.c", "search-token");
+    path_for(folder, "ignore-tree/tracked-cache"); assert(!mkdir(folder, 0700));
+    write_text("ignore-tree/tracked-cache/kept.c", "tracked file");
+    const char *keep[] = {"git", "-C", repo, "add", "-f", "--", "tracked-cache/kept.c", NULL}; command(keep);
+    path_for(folder, "ignore-tree/build"); assert(!mkdir(folder, 0700));
+    write_text("ignore-tree/build/result.txt", "ignored by a child pattern");
     path_for(folder, "ignore-tree/nested"); assert(!mkdir(folder, 0700));
     write_text("ignore-tree/nested/.gitignore", "*.log\n!keep.log\n");
     write_text("ignore-tree/nested/hidden.log", "ignored"); write_text("ignore-tree/nested/keep.log", "visible");
@@ -132,19 +143,45 @@ static void test_workspace_ignored(void) {
     assert_ignored(&ws, "keep.tmp", false); assert_ignored(&ws, "tracked.tmp", false);
     assert_ignored(&ws, ":literal.tmp", true); assert_ignored(&ws, "zz-late.tmp", true);
     assert_ignored(&ws, "vendor/module", false); assert_ignored(&ws, "vendor/module/inside.tmp", false);
-    assert_ignored(&ws, "cache", true); assert_ignored(&ws, "cache/file.c", true);
+    assert_ignored(&ws, "cache", true);
+    assert_ignored(&ws, "tracked-cache/kept.c", false);
+    assert_ignored(&ws, "build", false); assert_ignored(&ws, "build/result.txt", true);
+    int cache = tree_entry(&ws, "cache");
+    assert(ws.entries[cache].deferred && ws.entries[cache].subtree_end == cache + 1);
+    assert(tree_entry(&ws, "cache/file.c") < 0 && tree_entry(&ws, "cache/deep") < 0);
     assert_ignored(&ws, "nested", false); assert_ignored(&ws, "nested/hidden.log", true);
     assert_ignored(&ws, "nested/keep.log", false); assert_ignored(&ws, "local.txt", true);
     static CedSearch search;
     pthread_mutex_init(&search.mutex, NULL);
     assert(ced_search_start(&search, &ws, "search-token", true));
     ced_search_finish(&search);
-    assert(search.count == 4);
+    assert(search.count == 5);
     assert(ced_search_start(&search, &ws, "search-token", false));
     ced_search_finish(&search);
     assert(search.count == 2);
     assert(!strcmp(search.hits[0].path, "keep.tmp"));
     assert(!strcmp(search.hits[1].path, "tracked.tmp"));
+    assert(tree_entry(&ws, "cache/deep/file.c") < 0); /* Search does not expand the tree. */
+    CedWorkspace children = {0};
+    ws.entries[cache].expanded = true;
+    assert(ced_workspace_read_children(&children, ws.root, "cache", error));
+    assert(ced_workspace_insert_children(&ws, cache, &children, error));
+    assert_ignored(&ws, "cache/file.c", true);
+    int deep = tree_entry(&ws, "cache/deep");
+    assert(deep == cache + 1 && ws.entries[deep].parent == cache && ws.entries[deep].deferred);
+    assert(tree_entry(&ws, "cache/deep/file.c") < 0);
+    assert(ws.entries[cache].subtree_end == cache + 3 && !ws.entries[cache].deferred);
+    assert(ced_workspace_compact_directory(&ws, cache) == cache);
+    ws.entries[deep].expanded = true;
+    assert(ced_workspace_read_children(&children, ws.root, "cache/deep", error));
+    assert(ced_workspace_insert_children(&ws, deep, &children, error));
+    assert(ws.entries[cache].subtree_end == cache + 4);
+    assert_ignored(&ws, "cache/deep/file.c", true);
+    int nested = tree_entry(&ws, "nested"), log = tree_entry(&ws, "nested/hidden.log");
+    assert(ws.entries[log].parent == nested && log < ws.entries[nested].subtree_end);
+    assert(ced_workspace_open(&ws, repo, error));
+    assert_ignored(&ws, "cache/deep/file.c", true);
+    assert(ws.entries[tree_entry(&ws, "cache/deep")].expanded);
     pthread_mutex_destroy(&search.mutex);
     path_for(folder, "ignore-tree/nested");
     assert(ced_workspace_open(&ws, folder, error));

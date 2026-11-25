@@ -76,7 +76,25 @@ static int compare_items(const void *left, const void *right) {
     return strcmp(a->name, b->name);
 }
 
-static bool scan(CedWorkspace *ws, const char *relative, int parent, int depth, size_t *capacity) {
+static CedEntry *find_entry(CedEntry **entries, size_t count, const char *path);
+
+typedef struct {
+    CedEntry **ignored, **previous;
+    size_t ignored_count, previous_count;
+    CedSearch *search;
+    bool children_only;
+} TreeScan;
+
+static bool search_cancelled(CedSearch *search) {
+    if (!search) return false;
+    pthread_mutex_lock(&search->mutex);
+    bool cancelled = search->cancelled;
+    pthread_mutex_unlock(&search->mutex);
+    return cancelled;
+}
+
+static bool scan(CedWorkspace *ws, const char *relative, int parent, int depth, size_t *capacity, const TreeScan *options, bool inherited_ignored) {
+    if (search_cancelled(options->search)) return true;
     char path[CED_PATH];
     if (depth > 64 || !ced_join(path, sizeof path, ws->root, relative)) {
         ws->truncated = true;
@@ -89,6 +107,7 @@ static bool scan(CedWorkspace *ws, const char *relative, int parent, int depth, 
     struct dirent *entry;
     bool ok = true;
     while ((entry = readdir(dir))) {
+        if (count % 64 == 0 && search_cancelled(options->search)) break;
         if (excluded(entry->d_name)) continue;
         char child[CED_PATH];
         struct stat st;
@@ -125,8 +144,22 @@ static bool scan(CedWorkspace *ws, const char *relative, int parent, int depth, 
         int index = ws->count;
         char *copy = strdup(child);
         if (!copy) { ok = false; break; }
-        ws->entries[ws->count++] = (CedEntry){.path = copy, .parent = parent, .directory = items[i].dir};
-        if (items[i].dir) ok = scan(ws, child, index, depth + 1, capacity);
+        bool ignored = inherited_ignored;
+        if (!ignored && items[i].dir && options->ignored_count) {
+            const CedEntry *candidate = find_entry(options->ignored, options->ignored_count, child);
+            ignored = candidate && candidate->ignored;
+        }
+        bool expanded = false;
+        if (items[i].dir && options->previous_count) {
+            const CedEntry *previous = find_entry(options->previous, options->previous_count, child);
+            expanded = previous && previous->expanded;
+        }
+        bool deferred = items[i].dir && ignored && !expanded && depth < 64;
+        ws->entries[ws->count++] = (CedEntry){.path = copy, .parent = parent, .directory = items[i].dir,
+                                             .ignored = ignored, .deferred = deferred, .expanded = expanded};
+        if (items[i].dir && !deferred && !options->children_only)
+            ok = scan(ws, child, index, depth + 1, capacity, options, ignored);
+        if (items[i].dir && depth == 64) ws->truncated = true;
         ws->entries[index].subtree_end = ws->count;
     }
     for (size_t i = 0; i < count; i++) free(items[i].name);
@@ -138,7 +171,8 @@ int ced_workspace_compact_directory(const CedWorkspace *ws, int index) {
     int end = ws->entries[index].subtree_end;
     while (index + 1 < end) {
         const CedEntry *child = &ws->entries[index + 1];
-        if (!child->directory || child->subtree_end != end) break;
+        if (!child->directory || child->subtree_end != end ||
+            (ws->entries[index].ignored && child->deferred)) break;
         index++;
     }
     return index;
@@ -153,6 +187,15 @@ static CedEntry *find_entry(CedEntry **entries, size_t count, const char *path) 
     CedEntry key = {.path = (char *)path}, *key_ptr = &key;
     CedEntry **entry = bsearch(&key_ptr, entries, count, sizeof *entries, compare_entry_paths);
     return entry ? *entry : NULL;
+}
+
+static CedEntry **sorted_entries(const CedWorkspace *ws) {
+    if (!ws->count) return NULL;
+    CedEntry **entries = malloc((size_t)ws->count * sizeof *entries);
+    if (!entries) return NULL;
+    for (int i = 0; i < ws->count; i++) entries[i] = &ws->entries[i];
+    qsort(entries, (size_t)ws->count, sizeof *entries, compare_entry_paths);
+    return entries;
 }
 
 static int check_ignored(const CedWorkspace *ws, const bool *skip, char **output, size_t *length) {
@@ -207,11 +250,8 @@ static bool skip_submodule_paths(const CedWorkspace *ws, CedEntry **entries, boo
 }
 
 static void mark_ignored(CedWorkspace *ws) {
-    if (!ws->count) return;
-    CedEntry **entries = malloc((size_t)ws->count * sizeof *entries);
+    CedEntry **entries = sorted_entries(ws);
     if (!entries) return;
-    for (int i = 0; i < ws->count; i++) entries[i] = &ws->entries[i];
-    qsort(entries, (size_t)ws->count, sizeof *entries, compare_entry_paths);
 
     char *output = NULL;
     size_t length = 0;
@@ -240,6 +280,84 @@ static void mark_ignored(CedWorkspace *ws) {
     free(entries);
 }
 
+/* Git reports ignored untracked trees as directory paths without listing
+ * their contents. Confirm each directory itself is ignored: --directory can
+ * also report a parent whose children match a pattern such as build/*. */
+static void ignored_directories(CedWorkspace *dirs) {
+    const char *args[] = {"git", "-C", dirs->root, "ls-files", "--others", "--ignored",
+                         "--exclude-standard", "--directory", "-z", NULL};
+    char *output = NULL;
+    size_t length = 0;
+    if (command_run(args, &output, &length, -1)) { free(output); return; }
+    size_t capacity = 0;
+    for (size_t offset = 0; offset < length && dirs->count < CED_MAX_ENTRIES;) {
+        char *path = output + offset, *end = memchr(path, 0, length - offset);
+        if (!end) break;
+        offset = (size_t)(end - output) + 1;
+        if (end <= path + 1 || end[-1] != '/') continue;
+        if ((size_t)dirs->count == capacity) {
+            size_t size = capacity ? capacity * 2 : 32;
+            CedEntry *next = realloc(dirs->entries, size * sizeof *next);
+            if (!next) break;
+            dirs->entries = next;
+            capacity = size;
+        }
+        end[-1] = 0;
+        char *copy = strdup(path);
+        if (!copy) break;
+        dirs->entries[dirs->count++] = (CedEntry){.path = copy, .parent = -1, .directory = true};
+    }
+    free(output);
+    mark_ignored(dirs);
+}
+
+bool ced_workspace_read_children(CedWorkspace *children, const char *root, const char *relative, char *error) {
+    char path[CED_PATH], canonical[CED_PATH];
+    struct stat st;
+    size_t length = strlen(root);
+    int written = snprintf(path, sizeof path, "%s%s%s", root, length && root[length - 1] == '/' ? "" : "/", relative);
+    if (written < 0 || (size_t)written >= sizeof path || lstat(path, &st) || !S_ISDIR(st.st_mode) ||
+        !realpath(path, canonical) || strcmp(path, canonical))
+        return fail(error, "Could not open folder: %s", relative);
+    int depth = 1;
+    for (const char *p = relative; *p; p++) if (*p == '/') depth++;
+    snprintf(children->root, sizeof children->root, "%s", root);
+    size_t capacity = 0;
+    if (!scan(children, relative, -1, depth, &capacity, &(TreeScan){.children_only = true}, true)) {
+        ced_workspace_free(children);
+        return fail(error, "Could not read folder: access denied or out of memory.");
+    }
+    return true;
+}
+
+bool ced_workspace_insert_children(CedWorkspace *ws, int index, CedWorkspace *children, char *error) {
+    int first = index + 1;
+    int added = children->count;
+    if (added > CED_MAX_ENTRIES - ws->count) added = CED_MAX_ENTRIES - ws->count;
+    if (added) {
+        CedEntry *entries = realloc(ws->entries, (size_t)(ws->count + added) * sizeof *entries);
+        if (!entries) return fail(error, "Could not expand folder: out of memory.");
+        ws->entries = entries;
+        memmove(entries + first + added, entries + first, (size_t)(ws->count - first) * sizeof *entries);
+        ws->count += added;
+        for (int i = 0; i < first; i++) if (entries[i].subtree_end > index) entries[i].subtree_end += added;
+        for (int i = first; i < first + added; i++) {
+            entries[i] = children->entries[i - first];
+            entries[i].parent = index;
+            entries[i].subtree_end = i + 1;
+            children->entries[i - first].path = NULL;
+        }
+        for (int i = first + added; i < ws->count; i++) {
+            entries[i].subtree_end += added;
+            if (entries[i].parent > index) entries[i].parent += added;
+        }
+    }
+    ws->entries[index].deferred = false;
+    ws->truncated |= children->truncated || added < children->count;
+    ced_workspace_free(children);
+    return true;
+}
+
 bool ced_workspace_resolve(const char *path, char root[CED_PATH], char *error) {
     struct stat st;
     if (!realpath(path, root) || stat(root, &st) || !S_ISDIR(st.st_mode))
@@ -250,21 +368,25 @@ bool ced_workspace_resolve(const char *path, char root[CED_PATH], char *error) {
 bool ced_workspace_open(CedWorkspace *ws, const char *path, char *error) {
     CedWorkspace next = {0};
     if (!ced_workspace_resolve(path, next.root, error)) return false;
+    CedWorkspace dirs = {0};
+    snprintf(dirs.root, sizeof dirs.root, "%s", next.root);
+    ignored_directories(&dirs);
+    CedEntry **ignored = sorted_entries(&dirs);
+    CedEntry **previous = !strcmp(ws->root, next.root) ? sorted_entries(ws) : NULL;
+    TreeScan options = {
+        .ignored = ignored, .ignored_count = ignored ? (size_t)dirs.count : 0,
+        .previous = previous, .previous_count = previous ? (size_t)ws->count : 0
+    };
     size_t capacity = 0;
-    if (!scan(&next, "", -1, 0, &capacity)) {
+    bool ok = scan(&next, "", -1, 0, &capacity, &options, false);
+    free(previous);
+    free(ignored);
+    ced_workspace_free(&dirs);
+    if (!ok) {
         ced_workspace_free(&next);
         return fail(error, "Could not read folder: access denied or out of memory.");
     }
     mark_ignored(&next);
-    /* Preserve expansion on refresh. */
-    for (int i = 0; i < next.count; i++) {
-        if (!next.entries[i].directory) continue;
-        for (int j = 0; j < ws->count; j++)
-            if (!strcmp(ws->root, next.root) && !strcmp(next.entries[i].path, ws->entries[j].path)) {
-                next.entries[i].expanded = ws->entries[j].expanded;
-                break;
-            }
-    }
     ced_workspace_free(ws);
     *ws = next;
     return true;
@@ -400,13 +522,16 @@ void ced_document_free(CedDocument *doc) {
 
 static void *search_worker(void *user) {
     CedSearch *s = user;
+    bool incomplete = false;
+    if (s->scan_all) {
+        size_t capacity = 0;
+        incomplete = !scan(&s->snapshot, "", -1, 0, &capacity, &(TreeScan){.search = s}, false) || s->snapshot.truncated;
+    }
     size_t query_length = strlen(s->query);
     for (int i = 0; i < s->snapshot.count; i++) {
-        pthread_mutex_lock(&s->mutex);
-        bool stop = s->cancelled;
-        pthread_mutex_unlock(&s->mutex);
-        if (stop) break;
+        if (search_cancelled(s)) break;
         CedEntry *entry = &s->snapshot.entries[i];
+        if (entry->directory) continue;
         char path[CED_PATH], error[CED_ERROR], *text = NULL;
         if (!ced_join(path, sizeof path, s->snapshot.root, entry->path) || !read_text(path, &text, NULL, error)) continue;
         const char *line_start = text;
@@ -436,6 +561,7 @@ static void *search_worker(void *user) {
         free(text);
         if (s->truncated) break;
     }
+    s->truncated |= incomplete;
     pthread_mutex_lock(&s->mutex);
     s->done = true;
     pthread_mutex_unlock(&s->mutex);
@@ -451,14 +577,20 @@ bool ced_search_start(CedSearch *s, const CedWorkspace *ws, const char *query, b
     if (!*query) return true;
     snprintf(s->query, sizeof s->query, "%s", query);
     snprintf(s->snapshot.root, sizeof s->snapshot.root, "%s", ws->root);
-    s->snapshot.entries = calloc((size_t)ws->count + 1, sizeof(CedEntry));
-    if (!s->snapshot.entries) return false;
-    for (int i = 0; i < ws->count; i++) {
-        const CedEntry *entry = &ws->entries[i];
-        if (entry->directory || (!include_ignored && entry->ignored)) continue;
-        char *path = strdup(entry->path);
-        if (!path) { ced_workspace_free(&s->snapshot); return false; }
-        s->snapshot.entries[s->snapshot.count++] = (CedEntry){.path = path};
+    s->scan_all = false;
+    if (include_ignored) for (int i = 0; i < ws->count; i++) {
+        if (ws->entries[i].deferred) { s->scan_all = true; break; }
+    }
+    if (!s->scan_all) {
+        s->snapshot.entries = calloc((size_t)ws->count + 1, sizeof(CedEntry));
+        if (!s->snapshot.entries) return false;
+        for (int i = 0; i < ws->count; i++) {
+            const CedEntry *entry = &ws->entries[i];
+            if (entry->directory || (!include_ignored && entry->ignored)) continue;
+            char *path = strdup(entry->path);
+            if (!path) { ced_workspace_free(&s->snapshot); return false; }
+            s->snapshot.entries[s->snapshot.count++] = (CedEntry){.path = path};
+        }
     }
     if (pthread_create(&s->thread, NULL, search_worker, s)) {
         ced_workspace_free(&s->snapshot);
