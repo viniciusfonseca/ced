@@ -17,10 +17,11 @@ set(CUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(CUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(CED_CUI_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/CUI")
 add_subdirectory(third_party/CUI EXCLUDE_FROM_ALL)
-# Keep the pinned toolkit unchanged and extend its editor/diff language table.
+# Keep the pinned toolkit unchanged and extend its syntax highlighting.
 set_property(SOURCE "${CED_CUI_SOURCE_DIR}/src/cui_code.c" TARGET_DIRECTORY cui
     APPEND PROPERTY COMPILE_DEFINITIONS
-    cui__lang_for=cui__builtin_lang_for cui__tokenize_lang=cui__builtin_tokenize_lang)
+    cui__lang_for=cui__builtin_lang_for cui__tokenize_lang=cui__builtin_tokenize_lang
+    cui__tokenize=cui__builtin_tokenize)
 target_sources(cui PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/editor_syntax.c")
 target_include_directories(cui PRIVATE "${CED_CUI_SOURCE_DIR}/src")
 find_package(Threads REQUIRED)
@@ -169,6 +170,13 @@ endif()
 target_link_libraries(ced PRIVATE ced_fonts)
 
 include(CTest)
+if(BUILD_TESTING)
+    add_executable(ced_editor_syntax_tests tests/editor_syntax_test.c)
+    target_include_directories(ced_editor_syntax_tests PRIVATE "${CED_CUI_SOURCE_DIR}/src")
+    target_link_libraries(ced_editor_syntax_tests PRIVATE ced_core cui::cui)
+    target_compile_options(ced_editor_syntax_tests PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
+    add_test(NAME editor_syntax COMMAND ced_editor_syntax_tests)
+endif()
 if(BUILD_TESTING AND WIN32)
     add_executable(ced_windows_tests tests/windows_test.c)
     target_link_libraries(ced_windows_tests PRIVATE ced_core)

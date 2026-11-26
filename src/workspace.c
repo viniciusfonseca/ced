@@ -54,9 +54,10 @@ const char *ced_language(const char *path) {
     if (!ext) return "text";
     static const char *pairs[][2] = {
         {".c", "c"}, {".h", "c"}, {".cpp", "cpp"}, {".hpp", "cpp"},
-        {".cc", "cpp"}, {".m", "c"}, {".js", "js"}, {".jsx", "js"},
+        {".cc", "cpp"}, {".m", "c"}, {".js", "js"}, {".jsx", "js"}, {".mjs", "js"},
         {".ts", "ts"}, {".tsx", "ts"}, {".py", "python"}, {".rs", "rust"},
-        {".go", "go"}, {".java", "java"}, {".kt", "kotlin"}, {".kts", "kotlin"}, {".json", "json"}, {".sh", "shell"}, {".sql", "sql"},
+        {".go", "go"}, {".java", "java"}, {".kt", "kotlin"}, {".kts", "kotlin"},
+        {".json", "json"}, {".yaml", "yaml"}, {".yml", "yaml"}, {".sh", "shell"}, {".sql", "sql"},
         {".css", "css"}, {".html", "html"}, {".xml", "html"}
     };
     for (size_t i = 0; i < sizeof pairs / sizeof pairs[0]; i++)
