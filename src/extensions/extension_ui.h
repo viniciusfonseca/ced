@@ -1,6 +1,7 @@
 #ifndef CED_EXTENSION_UI_H
 #define CED_EXTENSION_UI_H
 #include "manager.h"
+#include "graph_ui.h"
 #include <cui/cui.h>
 /* Returns true when the user requests to install an extension. */
 bool ced_extensions_panel(cui_ctx *ui, const CedExtensions *manager);
@@ -10,4 +11,15 @@ bool ced_extension_tab_buttons(cui_ctx *ui, CedExtensions *manager, bool termina
 bool ced_extension_has_tabs(const CedExtensions *manager, bool terminal);
 void ced_extension_tab_body(cui_ctx *ui, CedExtensions *manager, const char *selected);
 void ced_extensions_ui(cui_ctx *ui, CedExtensions *manager);
+typedef struct {
+    cui_texture texture;
+    uint64_t document, serial;
+    cui_image_view view;
+    CedExtensionGraphView graph;
+} CedExtensionPreviewView;
+
+void ced_extension_preview_body(cui_ctx *ui, CedExtensionPreviewView *view, CedExtensionInstance *instance,
+                                const CedExtensionRenderer *renderer, const CedDocument *document);
+void ced_extension_preview_view_clear(cui_ctx *ui, CedExtensionPreviewView *view);
+
 #endif

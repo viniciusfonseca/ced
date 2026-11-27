@@ -56,6 +56,9 @@ typedef struct {
     bool lsp_synced;
     int cursor, anchor;
     bool markdown_preview;
+#ifdef CED_ENABLE_EXTENSIONS
+    bool renderer_source, extension_preview;
+#endif
 } EditorTab;
 
 typedef enum { CED_FILE_CREATE, CED_FILE_RENAME, CED_FILE_DELETE, CED_DIRECTORY_CREATE } FileOperation;
@@ -172,6 +175,7 @@ typedef struct {
     size_t selection_anchor, selection_cursor;
 #ifdef CED_ENABLE_EXTENSIONS
     CedExtensions *extensions;
+    CedExtensionPreviewView extension_view;
     char sidebar_tab[257];
 #endif
 } Editor;
@@ -1392,6 +1396,9 @@ static void markdown_preview(cui_ctx *ui, Editor *e, EditorTab *tab) {
 }
 
 static void editor_pane(cui_ctx *ui, Editor *e) {
+#ifdef CED_ENABLE_EXTENSIONS
+    bool preview_visible = false;
+#endif
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .bg = CUI_COLOR_SURFACE, .clip = true) {
         if (e->count) {
             cui_doc_tab tabs[MAX_DOCS];
@@ -1426,11 +1433,30 @@ static void editor_pane(cui_ctx *ui, Editor *e) {
                           .size = e->font_size);
         } else if (e->selected >= 0 && e->selected < e->count) {
             EditorTab *tab = &e->docs[e->selected];
-            bool assist_enabled = !e->close_dialog && !e->commit_dialog && !e->git_discard.open && !e->file_action.open && !e->palette && !extension_modal(e) && ced_lsp_language(tab->file.path);
-            if (!assist_enabled) ced_assist_reset(&e->assist);
-            int accepted = assist_enabled ? ced_assist_keys(ui, &e->assist) : -1;
-            if (accepted >= 0) apply_completion(ui, e, accepted);
-            if (ced_markdown_file(tab->file.path)) {
+            bool markdown = ced_markdown_file(tab->file.path);
+#ifdef CED_ENABLE_EXTENSIONS
+            CedExtensionInstance *provider;
+            const CedExtensionRenderer *renderer = ced_extensions_renderer(e->extensions, tab->file.path, &provider);
+            if (renderer && (e->goto_line > 0 || e->goto_offset >= 0)) tab->renderer_source = true;
+            bool authorized = provider && ced_extensions_authorized(provider, &tab->file);
+            tab->extension_preview = authorized && !tab->renderer_source;
+            if (renderer) {
+                markdown = tab->markdown_preview = false;
+                cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_END) {
+                    if (cui_button(ui, tab->extension_preview ? "Source" : renderer->title,
+                            .icon = tab->extension_preview ? CUI_ICON_CODE : CUI_ICON_EYE, .size = CUI_SIZE_SM)) {
+                        if (!e->extensions->trusted) e->extensions->trust_open = true;
+                        else if (!authorized) notify(e, "Allow the extension to read this document in Manage Extensions.");
+                        else {
+                            tab->renderer_source = tab->extension_preview;
+                            tab->extension_preview = !tab->renderer_source;
+                            tab->focus = tab->renderer_source;
+                        }
+                    }
+                }
+            }
+#endif
+            if (markdown) {
                 cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_END) {
                     cui_theme *theme = cui_theme_get(ui);
                     float radius = theme->radius_control;
@@ -1441,10 +1467,26 @@ static void editor_pane(cui_ctx *ui, Editor *e) {
                     if (clicked) dispatch(e, "ced.markdown.toggle");
                 }
             }
-            if (tab->markdown_preview && ced_markdown_file(tab->file.path)) {
+#ifdef CED_ENABLE_EXTENSIONS
+            if (tab->extension_preview) {
+                preview_visible = true;
+                ced_assist_reset(&e->assist);
+                cui_push_id_int(ui, tab->id);
+                if (provider->record.granted & CED_EXT_EDIT)
+                    ced_editor_prime(ui, "source", tab->anchor, tab->cursor);
+                ced_extension_preview_body(ui, &e->extension_view, provider, renderer, &tab->file);
+                cui_pop_id(ui);
+            } else
+#endif
+            if (tab->markdown_preview && markdown) {
                 ced_assist_reset(&e->assist);
                 markdown_preview(ui, e, tab);
             } else {
+                bool assist_enabled = !e->close_dialog && !e->commit_dialog && !e->git_discard.open &&
+                    !e->file_action.open && !e->palette && !extension_modal(e) && ced_lsp_language(tab->file.path);
+                if (!assist_enabled) ced_assist_reset(&e->assist);
+                int accepted = assist_enabled ? ced_assist_keys(ui, &e->assist) : -1;
+                if (accepted >= 0) apply_completion(ui, e, accepted);
                 cui_push_id_int(ui, tab->id);
                 bool complete = assist_enabled && ced_editor_completion_key(ui, "source");
                 if (tab->focus && e->goto_line <= 0 && e->goto_offset < 0)
@@ -1494,6 +1536,9 @@ static void editor_pane(cui_ctx *ui, Editor *e) {
             }
         }
     }
+#ifdef CED_ENABLE_EXTENSIONS
+    if (!preview_visible && e->extension_view.serial) ced_extension_preview_view_clear(ui, &e->extension_view);
+#endif
 }
 
 static void set_terminal_position(Editor *e, bool right) {
@@ -1713,8 +1758,12 @@ static CedCommandContext editor_context(void *user) {
     Editor *e = user;
     EditorTab *tab = e->selected >= 0 && e->selected < e->count ? &e->docs[e->selected] : NULL;
     bool has_document = tab && !e->diff && !tab->markdown_preview;
+    bool source_focus = has_document;
+#ifdef CED_ENABLE_EXTENSIONS
+    source_focus = source_focus && !tab->extension_preview;
+#endif
     uint64_t document = has_document ? tab->file.id : 0;
-    size_t anchor = has_document ? (size_t)tab->anchor : 0, cursor = has_document ? (size_t)tab->cursor : 0;
+    size_t anchor = source_focus ? (size_t)tab->anchor : 0, cursor = source_focus ? (size_t)tab->cursor : 0;
     if (!e->selection_version || e->selection_document != document || e->selection_anchor != anchor || e->selection_cursor != cursor) {
         e->selection_version++; e->selection_document = document;
         e->selection_anchor = anchor; e->selection_cursor = cursor;
@@ -1725,7 +1774,7 @@ static CedCommandContext editor_context(void *user) {
 #endif
     const char *language = has_document ? ced_language(tab->file.path) : NULL;
     return (CedCommandContext){document, has_document ? tab->file.version : 0, e->selection_version,
-        anchor, cursor, has_document, has_document && !e->terminal_view.focused && !e->output_focused && !extension_modal(e), trusted, language ? language : "text"};
+        anchor, cursor, has_document, source_focus && !e->terminal_view.focused && !e->output_focused && !extension_modal(e), trusted, language ? language : "text"};
 }
 
 #ifdef CED_ENABLE_EXTENSIONS
@@ -2035,7 +2084,11 @@ static void frame(cui_ctx *ui, Editor *e) {
                 ced_lsp_diagnostics(server,path,&count);
                 char problems[40]; snprintf(problems, sizeof problems, "Problems: %d", count);
                 if (ced_lsp_language(e->docs[e->selected].file.path) && cui_status_bar_item(ui, problems, .icon = CUI_ICON_TRIANGLE_ALERT)) e->problems_open = !e->problems_open;
-                if (!e->docs[e->selected].markdown_preview) {
+                if (!e->docs[e->selected].markdown_preview
+#ifdef CED_ENABLE_EXTENSIONS
+                    && !e->docs[e->selected].extension_preview
+#endif
+                ) {
                     char position[64];
                     snprintf(position, sizeof position, "Ln %d, Col %d", e->caret.line, e->caret.column);
                     cui_status_bar_text(ui, position, .tone = CUI_TONE_NEUTRAL);
@@ -2095,6 +2148,9 @@ static void editor_free(Editor *e) {
     ced_git_free(&e->git);
     free(e->before); free(e->after);
     if (e->app) {
+#ifdef CED_ENABLE_EXTENSIONS
+        ced_extension_preview_view_clear(cui_app_ui(e->app), &e->extension_view);
+#endif
         if (e->logo) cui_image_destroy(cui_app_ui(e->app), e->logo);
         cui_app_destroy(e->app);
     }

@@ -4,6 +4,80 @@
 #include <string.h>
 #include <math.h>
 
+typedef struct { cui_texture texture; int width, height; } PreviewSurface;
+
+static cui_rect fit_preview(cui_rect bounds, const PreviewSurface *surface) {
+    float scale = fminf(bounds.w / surface->width, bounds.h / surface->height);
+    float width = surface->width * scale, height = surface->height * scale;
+    return (cui_rect){bounds.x + (bounds.w - width) * 0.5f, bounds.y + (bounds.h - height) * 0.5f, width, height};
+}
+
+static void paint_preview(cui_ctx *ui, cui_rect bounds, void *user) {
+    const PreviewSurface *surface = user;
+    cui_draw_image(ui, surface->texture, fit_preview(bounds, surface), (cui_rect){0, 0, 1, 1},
+                   CUI_CORNERS(0), (cui_color){255, 255, 255, 255});
+}
+
+void ced_extension_preview_view_clear(cui_ctx *ui, CedExtensionPreviewView *view) {
+    if (view->texture) cui_image_destroy(ui, view->texture);
+    *view = (CedExtensionPreviewView){0};
+}
+
+void ced_extension_preview_body(cui_ctx *ui, CedExtensionPreviewView *view, CedExtensionInstance *instance,
+                                const CedExtensionRenderer *renderer, const CedDocument *document) {
+    const CedExtensionPreview *preview = ced_extensions_preview(instance, renderer, document);
+    if (view->document != document->id) ced_extension_preview_view_clear(ui, view);
+    if (preview->serial != view->serial) {
+        if (view->texture) cui_image_destroy(ui, view->texture);
+        view->texture = preview->image.pixels ? cui_image_create(ui, preview->image.width,
+            preview->image.height, preview->image.pixels) : 0;
+        view->document = document->id;
+        view->serial = preview->serial;
+    }
+    if (*preview->error) {
+        view->graph.geometry_pending = false;
+        cui_row(ui, .pad = 8, .gap = 6, .align = CUI_ALIGN_CENTER) {
+            cui_text(ui, preview->error, .width = CUI_FILL);
+            if (cui_button(ui, "Retry", .size = CUI_SIZE_SM)) ced_extensions_preview_clear(instance->manager);
+        }
+        return;
+    }
+    if (preview->graph) {
+        bool editable = (instance->record.granted & CED_EXT_EDIT) != 0;
+        bool busy = *instance->pending || preview->graph_version != document->version;
+        cJSON *edit = ced_extension_graph_body(ui, &view->graph, preview, editable, busy);
+        if (edit) {
+            const char *type = ced_ext_json_string(edit, "type");
+            if (ced_extensions_graph_edit(instance, renderer, document, edit))
+                view->graph.geometry_pending = type && (!strcmp(type, "moveNode") || !strcmp(type, "resizeNode"));
+            cJSON_Delete(edit);
+        }
+        return;
+    }
+    if (!view->texture) {
+        if (preview->serial) cui_secondary(ui, "Could not display the extension preview.");
+        else cui_row(ui, .pad = 8, .gap = 6, .align = CUI_ALIGN_CENTER) {
+            cui_spinner(ui, 12, .style = CUI_SPINNER_ARC);
+            cui_secondary(ui, "Rendering preview...");
+        }
+        return;
+    }
+    if (!preview->image.interactive) {
+        cui_image_viewer(ui, "extension-image", view->texture, preview->image.width,
+                         preview->image.height, &view->view, .height = CUI_FILL);
+        return;
+    }
+    PreviewSurface surface = {view->texture, preview->image.width, preview->image.height};
+    cui_canvas_result hit = cui_canvas(ui, "extension-image", CUI_FILL, CUI_FILL, paint_preview, &surface, sizeof surface);
+    if (hit.clicked) {
+        cui_rect image = fit_preview((cui_rect){0, 0, hit.rect.w, hit.rect.h}, &surface);
+        float x = hit.mouse.x - image.x, y = hit.mouse.y - image.y;
+        if (x >= 0 && y >= 0 && x < image.w && y < image.h)
+            ced_extensions_preview_click(instance, renderer, document, (int)(x * surface.width / image.w),
+                                         (int)(y * surface.height / image.h));
+    }
+}
+
 const CedExtensionTab *ced_extension_tab_find(CedExtensions *m, const char *id,
     CedExtensionInstance **owner, size_t *index) {
     if (!m || !*id) return NULL;
@@ -694,6 +768,10 @@ void ced_extensions_ui(cui_ctx *ui, CedExtensions *m) {
             for (size_t n = 0; n < r->manifest.tab_count; n++) {
                 const CedExtensionTab *tab = &r->manifest.tabs[n];
                 cui_textf(ui, "%s tab: %s", tab->terminal ? "Terminal" : "Sidebar", tab->title);
+            }
+            for (size_t n = 0; n < r->manifest.renderer_count; n++) {
+                const CedExtensionRenderer *renderer = &r->manifest.renderers[n];
+                cui_textf(ui, "Document preview: %s (%s)", renderer->title, renderer->extension);
             }
             if (r->manifest.capabilities & CED_EXT_READ) cui_text(ui, "Permission: read authorized open documents", .size = 13);
             if (r->manifest.capabilities & CED_EXT_EDIT) cui_text(ui, "Permission: edit authorized open documents", .size = 13);

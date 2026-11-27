@@ -17,6 +17,112 @@ All offsets are UTF-8 bytes, not character indexes or UTF-16 units. Documents ha
 
 Requests include the initialization context. Stale session/workspace/generation, document revision and optional selection revision are checked before a commit. A workspace switch invalidates requests before closing documents. Extension text edits run at the start of a UI frame, before rendering consumes buffer pointers. Document reads include unsaved text; API edits never save to disk. Legacy non-UTF-8 buffers remain open but text access returns `Unavailable`.
 
+## Document renderers
+
+Executable extensions with `documents.read` can declare up to eight renderers in
+`contributes.documentRenderers`. Each entry has a filename extension, a title
+and a command declared by the same package. Use a dot followed by 1–16 lowercase
+ASCII letters, digits, hyphens or underscores for the filename extension. CED
+matches suffixes case-insensitively. If multiple enabled extensions with read
+access claim the same suffix, the first extension ID in lexical order wins.
+
+This manifest fragment registers a renderer for an Agentic Solutions diagram.
+
+```json
+{
+  "capabilities": ["documents.read"],
+  "activationEvents": ["onCommand:example.solutions.render"],
+  "contributes": {
+    "commands": [{"id": "example.solutions.render", "title": "Render Solution"}],
+    "documentRenderers": [
+      {"extension": ".asln", "title": "Diagram", "command": "example.solutions.render"}
+    ]
+  }
+}
+```
+
+CED advertises `host.documentRenderProtocol: 1` in `ced/initialize`. Opening a
+matching text document in a trusted workspace activates its renderer when the
+extension has access to the document. Use **Source** to edit the file and the
+renderer title to return to the preview. Opening at a specific line shows the
+source. An extension command condition can use `hasDocument`, `workspaceTrusted`
+and `languageId`. Renderer invocations have an empty selection and no text focus.
+
+The host sends `commands/invoke` with the document's version in
+`params.editor.document` and `arguments: [{"action":"render","extension":".asln"}]`.
+Fetch the captured document through `documents/get` using its `documentId` and
+the request context. This includes unsaved text. Draw the image in the extension
+process and return this shape as the command result.
+
+```json
+{
+  "render": {
+    "width": 1,
+    "height": 1,
+    "rgba": "Nn3S/w==",
+    "interactive": false
+  }
+}
+```
+
+`rgba` contains standard padded base64 of `width × height × 4` straight RGBA8
+bytes, in row-major order starting at the top left. The edge limit is 1,024
+pixels and is advertised as `limits.maxRenderImageEdge`. The JSON-RPC response
+limit is advertised as `limits.maxRenderResultBytes`. The default viewer supports
+zoom and pan. With `interactive: true` the image is fitted to the pane and CED
+sends `{"action":"click","extension":".asln","x":12,"y":34}` in the arguments
+array. Coordinates are zero-based image pixels. Return another frame to update
+the surface after the click. The editor owns the preview surface and the
+extension owns every pixel shown inside it.
+
+The host displays results only for the matching open document revision. The
+preview invocations have read access through the normal document grants. When
+`host.documentRenderEdits` is true, a click may also call `documents/applyEdits`
+with the normal edit grant, the active preview document ID, and the clicked
+revision as `expectedVersion`. CED applies the edit to the buffer with undo
+history and renders the new revision. Automatic render events have read access.
+Ordinary palette invocations still use `arguments: null`.
+
+### Native graph previews
+
+When the host advertises `host.documentGraphProtocol: 3`, a document renderer
+can return a `graph` object in its command result. CED draws this graph in its
+own UI and processes pointer gestures locally. The `render` response remains
+available for extensions that provide an RGBA image.
+
+A graph contains a `nodes` array (up to 64 items) and a `links` array (up to
+256 items). A node has `label`, `x`, `y`, `width` and `height` fields. Node
+positions are signed integer coordinates from -8,388,607 to 8,388,607. The
+initial viewport fits the original 960 by 620 logical surface, whose canvas
+begins at y=84. Node sizes range from 40 by 28 to 960 by 620. Each link has `from`, `to`, `style`
+(`solid`, `dotted`, `dashed`) and `direction` (`none`, `forward`, `backward`,
+`both`). Each endpoint has a zero-based `node` index, a `side` (`top`,
+`right`, `bottom`, `left`) and a fractional `offset` between 0 and 1.
+
+With the edit grant, CED sends one `graphEdit` invocation per completed change.
+The first argument carries `action: "graphEdit"`, the renderer's `extension`
+and an `edit` object. The edit is one of these forms.
+
+```json
+{"type":"moveNode","node":0,"x":160,"y":180}
+{"type":"addNode","x":250,"y":340}
+{"type":"editNode","node":0,"label":"Review","width":170,"height":70}
+{"type":"resizeNode","node":0,"x":140,"y":170,"width":190,"height":80}
+{"type":"removeElements","nodes":[0,2],"links":[1]}
+{"type":"removeNodes","nodes":[0,2]}
+{"type":"addLink","link":{"from":{"node":0,"side":"right","offset":0.3},"to":{"node":1,"side":"left","offset":0.7},"style":"dashed","direction":"both"}}
+```
+
+Node indices refer to the graph for the document revision in the invocation.
+`moveNode` uses the top-left position and `addNode` uses the center of the
+new node. `resizeNode` changes the position and size in one edit.
+`removeElements` deletes the specified node and link indices, plus any links
+attached to deleted nodes. Either index array may be empty or omitted.
+Protocol 2 supports `editNode` and `removeNodes`. Protocol 1 supports bounded
+placement and the original `moveNode`, `addNode` and `addLink` edits. The extension applies document changes through `documents/applyEdits` with
+that revision as `expectedVersion`. CED requests a new graph after the buffer
+revision changes.
+
 ## Native tab contributions
 
 The host advertises `host.tabProtocol: 1` in `ced/initialize`. A manifest can declare up to four tabs under `contributes.tabs`. Each has an extension-owned `id`, a `title` of up to 80 UTF-8 bytes, a `panel` of `"sidebar"` or `"terminal"`, and a `command` declared by the same extension. Each tab uses a different command with its normal `onCommand` activation and conditions.

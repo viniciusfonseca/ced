@@ -58,6 +58,8 @@ static void reset(void) {
     *instance->pending = *instance->command = *instance->error = 0;
     instance->state = EXT_ACTIVE; instance->last_request = 0; instance->violations = 0;
     instance->grant_count = 0; instance->invocation_document = 0;
+    instance->render_request = 0; instance->render_click = false;
+    manager->preview = (CedExtensionPreview){0};
     instance->record.granted = CED_EXT_READ | CED_EXT_EDIT;
     strcpy(host.document.text,"abc"); host.document.version = 7; host.document.length = 3; host.commits = 0;
     host.reject_commit = false;
@@ -84,6 +86,24 @@ static cJSON *expect_error(int code) {
     assert(cJSON_IsObject(error) && cJSON_GetObjectItemCaseSensitive(error,"code")->valueint == code);
     assert(ced_ext_rpc_failure_valid(error)); return json;
 }
+static void renderer_edit_tests(void) {
+    for (int scenario = 0; scenario < 5; scenario++) {
+        reset();
+        instance->render_request = 1;
+        instance->render_click = scenario != 0;
+        manager->preview = (CedExtensionPreview){
+            .key = scenario == 1 ? 2 : 1,
+            .document = scenario == 2 ? 2 : 1,
+            .version = scenario == 3 ? 6 : 7,
+        };
+        dispatch(edit_request(7));
+        cJSON *reply = scenario == 4 ? answer() : expect_error(-32001);
+        assert(host.commits == (scenario == 4 ? 1u : 0u));
+        cJSON_Delete(reply);
+    }
+    reset();
+}
+
 static void allocation_tests(void) {
     reset(); cJSON *json = edit_request(7);
     allocations = 0; fail_at = SIZE_MAX; cJSON_Hooks hooks = {fault_malloc,free}; cJSON_InitHooks(&hooks);
@@ -229,7 +249,7 @@ int main(void) {
     pthread_mutex_init(&process->mutex,NULL);
     instance = &manager->instances[0]; instance->manager = manager; instance->process = process;
     strcpy(instance->session,"test-session"); instance->record.valid = instance->record.enabled = true;
-    allocation_tests(); protocol_tests(); revocation_tests(inside); frame_budget_test(); contention_test(); reset();
+    allocation_tests(); protocol_tests(); renderer_edit_tests(); revocation_tests(inside); frame_budget_test(); contention_test(); reset();
     pthread_mutex_destroy(&process->mutex); free(process); free(manager); ced_document_free(&host.document);
     assert(ced_file_delete(parent,root,error));
     puts("OK: broker allocation failures, queue reservations, stale/error metadata, optional fields, notification abuse and document revocation");

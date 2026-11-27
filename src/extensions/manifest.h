@@ -7,6 +7,7 @@
 #define CED_EXTENSION_LIMIT 8
 #define CED_EXTENSION_COMMAND_LIMIT 100
 #define CED_EXTENSION_TAB_LIMIT 4
+#define CED_EXTENSION_RENDERER_LIMIT 8
 #define CED_EXTENSION_MANIFEST_LIMIT (256 * 1024)
 #define CED_EXTENSION_PACKAGE_LIMIT (64 * 1024 * 1024)
 #define CED_EXTENSION_FILE_LIMIT 2000
@@ -25,6 +26,10 @@ typedef struct {
     bool terminal;
 } CedExtensionTab;
 typedef struct {
+    char extension[18], title[81];
+    size_t command;
+} CedExtensionRenderer;
+typedef struct {
     char id[129], name[513], version[64], description[513], entrypoint[CED_PATH];
     unsigned capabilities, language_servers;
     bool executable;
@@ -32,6 +37,8 @@ typedef struct {
     size_t command_count;
     CedExtensionTab tabs[CED_EXTENSION_TAB_LIMIT];
     size_t tab_count;
+    CedExtensionRenderer renderers[CED_EXTENSION_RENDERER_LIMIT];
+    size_t renderer_count;
     cJSON *configuration, *requirements;
 } CedExtensionManifest;
 

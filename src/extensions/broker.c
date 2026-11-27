@@ -108,6 +108,13 @@ static bool apply(CedExtensionInstance *i, const char *id, const cJSON *p, CedEx
     CedCommandContext current = i->manager->host.context(i->manager->host.user);
     if (expected && !ced_ext_json_uint(expected, &selection_version)) goto invalid;
     if (version != d.document->version) { snprintf(error, CED_ERROR, "StaleDocument"); return false; }
+    if (i->render_request) {
+        const CedExtensionPreview *preview = &i->manager->preview;
+        if (!i->render_click || preview->key != i->render_request || preview->document != d.document->id ||
+            preview->version != version || !current.has_document || current.document_id != d.document->id) {
+            snprintf(error, CED_ERROR, "PermissionDenied"); return false;
+        }
+    }
     if (expected && (current.selection_version != selection_version || current.document_id != d.document->id)) {
         snprintf(error, CED_ERROR, "StaleEditorContext"); return false;
     }
@@ -211,7 +218,8 @@ void ced_extensions_broker(CedExtensionInstance *i, const cJSON *message) {
             }
         }
     } else if (!strcmp(method, "editor/getContext") || !strcmp(method, "documents/list") || !strcmp(method, "documents/get") || !strcmp(method, "documents/applyEdits")) {
-        if (!(i->record.granted & CED_EXT_READ) || (!strcmp(method,"documents/applyEdits") && !(i->record.granted & CED_EXT_EDIT))) snprintf(error, sizeof error, "PermissionDenied");
+        if (!(i->record.granted & CED_EXT_READ) || (!strcmp(method,"documents/applyEdits") &&
+            (!(i->record.granted & CED_EXT_EDIT) || (i->render_request && !i->render_click)))) snprintf(error, sizeof error, "PermissionDenied");
         else if (!strcmp(method, "editor/getContext")) result = ced_extensions_editor(i, i->manager->host.context(i->manager->host.user));
         else if (!strcmp(method, "documents/list")) {
             result = cJSON_CreateObject(); cJSON *array = cJSON_AddArrayToObject(result, "documents"); CedExtensionDocument d;

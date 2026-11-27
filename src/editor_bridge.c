@@ -133,6 +133,18 @@ void ced_editor_touch(cui_ctx *ui, const char *id) {
     cui__state_entry(ui, cui_make_id(ui, id) ^ EDITOR_SALT);
 }
 
+void ced_editor_prime(cui_ctx *ui, const char *id, int anchor, int cursor) {
+    cui_id key = cui_make_id(ui, id) ^ EDITOR_SALT;
+    cui_state_entry *entry = cui__state_entry(ui, key);
+    if (entry->data) return;
+    cui_code_editor_select(ui, id, anchor, cursor);
+    entry = cui__state_entry(ui, key);
+    cui_edit_state *state = entry->data;
+    state->anchor = anchor;
+    state->cursor = cursor;
+    cui__edit_attach(ui, key, state);
+}
+
 int ced_editor_tabs_close_menu(cui_ctx *ui, const char *id, const cui_doc_tab *tabs, int count) {
     cui_id previous = ui->last_id;
     ui->last_id = 0;

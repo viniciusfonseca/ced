@@ -247,7 +247,7 @@ Executables are **not sandboxed**: they run with your operating-system user perm
 
 Use `ced --disable-extensions /path/to/project` to skip extension loading and execution. To omit the subsystem entirely, build with `make EXTENSIONS=OFF BUILD_DIR=build-no-extensions` or configure CMake with `-DCED_ENABLE_EXTENSIONS=OFF`.
 
-Extensions can contribute [native tabs](docs/extensions.md#native-tab-contributions) to the sidebar and terminal panel. See the [implemented host profile](docs/extensions.md), [native example](examples/extensions/uppercase-selection/README.md), and [draft authoring specification](docs/extension-authoring-spec.md) for the experimental API `1.0` and its supported features.
+Extensions can render custom file formats in the editor through [document renderers](docs/extensions.md#document-renderers). They can also contribute [native tabs](docs/extensions.md#native-tab-contributions) to the sidebar and terminal panel. See the [implemented host profile](docs/extensions.md), [native example](examples/extensions/uppercase-selection/README.md), and [draft authoring specification](docs/extension-authoring-spec.md) for the experimental API `1.0` and its supported features.
 
 ## Tests
 

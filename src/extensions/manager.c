@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 static const char *const methods[] = {"editor/getContext", "documents/list", "documents/get",
@@ -12,6 +13,8 @@ static void clear_tab_state(CedExtensionInstance *i) {
     cJSON_Delete(i->invocation_arguments);
     i->invocation_arguments = NULL;
     i->tab_action = false;
+    i->render_request = 0;
+    i->render_click = false;
     for (size_t n = 0; n < i->record.manifest.tab_count; n++) {
         cJSON_Delete(i->tabs[n].model);
         i->tabs[n] = (CedExtensionTabState){0};
@@ -54,6 +57,23 @@ static void request(CedExtensionInstance *i, const char *method, cJSON *params, 
     ced_extension_process_send(i->process, message);
 }
 
+void ced_extensions_preview_clear(CedExtensions *m) {
+    if (!m) return;
+    ced_extension_image_free(&m->preview.image);
+    free(m->preview.graph);
+    m->preview = (CedExtensionPreview){0};
+}
+
+/* Keep the last native graph visible while the active document is refreshed. */
+static void invalidate_preview(CedExtensions *m, bool keep_graph) {
+    if (!keep_graph || !m->preview.graph) {
+        ced_extensions_preview_clear(m);
+        return;
+    }
+    m->preview.key = m->preview.version = 0;
+    m->preview.error[0] = 0;
+}
+
 void ced_extensions_stop(CedExtensionInstance *i, const char *reason) {
     if (i->process && i->state != EXT_STOPPING) {
         if (*i->pending) {
@@ -76,6 +96,7 @@ void ced_extensions_stop(CedExtensionInstance *i, const char *reason) {
     cJSON_Delete(i->invocation_editor); i->invocation_editor = NULL;
     i->retain_on_workspace_change = i->rebind_workspace = false;
     clear_tab_state(i);
+    if (i->manager && i->manager->preview.owner == i) ced_extensions_preview_clear(i->manager);
 }
 
 void ced_extensions_violation(CedExtensionInstance *i, const char *reason) {
@@ -118,6 +139,10 @@ unsigned ced_extensions_document_access(const CedExtensions *m, const CedDocumen
 
 void ced_extensions_document_changed(CedExtensions *m, const CedDocument *document, unsigned previous_access) {
     if (!m) return;
+    CedExtensionPreview *preview = &m->preview;
+    if (preview->document == document->id)
+        invalidate_preview(m, preview->graph_version != document->version &&
+            preview->owner && ced_extensions_authorized(preview->owner, document));
     for (size_t n = 0; n < m->count; n++)
         if ((previous_access & (1u << n)) && !ced_extensions_authorized(&m->instances[n], document))
             ced_extensions_stop(&m->instances[n], "restart");
@@ -125,6 +150,7 @@ void ced_extensions_document_changed(CedExtensions *m, const CedDocument *docume
 
 void ced_extensions_document_closed(CedExtensions *m, uint64_t id) {
     if (!m) return;
+    if (m->preview.document == id) ced_extensions_preview_clear(m);
     for (size_t n = 0; n < m->count; n++) {
         CedExtensionInstance *i = &m->instances[n];
         if (i->invocation_document == id) ced_extensions_stop(i, "restart");
@@ -168,6 +194,9 @@ static void initialize(CedExtensionInstance *i) {
     cJSON_AddStringToObject(host, "name", "CED"); cJSON_AddStringToObject(host, "version", CED_EXTENSION_APP_VERSION);
     cJSON_AddNumberToObject(host, "tabProtocol", 1);
     cJSON_AddNumberToObject(host, "tabWidgets", 10);
+    cJSON_AddNumberToObject(host, "documentRenderProtocol", 1);
+    cJSON_AddNumberToObject(host, "documentGraphProtocol", 3);
+    cJSON_AddBoolToObject(host, "documentRenderEdits", true);
     cJSON_AddBoolToObject(host, "workspaceChanges", true);
     cJSON *extension = cJSON_AddObjectToObject(p, "extension");
     cJSON_AddStringToObject(extension, "id", i->record.manifest.id);
@@ -184,7 +213,8 @@ static void initialize(CedExtensionInstance *i) {
         {"maxHeaderBytes",1024},{"maxMessageBytes",8388608},{"maxJsonDepth",64},
         {"maxQueuedBytes",8388608},{"maxPendingRequests",8},{"maxDocumentBytes",2097152},
         {"maxEditsPerTransaction",1000},{"maxSubscriptions",1},{"maxCommandArgumentsBytes",65536},
-        {"maxCommandResultBytes",65536},{"maxStateBytes",262144},{"maxPresentationBytes",512},
+        {"maxCommandResultBytes",65536},{"maxRenderResultBytes",CED_EXTENSION_RENDER_RESULT_LIMIT},
+        {"maxRenderImageEdge",CED_EXTENSION_RENDER_EDGE},{"maxStateBytes",262144},{"maxPresentationBytes",512},
         {"maxLogMessageBytes",8192},{"maxLogBytesPerSecond",65536},{"maxMessagesPer10Seconds",5},
         {"initializeTimeoutMs",3000},{"activateTimeoutMs",2000},{"commandTimeoutMs",5000},
         {"serviceTimeoutMs",1000},{"deactivateTimeoutMs",500}};
@@ -194,7 +224,7 @@ static void initialize(CedExtensionInstance *i) {
 }
 
 static bool execute_command(CedExtensionInstance *i, const char *id, const CedCommandContext *context,
-                            cJSON *arguments, char *error) {
+                            cJSON *arguments, uint64_t render_request, char *error) {
     CedExtensions *m = i->manager;
     const char *failure = NULL;
     if (!m->trusted) failure = "Trust this workspace in Manage Extensions before running extensions.";
@@ -207,12 +237,13 @@ static bool execute_command(CedExtensionInstance *i, const char *id, const CedCo
     if (failure) { snprintf(error, CED_ERROR, "%s", failure); return false; }
     *i->error = 0;
     snprintf(i->command, sizeof i->command, "%s", id);
-    i->invocation_editor = ced_extensions_editor(i, arguments ? (CedCommandContext){0} : *context);
+    i->invocation_editor = ced_extensions_editor(i, arguments && !render_request ? (CedCommandContext){0} : *context);
     if (!i->invocation_editor) { *i->command = 0; snprintf(error, CED_ERROR, "ResourceLimit: editor context allocation"); return false; }
-    i->invocation_document = !arguments && context->has_document ? context->document_id : 0;
+    i->invocation_document = (!arguments || render_request) && context->has_document ? context->document_id : 0;
     if (i->process) {
         i->invocation_arguments = arguments;
-        i->tab_action = arguments != NULL;
+        i->tab_action = arguments && !render_request;
+        i->render_request = render_request;
         invoke(i);
         return true;
     }
@@ -223,13 +254,14 @@ static bool execute_command(CedExtensionInstance *i, const char *id, const CedCo
     i->process = ced_extension_process_start(m->profile, &i->record, i->session, error);
     if (!i->process) { *i->command = 0; i->invocation_document = 0; cJSON_Delete(i->invocation_editor); i->invocation_editor = NULL; return false; }
     i->invocation_arguments = arguments;
-    i->tab_action = arguments != NULL;
+    i->tab_action = arguments && !render_request;
+    i->render_request = render_request;
     initialize(i);
     return true;
 }
 
 static bool execute(void *user, const char *id, const CedCommandContext *context, char *error) {
-    return execute_command(user, id, context, NULL, error);
+    return execute_command(user, id, context, NULL, 0, error);
 }
 
 bool ced_extensions_tab_action(CedExtensionInstance *i, size_t tab_index, const char *action, const char *value) {
@@ -250,13 +282,141 @@ bool ced_extensions_tab_action(CedExtensionInstance *i, size_t tab_index, const 
         return false;
     }
     char error[CED_ERROR] = {0};
-    if (ced_ext_json_append(args, event) && execute_command(i, command->id, &context, args, error)) {
+    if (ced_ext_json_append(args, event) && execute_command(i, command->id, &context, args, 0, error)) {
         i->tabs[tab_index].requested = true;
         return true;
     }
     cJSON_Delete(args);
     report(i->manager, *error ? error : "Could not send the extension tab action.");
     return false;
+}
+
+const CedExtensionRenderer *ced_extensions_renderer(CedExtensions *m, const char *path,
+                                                    CedExtensionInstance **owner) {
+    *owner = NULL;
+    const char *suffix = strrchr(ced_basename(path), '.');
+    if (!m || !suffix) return NULL;
+    const CedExtensionRenderer *match = NULL;
+    for (size_t n = 0; n < m->count; n++) {
+        CedExtensionInstance *i = &m->instances[n];
+        if (!i->record.valid || !i->record.enabled || !(i->record.granted & CED_EXT_READ)) continue;
+        if (*owner && strcmp(i->record.manifest.id, (*owner)->record.manifest.id) > 0) continue;
+        for (size_t r = 0; r < i->record.manifest.renderer_count; r++) {
+            const CedExtensionRenderer *renderer = &i->record.manifest.renderers[r];
+            if (!strcasecmp(suffix, renderer->extension)) { match = renderer; *owner = i; break; }
+        }
+    }
+    return match;
+}
+
+static bool preview_waiting(const CedExtensionInstance *i) {
+    return i->manager->job.running || i->manager->reload || i->state == EXT_STOPPING || *i->pending;
+}
+
+static bool request_preview(CedExtensionInstance *i, const CedExtensionRenderer *renderer, const CedDocument *doc,
+                            const char *action, int x, int y, const cJSON *edit) {
+    CedExtensions *m = i->manager;
+    if (preview_waiting(i) || !ced_extensions_authorized(i, doc)) return false;
+    char *error = m->preview.error;
+    const CedExtensionCommand *command = &i->record.manifest.commands[renderer->command];
+    CedCommandContext context = {
+        .document_id = doc->id, .version = doc->version, .has_document = true,
+        .workspace_trusted = m->trusted, .language_id = ced_language(doc->path)
+    };
+    if (!ced_command_condition(&command->when, &context)) {
+        snprintf(error, CED_ERROR, "The extension preview is unavailable for this document.");
+        return false;
+    }
+    bool click = !strcmp(action, "click");
+    cJSON *args = cJSON_CreateArray(), *event = cJSON_CreateObject();
+    bool ok = args && event && cJSON_AddStringToObject(event, "extension", renderer->extension) &&
+        cJSON_AddStringToObject(event, "action", action) &&
+        (!click || (cJSON_AddNumberToObject(event, "x", x) && cJSON_AddNumberToObject(event, "y", y))) &&
+        (!edit || ced_ext_json_add(event, "edit", cJSON_Duplicate(edit, true)));
+    if (!ok || !cJSON_AddItemToArray(args, event)) {
+        cJSON_Delete(event); cJSON_Delete(args);
+        snprintf(error, CED_ERROR, "Could not prepare extension preview.");
+        return false;
+    }
+    if (execute_command(i, command->id, &context, args, m->preview.key, error)) {
+        i->render_click = click || edit;
+        return true;
+    }
+    cJSON_Delete(args);
+    return false;
+}
+
+const CedExtensionPreview *ced_extensions_preview(CedExtensionInstance *i, const CedExtensionRenderer *renderer,
+                                                   const CedDocument *doc) {
+    CedExtensions *m = i->manager;
+    CedExtensionPreview *preview = &m->preview;
+    bool same_preview = preview->owner == i && preview->renderer == renderer &&
+        preview->document == doc->id && ced_extensions_authorized(i, doc);
+    if (!same_preview || preview->version != doc->version) {
+        invalidate_preview(m, same_preview);
+        preview->owner = i;
+        preview->renderer = renderer;
+        preview->document = doc->id;
+        preview->version = doc->version;
+        preview->key = ++m->next_preview;
+    }
+    if (!preview->image.pixels && (!preview->graph || preview->graph_version != doc->version) &&
+        !*preview->error)
+        request_preview(i, renderer, doc, "render", 0, 0, NULL);
+    return preview;
+}
+
+bool ced_extensions_preview_click(CedExtensionInstance *i, const CedExtensionRenderer *renderer,
+                                  const CedDocument *doc, int x, int y) {
+    CedExtensionPreview *p = &i->manager->preview;
+    if (p->owner != i || p->document != doc->id || p->version != doc->version || *p->error ||
+        !p->image.interactive || x < 0 || y < 0 || x >= p->image.width || y >= p->image.height) return false;
+    return request_preview(i, renderer, doc, "click", x, y, NULL);
+}
+
+bool ced_extensions_graph_edit(CedExtensionInstance *i, const CedExtensionRenderer *renderer,
+                               const CedDocument *doc, const cJSON *edit) {
+    CedExtensionPreview *p = &i->manager->preview;
+    if (p->owner != i || p->document != doc->id || p->version != doc->version || *p->error ||
+        !p->graph || p->graph_version != doc->version || p->renderer != renderer ||
+        !(i->record.granted & CED_EXT_EDIT) || !cJSON_IsObject(edit)) return false;
+    return request_preview(i, renderer, doc, "graphEdit", 0, 0, edit);
+}
+
+static void receive_preview(CedExtensionInstance *i, const cJSON *result) {
+    CedExtensions *m = i->manager;
+    CedExtensionPreview *p = &m->preview;
+    if (p->owner != i || p->key != i->render_request) return;
+    CedExtensionDocument document;
+    bool authorized = false, current = false;
+    for (size_t n = 0; n < 32 && m->host.document(m->host.user, n, &document); n++) {
+        if (document.document->id != p->document) continue;
+        authorized = ced_extensions_authorized(i, document.document);
+        current = authorized && document.document->version == p->version;
+        break;
+    }
+    if (!current) { invalidate_preview(m, authorized); return; }
+    const cJSON *graph = cJSON_GetObjectItemCaseSensitive(result, "graph");
+    if (graph) {
+        CedExtensionGraph *decoded = ced_extension_graph_decode(graph, p->error);
+        if (decoded) {
+            ced_extension_image_free(&p->image);
+            free(p->graph);
+            p->graph = decoded;
+            p->graph_version = p->version;
+            p->serial = ++m->next_image;
+        }
+        return;
+    }
+    CedExtensionImage image = {0};
+    if (ced_extension_image_decode(cJSON_GetObjectItemCaseSensitive(result, "render"), &image, p->error)) {
+        ced_extension_image_free(&p->image);
+        free(p->graph);
+        p->graph = NULL;
+        p->graph_version = 0;
+        p->image = image;
+        p->serial = ++m->next_image;
+    }
 }
 
 static bool tab_text(const char *text, size_t limit, bool multiline) {
@@ -523,7 +683,10 @@ static void response(CedExtensionInstance *i, const cJSON *message) {
         snprintf(log,sizeof log,"%s %s: error code %.0f\n",id,i->pending_method,cJSON_GetObjectItemCaseSensitive(error,"code")->valuedouble);
         ced_extension_process_log(i->process,log);
         if (i->state != EXT_ACTIVE || rebinding) { ced_extensions_stop(i, "shutdown"); i->state = EXT_FAILED; }
-        *i->command = 0; i->invocation_document = 0; report(i->manager, i->error); return;
+        if (i->render_request && i->manager->preview.key == i->render_request)
+            snprintf(i->manager->preview.error, CED_ERROR, "%s", i->error);
+        *i->command = 0; i->invocation_document = 0; i->render_request = 0; i->render_click = false;
+        report(i->manager, i->error); return;
     }
     if (i->state == EXT_INITIALIZING) {
         if (!handshake(i, result)) {
@@ -541,8 +704,9 @@ static void response(CedExtensionInstance *i, const cJSON *message) {
         i->activation_ms = (ced_ext_now() - i->activation_started) * 1000;
         i->state = EXT_ACTIVE; invoke(i);
     } else if (i->state == EXT_ACTIVE) {
-        receive_tab(i, result);
-        *i->command = 0; i->invocation_document = 0; i->tab_action = false;
+        if (i->render_request) receive_preview(i, result);
+        else receive_tab(i, result);
+        *i->command = 0; i->invocation_document = 0; i->tab_action = false; i->render_request = 0; i->render_click = false;
     }
 }
 
@@ -679,8 +843,9 @@ void ced_extensions_tick(CedExtensions *m) {
             else if (!rpc || strcmp(rpc,"2.0")) {
                 snprintf(i->error,sizeof i->error,"Invalid RPC response version");
                 ced_extensions_stop(i,"shutdown"); i->state = EXT_FAILED;
-            } else if (!cJSON_GetObjectItemCaseSensitive(message->json, "method") && i->state == EXT_ACTIVE && message->body_length > 65536) {
-                snprintf(i->error, sizeof i->error, "ResourceLimit: command response exceeds 64 KiB");
+            } else if (i->state == EXT_ACTIVE &&
+                       message->body_length > (i->render_request ? CED_EXTENSION_RENDER_RESULT_LIMIT : 65536)) {
+                snprintf(i->error, sizeof i->error, "ResourceLimit: extension response is too large");
                 ced_extensions_stop(i, "shutdown"); i->state = EXT_FAILED;
             } else response(i, message->json);
             ced_extension_message_free(message);
@@ -701,6 +866,7 @@ void ced_extensions_tick(CedExtensions *m) {
             i->retain_on_workspace_change = i->rebind_workspace = false;
             cJSON_Delete(i->invocation_editor); i->invocation_editor = NULL;
             clear_tab_state(i);
+            if (m->preview.owner == i) ced_extensions_preview_clear(m);
         } else if (!i->rebind_workspace || *i->pending) stopped = false;
     }
     CedExtensionJob *j = &m->job;

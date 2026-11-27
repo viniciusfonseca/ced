@@ -118,6 +118,32 @@ static bool parse_tabs(const cJSON *list, CedExtensionManifest *manifest, char *
     return true;
 }
 
+static bool parse_renderers(const cJSON *list, CedExtensionManifest *m, char *error) {
+    static const char *const fields[] = {"extension", "title", "command", NULL};
+    if (!list) return true;
+    if (!m->executable || !(m->capabilities & CED_EXT_READ) || !cJSON_IsArray(list) ||
+        cJSON_GetArraySize(list) > CED_EXTENSION_RENDERER_LIMIT) return false;
+    const cJSON *entry;
+    cJSON_ArrayForEach(entry, list) {
+        CedExtensionRenderer *renderer = &m->renderers[m->renderer_count];
+        if (!ced_ext_json_fields(entry, fields, error) ||
+            !presentation(entry, "extension", renderer->extension, sizeof renderer->extension, true) ||
+            !presentation(entry, "title", renderer->title, sizeof renderer->title, true)) return false;
+        const char *suffix = renderer->extension;
+        if (*suffix != '.' || !suffix[1] ||
+            suffix[1 + strspn(suffix + 1, "abcdefghijklmnopqrstuvwxyz0123456789-_")]) return false;
+        const char *command = ced_ext_json_string(entry, "command");
+        if (!command) return false;
+        while (renderer->command < m->command_count &&
+               strcmp(command, m->commands[renderer->command].id)) renderer->command++;
+        if (renderer->command == m->command_count) return false;
+        for (size_t i = 0; i < m->renderer_count; i++)
+            if (!strcmp(suffix, m->renderers[i].extension)) return false;
+        m->renderer_count++;
+    }
+    return true;
+}
+
 static bool condition(const cJSON *object, CedCommandCondition *when, char *error) {
     if (!object) return true;
     static const char *const fields[] = {"hasDocument", "editorTextFocus", "hasSelection", "workspaceTrusted", "languageId", NULL};
@@ -197,7 +223,7 @@ bool ced_extension_manifest_parse(const char *bytes, size_t length, CedExtension
     static const char *const fields[] = {"manifestVersion", "id", "name", "version", "description", "license",
         "ced", "kind", "entrypoints", "activationEvents", "capabilities", "untrustedWorkspaces", "contributes", "requirements", "metadata", NULL};
     static const char *const ced_fields[] = {"minVersion", "apiMajor", NULL};
-    static const char *const contributes_fields[] = {"commands", "configuration", "tabs", "languageServers", NULL};
+    static const char *const contributes_fields[] = {"commands", "configuration", "tabs", "languageServers", "documentRenderers", NULL};
     const cJSON *ced = cJSON_GetObjectItemCaseSensitive(root, "ced"), *contributes = cJSON_GetObjectItemCaseSensitive(root, "contributes");
     uint64_t number;
     const char *kind = ced_ext_json_string(root, "kind");
@@ -278,6 +304,7 @@ bool ced_extension_manifest_parse(const char *bytes, size_t length, CedExtension
             if (!found) goto parsed_invalid;
         }
     }
+    if (!parse_renderers(cJSON_GetObjectItemCaseSensitive(contributes, "documentRenderers"), out, error)) goto parsed_invalid;
     cJSON_Delete(root); return true;
 parsed_invalid:
     cJSON_Delete(root); ced_extension_manifest_free(out);

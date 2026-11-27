@@ -22,6 +22,7 @@ int ced_editor_tabs_close_menu(cui_ctx *ui, const char *id, const cui_doc_tab *t
 /* Anchor a menu to the preceding widget. Open it with cui_popover_open. */
 bool ced_anchored_menu_begin(cui_ctx *ui, const char *id, float width);
 void ced_editor_touch(cui_ctx *ui, const char *id);
+void ced_editor_prime(cui_ctx *ui, const char *id, int anchor, int cursor);
 /* Track effective native text changes, including undo/redo. */
 cui_code_editor_result ced_editor_render(cui_ctx *ui, const char *id, CedDocument *document,
                                          const cui_code_editor_opts *options);
