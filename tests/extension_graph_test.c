@@ -96,6 +96,13 @@ static void test_menu(cui_ctx *ui, CedExtensionGraphView *view, const CedExtensi
     cJSON_Delete(edit);
 
     cui_id menu = cui_make_id(ui, "graph-context") ^ 0xC7Cu;
+    open_menu(ui, view, preview, 350, 420);
+    assert(cui__popup_get(ui, menu, false)->open);
+    assert(!click_at(ui, view, preview, point(ui, 760, 170)));
+    assert(!cui__popup_get(ui, menu, false)->open);
+    assert(view->selected_nodes[0] && view->selected_nodes[1] && view->selected_links[0]);
+    settle_ui(ui, view, preview);
+
     open_menu(ui, view, preview, 360, 227.5f);
     assert(view->menu_link == 0 && view->menu_node < 0);
     edit = click_item(ui, view, preview, menu, "Remove Link");

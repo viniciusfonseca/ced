@@ -201,6 +201,42 @@ static void draw_endpoint(cui_ctx *ui, cui_vec2 tip, int side, bool arrow, float
     }
 }
 
+static void draw_node_contents(cui_ctx *ui, cui_rect card, float zoom, const char *label, int len) {
+    const cui_font font = CUI_FONT_MEDIUM;
+    float footer = fminf(24 * zoom, card.h * .4f);
+    cui_rect body = {card.x, card.y, card.w, card.h - footer};
+    float icon = fminf(28 * zoom, fminf(body.w, body.h) * .72f);
+    if (icon >= 3) cui_draw_icon(ui, CUI_ICON_BOX, body, icon, CUI_C(ui, TEXT_SECONDARY));
+
+    float hair = fminf(1, zoom);
+    cui_draw_rect(ui, (cui_rect){card.x + hair, card.y + body.h, card.w - 2 * hair, hair},
+                  CUI_CORNERS(0), CUI_C(ui, BORDER));
+
+    float size = fminf(cui__fs(ui, ui->theme.text_body) * zoom, footer * .7f);
+    if (!len || size < 3) return;
+    float available = card.w - 16 * zoom;
+    float width = cui__text_width(ui, font, size, label, len, false);
+    char shortened[128 * 4 + 3];
+    if (width > available) {
+        static const char ellipsis[] = "\xe2\x80\xa6";
+        float ellipsis_width = cui__text_width(ui, font, size, ellipsis, 3, false);
+        if (ellipsis_width > available) return;
+        int cut = cui__text_hit(ui, font, size, label, len, available - ellipsis_width);
+        memcpy(shortened, label, (size_t)cut);
+        for (;;) {
+            memcpy(shortened + cut, ellipsis, 3);
+            width = cui__text_width(ui, font, size, shortened, cut + 3, false);
+            if (width <= available || !cut) break;
+            cut = cui__utf8_prev(label, cut);
+        }
+        label = shortened;
+        len = cut + 3;
+    }
+    float line = cui__font_line_height(ui, font, size);
+    cui__draw_text_line(ui, font, size, card.x + (card.w - width) * .5f,
+                        card.y + body.h + (footer - line) * .5f, CUI_C(ui, FOREGROUND), label, len, false);
+}
+
 static void draw_card(cui_ctx *ui, GraphTransform t, CedGraphNode node, bool hovered, bool raised, bool selected) {
     float z = t.scale;
     cui_vec2 pos = screen(t, (cui_vec2){node.x, node.y});
@@ -212,13 +248,7 @@ static void draw_card(cui_ctx *ui, GraphTransform t, CedGraphNode node, bool hov
     if (raised) cui__draw_elevation(ui, r, radius, CUI_ELEVATION_FLOATING, 1);
     cui_draw_rect_border(ui, r, radius, bg, border, selected ? 2 : 1);
     if (dark) cui__draw_top_light(ui, r, radius, .045f);
-    float head = fminf(34*z, r.h), ts = cui__fs(ui, ui->theme.text_body) * z;
-    if (ts >= 3) {
-        float line = cui__font_line_height(ui, CUI_FONT_MEDIUM, ts);
-        cui__draw_text_ellipsis(ui, CUI_FONT_MEDIUM, ts, r.x + 12*z, r.y + (head - line)*.5f, r.w - 24*z,
-                                CUI_C(ui, FOREGROUND), node.label, (int)strlen(node.label), false);
-    }
-    if (head + 1 < r.h) cui_draw_rect(ui, (cui_rect){r.x+1,r.y+head,r.w-2,1}, CUI_CORNERS(0), CUI_C(ui, BORDER));
+    draw_node_contents(ui, r, z, node.label, (int)strlen(node.label));
 }
 
 static void graph_wheel_target(cui_ctx *ui, cui_id id, cui_rect bounds) {
@@ -674,7 +704,16 @@ cJSON *ced_extension_graph_body(cui_ctx *ui, CedExtensionGraphView *v, const Ced
         .wheel_id = cui_make_id(ui, "extension-graph-wheel")};
     bool keyboard;
     cui_canvas_result hit = graph_canvas(ui, paint, &keyboard);
-    cJSON *edit = graph_input(ui, v, paint, hit, editable, busy);
+    cui_popup *menu = cui__popup_get(ui, cui_make_id(ui, "graph-context") ^ 0xC7Cu, false);
+    bool menu_open = menu && menu->open;
+    /* CUI keeps a context menu open on its trigger, which here fills the canvas. */
+    if (menu_open && ui->hot_layer != menu->id &&
+        (cui_mouse_clicked(ui, CUI_MOUSE_LEFT) || cui_mouse_clicked(ui, CUI_MOUSE_MIDDLE)))
+        cui__popup_set(ui, menu->id, false);
+
+    cJSON *edit = NULL;
+    if (!menu_open || cui_mouse_clicked(ui, CUI_MOUSE_RIGHT))
+        edit = graph_input(ui, v, paint, hit, editable, busy);
     if (!edit && editable && !busy && keyboard && !v->editing && !v->pressed && !v->panning &&
         (cui_key_pressed(ui, CUI_KEY_DELETE) || cui_key_pressed(ui, CUI_KEY_BACKSPACE))) {
         edit = remove_elements(preview->graph, v, -1, -1, REMOVE_SELECTED_NODES | REMOVE_SELECTED_LINKS);
